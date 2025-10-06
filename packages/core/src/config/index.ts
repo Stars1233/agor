@@ -6,5 +6,6 @@
 
 export * from './config-manager';
 export * from './context-resolver';
+export * from './repo-list';
 export * from './repo-reference';
 export * from './types';
