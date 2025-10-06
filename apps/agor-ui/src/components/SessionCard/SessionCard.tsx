@@ -1,5 +1,6 @@
 import {
   BranchesOutlined,
+  CloseOutlined,
   DragOutlined,
   EditOutlined,
   ExpandOutlined,
@@ -7,7 +8,7 @@ import {
   LoadingOutlined,
   PlusCircleOutlined,
 } from '@ant-design/icons';
-import { Badge, Button, Card, Collapse, Space, Spin, Tag, Typography } from 'antd';
+import { Badge, Button, Card, Collapse, Modal, Space, Spin, Tag, Typography } from 'antd';
 import type { Session, Task } from '../../types';
 import TaskListItem from '../TaskListItem';
 import './SessionCard.css';
@@ -21,6 +22,7 @@ interface SessionCardProps {
   tasks: Task[];
   onTaskClick?: (taskId: string) => void;
   onSessionClick?: () => void;
+  onDelete?: (sessionId: string) => void;
   defaultExpanded?: boolean;
 }
 
@@ -29,8 +31,21 @@ const SessionCard = ({
   tasks,
   onTaskClick,
   onSessionClick,
+  onDelete,
   defaultExpanded = true,
 }: SessionCardProps) => {
+  const handleDelete = () => {
+    Modal.confirm({
+      title: 'Delete Session',
+      content: `Are you sure you want to delete this session "${session.description || session.session_id}"? This action cannot be undone.`,
+      okText: 'Delete',
+      okType: 'danger',
+      cancelText: 'Cancel',
+      onOk: () => {
+        onDelete?.(session.session_id);
+      },
+    });
+  };
   const getAgentIcon = () => {
     const agentIcons: Record<string, string> = {
       'claude-code': '🤖',
@@ -163,6 +178,19 @@ const SessionCard = ({
                   onSessionClick();
                 }}
                 title="Open in drawer"
+              />
+            )}
+            {onDelete && (
+              <Button
+                type="text"
+                size="small"
+                icon={<CloseOutlined />}
+                onClick={e => {
+                  e.stopPropagation();
+                  handleDelete();
+                }}
+                title="Delete session"
+                danger
               />
             )}
           </div>
