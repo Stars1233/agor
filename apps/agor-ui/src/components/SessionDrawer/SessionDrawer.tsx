@@ -39,6 +39,17 @@ const SessionDrawer = ({
   onSubtask,
 }: SessionDrawerProps) => {
   const [inputValue, setInputValue] = React.useState('');
+  const [scrollToBottom, setScrollToBottom] = React.useState<(() => void) | null>(null);
+
+  // Scroll to bottom when drawer opens
+  React.useEffect(() => {
+    if (open && scrollToBottom) {
+      // Small delay to ensure content is rendered
+      setTimeout(() => {
+        scrollToBottom();
+      }, 100);
+    }
+  }, [open, scrollToBottom]);
 
   const handleSendPrompt = () => {
     if (inputValue.trim()) {
@@ -215,7 +226,11 @@ const SessionDrawer = ({
       >
         <Title level={5}>Conversation</Title>
         <div style={{ flex: 1, border: '1px solid #d9d9d9', borderRadius: '4px', minHeight: 0 }}>
-          <ConversationView client={client} sessionId={session.session_id} />
+          <ConversationView
+            client={client}
+            sessionId={session.session_id}
+            onScrollRef={setScrollToBottom}
+          />
         </div>
       </div>
 

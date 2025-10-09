@@ -6,6 +6,7 @@
  * - Expanded: Shows all messages in the task
  * - Default: Latest task expanded, older collapsed
  * - Progressive disclosure pattern
+ * - Groups 3+ sequential tool-only messages into ToolBlock
  */
 
 import type { Message, Task } from '@agor/core/types';
@@ -22,10 +23,17 @@ import {
 } from '@ant-design/icons';
 import { Collapse, Space, Tag, Typography } from 'antd';
 import type React from 'react';
+import { useMemo } from 'react';
 import { MessageBlock } from '../MessageBlock';
+import { ToolBlock } from '../ToolBlock';
 import './TaskBlock.css';
 
 const { Text, Paragraph } = Typography;
+
+/**
+ * Block types for rendering
+ */
+type Block = { type: 'message'; message: Message } | { type: 'tool-block'; messages: Message[] };
 
 interface TaskBlockProps {
   task: Task;
@@ -33,11 +41,70 @@ interface TaskBlockProps {
   defaultExpanded?: boolean;
 }
 
+/**
+ * Check if message is tool-only (no text content, only tool uses)
+ */
+function isToolOnlyMessage(message: Message): boolean {
+  if (typeof message.content === 'string') {
+    return message.content.trim().length === 0 && message.tool_uses && message.tool_uses.length > 0;
+  }
+
+  if (Array.isArray(message.content)) {
+    const hasText = message.content.some(block => block.type === 'text');
+    const hasTools = message.content.some(block => block.type === 'tool_use');
+    return !hasText && hasTools;
+  }
+
+  return false;
+}
+
+/**
+ * Group messages into blocks:
+ * - When 3+ consecutive tool-only messages appear → group into ToolBlock
+ * - Otherwise → render as individual MessageBlock
+ */
+function groupMessagesIntoBlocks(messages: Message[]): Block[] {
+  const blocks: Block[] = [];
+  let toolBuffer: Message[] = [];
+
+  for (const msg of messages) {
+    if (isToolOnlyMessage(msg)) {
+      // Accumulate tool-only messages
+      toolBuffer.push(msg);
+    } else {
+      // Flush tool buffer if we have 3+ tools
+      if (toolBuffer.length >= 3) {
+        blocks.push({ type: 'tool-block', messages: toolBuffer });
+        toolBuffer = [];
+      } else if (toolBuffer.length > 0) {
+        // Too few to group - render individually
+        blocks.push(...toolBuffer.map(m => ({ type: 'message' as const, message: m })));
+        toolBuffer = [];
+      }
+
+      // Add the current message
+      blocks.push({ type: 'message', message: msg });
+    }
+  }
+
+  // Flush remaining buffer
+  if (toolBuffer.length >= 3) {
+    blocks.push({ type: 'tool-block', messages: toolBuffer });
+  } else if (toolBuffer.length > 0) {
+    blocks.push(...toolBuffer.map(m => ({ type: 'message' as const, message: m })));
+  }
+
+  return blocks;
+}
+
 export const TaskBlock: React.FC<TaskBlockProps> = ({
   task,
   messages,
   defaultExpanded = false,
 }) => {
+  // Group messages into blocks
+  const blocks = useMemo(() => groupMessagesIntoBlocks(messages), [messages]);
+
   const getStatusIcon = () => {
     switch (task.status) {
       case 'completed':
@@ -136,14 +203,24 @@ export const TaskBlock: React.FC<TaskBlockProps> = ({
             label: taskHeader,
             children: (
               <div className="task-messages">
-                {messages.length === 0 ? (
+                {blocks.length === 0 ? (
                   <Text type="secondary" style={{ fontStyle: 'italic' }}>
                     No messages in this task
                   </Text>
                 ) : (
-                  messages.map(message => (
-                    <MessageBlock key={message.message_id} message={message} />
-                  ))
+                  blocks.map(block => {
+                    if (block.type === 'message') {
+                      return (
+                        <MessageBlock key={block.message.message_id} message={block.message} />
+                      );
+                    }
+                    if (block.type === 'tool-block') {
+                      // Use first message ID as key for tool block
+                      const blockKey = `tool-block-${block.messages[0]?.message_id || 'unknown'}`;
+                      return <ToolBlock key={blockKey} messages={block.messages} />;
+                    }
+                    return null;
+                  })
                 )}
 
                 {/* Show commit message if available */}

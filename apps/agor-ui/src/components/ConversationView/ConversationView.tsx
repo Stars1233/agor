@@ -15,7 +15,7 @@
 import type { AgorClient } from '@agor/core/api';
 import type { Message, SessionID, Task } from '@agor/core/types';
 import { Alert, Empty, Spin, Typography } from 'antd';
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useMessages, useTasks } from '../../hooks';
 import { MessageBlock } from '../MessageBlock';
 import { TaskBlock } from '../TaskBlock';
@@ -32,10 +32,33 @@ export interface ConversationViewProps {
    * Session ID to fetch messages for
    */
   sessionId: SessionID | null;
+
+  /**
+   * Callback to expose scroll-to-bottom function to parent
+   */
+  onScrollRef?: (scrollToBottom: () => void) => void;
 }
 
-export const ConversationView: React.FC<ConversationViewProps> = ({ client, sessionId }) => {
+export const ConversationView: React.FC<ConversationViewProps> = ({
+  client,
+  sessionId,
+  onScrollRef,
+}) => {
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Scroll to bottom function (wrapped in useCallback to avoid re-renders)
+  const scrollToBottom = useCallback(() => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    }
+  }, []);
+
+  // Expose scroll function to parent
+  useEffect(() => {
+    if (onScrollRef) {
+      onScrollRef(scrollToBottom);
+    }
+  }, [onScrollRef, scrollToBottom]);
 
   // Fetch messages and tasks for this session
   const {
@@ -66,9 +89,7 @@ export const ConversationView: React.FC<ConversationViewProps> = ({ client, sess
   // Auto-scroll to bottom when new messages arrive
   // biome-ignore lint/correctness/useExhaustiveDependencies: We want to scroll on messages change
   useEffect(() => {
-    if (containerRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
-    }
+    scrollToBottom();
   }, [messages, tasks]);
 
   if (error) {

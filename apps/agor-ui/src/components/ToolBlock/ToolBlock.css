@@ -1,0 +1,53 @@
+.tool-block {
+  margin-bottom: 16px;
+  border: 1px solid var(--ant-color-border);
+  border-radius: 8px;
+  background: var(--ant-color-bg-container);
+  overflow: hidden;
+}
+
+.tool-block-collapse {
+  border: none !important;
+}
+
+.tool-block-collapse .ant-collapse-item {
+  border: none !important;
+}
+
+.tool-block-collapse .ant-collapse-header {
+  padding: 16px !important;
+  background: rgba(24, 144, 255, 0.03) !important;
+  border-bottom: 1px solid var(--ant-color-border);
+}
+
+.tool-block-collapse .ant-collapse-content {
+  border: none !important;
+}
+
+.tool-block-header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tool-block-details {
+  padding: 16px;
+}
+
+.tool-block-item {
+  padding: 12px;
+  background: var(--ant-color-bg-layout);
+  border-radius: 6px;
+  border: 1px solid var(--ant-color-border);
+}
+
+/* Make tool block visually distinct */
+.tool-block::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: linear-gradient(180deg, #1890ff 0%, #096dd9 100%);
+}

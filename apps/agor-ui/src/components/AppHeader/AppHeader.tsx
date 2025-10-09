@@ -5,6 +5,7 @@ const { Header } = Layout;
 const { Title, Text } = Typography;
 
 // GitHub icon added to navbar
+// HMR TEST 5 - Minimal config test
 
 export interface AppHeaderProps {
   onMenuClick?: () => void;
