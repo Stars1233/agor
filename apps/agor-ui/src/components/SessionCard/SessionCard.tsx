@@ -10,6 +10,7 @@ import {
   SettingOutlined,
 } from '@ant-design/icons';
 import {
+  App,
   Badge,
   Button,
   Card,
@@ -53,9 +54,10 @@ const SessionCard = ({
 }: SessionCardProps) => {
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [form] = Form.useForm();
+  const { modal } = App.useApp();
 
   const handleDelete = () => {
-    Modal.confirm({
+    modal.confirm({
       title: 'Delete Session',
       content: `Are you sure you want to delete this session "${session.description || session.session_id}"? This action cannot be undone.`,
       okText: 'Delete',

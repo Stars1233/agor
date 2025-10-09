@@ -12,7 +12,7 @@ This file provides guidance to Claude Code when working with the Agor codebase.
 
 ## Architecture Documentation
 
-All architectural documentation lives in `context/concepts/`. **Read these first** before making changes:
+All architectural documentation lives in `context/`. **Start with `context/README.md`** for a full index, then read relevant docs before making changes:
 
 ### Core Concepts (Start Here)
 
@@ -24,9 +24,24 @@ All architectural documentation lives in `context/concepts/`. **Read these first
 
 ### Explorations (WIP/Future)
 
-- `context/explorations/agent-interface.md` - Agent abstraction layer design
-- `context/explorations/state-management.md` - Drizzle + LibSQL persistence patterns
-- `context/explorations/state-broadcasting.md` - Real-time sync architecture
+For deeper dives into specific design decisions, see `context/explorations/`:
+
+**Agent Integration:**
+
+- `agent-interface.md` - Agent abstraction layer design for supporting multiple AI agents
+- `agent-abstraction-analysis.md` - Analysis of agent integration patterns and common abstractions
+- `terminology-agentic-tools.md` - Terminology definitions for agentic systems and tools
+
+**CLI & User Experience:**
+
+- `cli.md` - CLI design patterns (oclif framework, entity commands, stateful context management)
+- `conversation-design.md` - Conversational interface patterns for agent interactions
+- `native-cli-feature-gaps.md` - Feature comparison between native agent CLIs and SDK capabilities
+
+**Orchestration & Coordination:**
+
+- `subtask-orchestration.md` - Multi-agent task coordination and getting agents to spawn Agor-tracked subtasks
+- `async-jobs.md` - Background job processing, queuing strategies, and long-running task management
 
 ## Project Structure
 

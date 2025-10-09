@@ -64,6 +64,17 @@ async function main() {
     })
   );
 
+  // Configure channels to broadcast events to all connected clients
+  app.on('connection', connection => {
+    // Join all connections to the 'everybody' channel
+    app.channel('everybody').join(connection);
+  });
+
+  // Publish all service events to all connected clients
+  app.publish(() => {
+    return app.channel('everybody');
+  });
+
   // Initialize database
   console.log(`📦 Connecting to database: ${DB_PATH}`);
   const db = createDatabase({ url: DB_PATH });
