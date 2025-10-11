@@ -4,7 +4,8 @@
  * Shared client library for connecting to agor-daemon from CLI and UI
  */
 
-import type { Board, Repo, Session, Task } from '@agor/core/types';
+import type { Board, Repo, Session, Task, User } from '@agor/core/types';
+import authentication from '@feathersjs/authentication-client';
 import type { Application, Paginated, Params } from '@feathersjs/feathers';
 import { feathers } from '@feathersjs/feathers';
 import socketio from '@feathersjs/socketio-client';
@@ -18,6 +19,7 @@ export interface ServiceTypes {
   tasks: Task;
   boards: Board;
   repos: Repo;
+  users: User;
 }
 
 /**
@@ -50,6 +52,14 @@ export function createClient(url: string = 'http://localhost:3030'): AgorClient 
   const client = feathers<ServiceTypes>() as AgorClient;
 
   client.configure(socketio(socket));
+
+  // Configure authentication with localStorage if available (browser only)
+  const storage =
+    typeof globalThis !== 'undefined' && 'localStorage' in globalThis
+      ? (globalThis as typeof globalThis & { localStorage: Storage }).localStorage
+      : undefined;
+
+  client.configure(authentication({ storage }));
   client.io = socket;
 
   return client;

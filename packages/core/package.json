@@ -56,6 +56,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.8",
+    "@feathersjs/authentication-client": "^5.0.35",
     "@feathersjs/feathers": "^5.0.29",
     "@feathersjs/socketio-client": "^5.0.29",
     "@libsql/client": "^0.14.0",

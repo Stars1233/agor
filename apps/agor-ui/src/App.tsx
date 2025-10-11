@@ -1,15 +1,36 @@
 import { getRepoReferenceOptions } from '@agor/core/config';
 import { Alert, App as AntApp, ConfigProvider, Spin, theme } from 'antd';
 import { App as AgorApp } from './components/App';
-import { useAgorClient, useAgorData, useBoardActions, useSessionActions } from './hooks';
+import { LoginPage } from './components/LoginPage';
+import { useAgorClient, useAgorData, useAuth, useBoardActions, useSessionActions } from './hooks';
 import { mockAgents } from './mocks';
 
 function AppContent() {
   const { message } = AntApp.useApp();
-  // Connect to daemon
-  const { client, connected, connecting, error: connectionError } = useAgorClient();
 
-  // Fetch data
+  // Authentication
+  const {
+    user,
+    authenticated,
+    loading: authLoading,
+    error: authError,
+    accessToken,
+    login,
+    logout,
+  } = useAuth();
+
+  // Call ALL hooks unconditionally BEFORE any conditional returns
+  // Connect to daemon with authentication token (pass null if not authenticated)
+  const {
+    client,
+    connected,
+    connecting,
+    error: connectionError,
+  } = useAgorClient({
+    accessToken: authenticated ? accessToken : null,
+  });
+
+  // Fetch data (will be empty if not connected)
   const { sessions, tasks, boards, repos, loading, error: dataError } = useAgorData(client);
 
   // Session actions
@@ -18,6 +39,31 @@ function AppContent() {
 
   // Board actions
   const { createBoard, updateBoard, deleteBoard } = useBoardActions(client);
+
+  // NOW handle conditional rendering based on state
+  // Show login page if not authenticated
+  if (!authLoading && !authenticated) {
+    return <LoginPage onLogin={login} error={authError} />;
+  }
+
+  // Show loading while checking authentication
+  if (authLoading) {
+    return (
+      <ConfigProvider theme={{ algorithm: theme.darkAlgorithm }}>
+        <div
+          style={{
+            height: '100vh',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <Spin size="large" />
+          <div style={{ marginTop: 16, color: 'rgba(255, 255, 255, 0.65)' }}>Authenticating...</div>
+        </div>
+      </ConfigProvider>
+    );
+  }
 
   // Show connection error
   if (connectionError) {
@@ -261,6 +307,7 @@ function AppContent() {
   return (
     <AgorApp
       client={client}
+      user={user}
       sessions={sessions}
       tasks={tasks}
       availableAgents={mockAgents}
@@ -281,6 +328,7 @@ function AppContent() {
       onDeleteRepo={handleDeleteRepo}
       onDeleteWorktree={handleDeleteWorktree}
       onCreateWorktree={handleCreateWorktree}
+      onLogout={logout}
     />
   );
 }

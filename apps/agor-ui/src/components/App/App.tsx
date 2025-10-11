@@ -19,6 +19,7 @@ const { Content } = Layout;
 
 export interface AppProps {
   client: AgorClient | null;
+  user?: import('@agor/core/types').User | null;
   sessions: Session[];
   tasks: Record<string, Task[]>;
   availableAgents: Agent[];
@@ -42,10 +43,12 @@ export interface AppProps {
     repoId: string,
     data: { name: string; ref: string; createBranch: boolean }
   ) => void;
+  onLogout?: () => void;
 }
 
 export const App: React.FC<AppProps> = ({
   client,
+  user,
   sessions,
   tasks,
   availableAgents,
@@ -66,6 +69,7 @@ export const App: React.FC<AppProps> = ({
   onDeleteRepo,
   onDeleteWorktree,
   onCreateWorktree,
+  onLogout,
 }) => {
   const [modalOpen, setModalOpen] = useState(false);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -118,8 +122,10 @@ export const App: React.FC<AppProps> = ({
   return (
     <Layout style={{ height: '100vh' }}>
       <AppHeader
+        user={user}
         onMenuClick={() => setListDrawerOpen(true)}
         onSettingsClick={() => setSettingsOpen(true)}
+        onLogout={onLogout}
         currentBoardName={currentBoard?.name}
         currentBoardIcon={currentBoard?.icon}
       />

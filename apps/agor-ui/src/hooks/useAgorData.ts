@@ -77,7 +77,11 @@ export function useAgorData(client: AgorClient | null): UseAgorDataResult {
 
   // Subscribe to real-time updates
   useEffect(() => {
-    if (!client) return;
+    if (!client) {
+      // No client = not authenticated, set loading to false
+      setLoading(false);
+      return;
+    }
 
     // Initial fetch
     fetchData();

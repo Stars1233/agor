@@ -190,7 +190,6 @@ const SessionCanvas = ({
         fitView
         minZoom={0.1}
         maxZoom={1.5}
-        nodeDragHandle=".drag-handle"
         nodesDraggable={true}
         nodesConnectable={false}
         elementsSelectable={false}

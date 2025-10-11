@@ -90,6 +90,12 @@ export function getDefaultConfig(): AgorConfig {
       colorOutput: true,
       shortIdLength: 8,
     },
+    daemon: {
+      port: 3030,
+      host: 'localhost',
+      allowAnonymous: true, // Default: Allow anonymous access (local mode)
+      requireAuth: false, // Default: Do not require authentication
+    },
   };
 }
 

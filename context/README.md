@@ -42,6 +42,10 @@ Experimental ideas and designs not yet crystallized into concepts. These represe
 - **[subtask-orchestration.md](explorations/subtask-orchestration.md)** - Multi-agent task coordination and getting agents to spawn Agor-tracked subtasks
 - **[async-jobs.md](explorations/async-jobs.md)** - Background job processing, queuing strategies, and long-running task management
 
+**Multiplayer & Collaboration:**
+
+- **[multiplayer-auth.md](explorations/multiplayer-auth.md)** - Authentication and authorization architecture for multi-user collaboration (FeathersJS auth, anonymous mode, OAuth, RBAC)
+
 **Lifecycle:** `explorations/` → `concepts/` when design is validated and ready to be official
 
 ### Primitives (Deep Dives)

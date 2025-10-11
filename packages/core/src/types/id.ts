@@ -111,6 +111,16 @@ export type AgentID = UUID;
 export type MessageID = UUID;
 
 /**
+ * User identifier
+ *
+ * Uniquely identifies a user in the system.
+ *
+ * @example
+ * const userId: UserID = "0193f1a2-3b4c-7d5e-a8f3-9d2e1c4b5a6f";
+ */
+export type UserID = UUID;
+
+/**
  * Note: Concepts and Reports use file paths as identifiers, not UUIDs.
  *
  * - Concepts: ConceptPath (e.g., "core.md", "explorations/cli.md")

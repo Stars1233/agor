@@ -64,7 +64,7 @@ export const sessions = sqliteTable(
       }>()
       .notNull(),
   },
-  (table) => ({
+  table => ({
     statusIdx: index('sessions_status_idx').on(table.status),
     agentIdx: index('sessions_agent_idx').on(table.agent),
     boardIdx: index('sessions_board_idx').on(table.board_id),
@@ -105,7 +105,7 @@ export const tasks = sqliteTable(
       }>()
       .notNull(),
   },
-  (table) => ({
+  table => ({
     sessionIdx: index('tasks_session_idx').on(table.session_id),
     statusIdx: index('tasks_status_idx').on(table.status),
     createdIdx: index('tasks_created_idx').on(table.created_at),
@@ -153,7 +153,7 @@ export const messages = sqliteTable(
       }>()
       .notNull(),
   },
-  (table) => ({
+  table => ({
     // Indexes for efficient lookups
     sessionIdx: index('messages_session_id_idx').on(table.session_id),
     taskIdx: index('messages_task_id_idx').on(table.task_id),
@@ -185,7 +185,7 @@ export const boards = sqliteTable(
       }>()
       .notNull(),
   },
-  (table) => ({
+  table => ({
     nameIdx: index('boards_name_idx').on(table.name),
     slugIdx: index('boards_slug_idx').on(table.slug),
   })
@@ -215,8 +215,47 @@ export const repos = sqliteTable(
       }>()
       .notNull(),
   },
-  (table) => ({
+  table => ({
     slugIdx: index('repos_slug_idx').on(table.slug),
+  })
+);
+
+/**
+ * Users table - Authentication and authorization
+ *
+ * Optional table - only created when authentication is enabled via `agor auth init`.
+ * In anonymous mode (default), this table doesn't exist and all operations are permitted.
+ */
+export const users = sqliteTable(
+  'users',
+  {
+    // Primary identity
+    user_id: text('user_id', { length: 36 }).primaryKey(),
+    created_at: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
+    updated_at: integer('updated_at', { mode: 'timestamp_ms' }),
+
+    // Materialized for auth lookups
+    email: text('email').unique().notNull(),
+    password: text('password').notNull(), // bcrypt hashed
+
+    // Basic profile (materialized for display)
+    name: text('name'),
+    role: text('role', {
+      enum: ['owner', 'admin', 'member', 'viewer'],
+    })
+      .notNull()
+      .default('member'),
+
+    // JSON blob for profile/preferences
+    data: text('data', { mode: 'json' })
+      .$type<{
+        avatar?: string;
+        preferences?: Record<string, unknown>;
+      }>()
+      .notNull(),
+  },
+  table => ({
+    emailIdx: index('users_email_idx').on(table.email),
   })
 );
 
@@ -233,3 +272,5 @@ export type BoardRow = typeof boards.$inferSelect;
 export type BoardInsert = typeof boards.$inferInsert;
 export type RepoRow = typeof repos.$inferSelect;
 export type RepoInsert = typeof repos.$inferInsert;
+export type UserRow = typeof users.$inferSelect;
+export type UserInsert = typeof users.$inferInsert;

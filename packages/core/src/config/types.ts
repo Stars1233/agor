@@ -47,6 +47,26 @@ export interface AgorDisplaySettings {
 }
 
 /**
+ * Daemon settings
+ */
+export interface AgorDaemonSettings {
+  /** Daemon port (default: 3030) */
+  port?: number;
+
+  /** Daemon host (default: localhost) */
+  host?: string;
+
+  /** Allow anonymous access (default: true for local mode) */
+  allowAnonymous?: boolean;
+
+  /** Require authentication for all requests (default: false) */
+  requireAuth?: boolean;
+
+  /** JWT secret (auto-generated if not provided) */
+  jwtSecret?: string;
+}
+
+/**
  * Tool credentials (API keys, tokens, etc.)
  */
 export interface AgorCredentials {
@@ -76,6 +96,9 @@ export interface AgorConfig {
   /** Display settings */
   display?: AgorDisplaySettings;
 
+  /** Daemon settings */
+  daemon?: AgorDaemonSettings;
+
   /** Tool credentials (API keys, tokens) */
   credentials?: AgorCredentials;
 }
@@ -92,4 +115,5 @@ export type ConfigKey =
   | ContextKey
   | `defaults.${keyof AgorDefaults}`
   | `display.${keyof AgorDisplaySettings}`
+  | `daemon.${keyof AgorDaemonSettings}`
   | `credentials.${keyof AgorCredentials}`;

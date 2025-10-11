@@ -10,3 +10,4 @@ export * from './report';
 export * from './session';
 export * from './task';
 export * from './ui';
+export * from './user';

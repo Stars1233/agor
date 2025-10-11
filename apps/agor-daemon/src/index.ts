@@ -10,6 +10,8 @@ import { loadConfig } from '@agor/core/config';
 import { createDatabase, MessagesRepository, SessionRepository } from '@agor/core/db';
 import { ClaudeTool } from '@agor/core/tools';
 import type { SessionID } from '@agor/core/types';
+import { AuthenticationService, JWTStrategy } from '@feathersjs/authentication';
+import { LocalStrategy } from '@feathersjs/authentication-local';
 import feathersExpress, { errorHandler, rest } from '@feathersjs/express';
 import type { Params } from '@feathersjs/feathers';
 import { feathers } from '@feathersjs/feathers';
@@ -20,6 +22,8 @@ import { createMessagesService } from './services/messages';
 import { createReposService } from './services/repos';
 import { createSessionsService } from './services/sessions';
 import { createTasksService } from './services/tasks';
+import { createUsersService } from './services/users';
+import { AnonymousStrategy } from './strategies/anonymous';
 
 /**
  * Extended Params with route ID parameter
@@ -79,13 +83,56 @@ async function main() {
   console.log(`📦 Connecting to database: ${DB_PATH}`);
   const db = createDatabase({ url: DB_PATH });
 
-  // Register services first (needed by ClaudeTool)
+  // Register core services
   app.use('/sessions', createSessionsService(db));
   app.use('/tasks', createTasksService(db));
   const messagesService = createMessagesService(db);
   app.use('/messages', messagesService);
   app.use('/boards', createBoardsService(db));
   app.use('/repos', createReposService(db));
+
+  // Register users service (for authentication)
+  const usersService = createUsersService(db);
+  app.use('/users', usersService);
+
+  // Generate or load JWT secret
+  let jwtSecret = config.daemon?.jwtSecret;
+  if (!jwtSecret) {
+    // Generate a random secret for local development
+    jwtSecret = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2);
+    console.log(
+      '⚠️  Using auto-generated JWT secret (set daemon.jwtSecret in config for production)'
+    );
+  }
+
+  // Configure authentication options BEFORE creating service
+  app.set('authentication', {
+    secret: jwtSecret,
+    entity: 'user',
+    entityId: 'user_id',
+    service: 'users',
+    authStrategies: ['jwt', 'local', 'anonymous'],
+    jwtOptions: {
+      header: { typ: 'access' },
+      audience: 'https://agor.dev',
+      issuer: 'agor',
+      algorithm: 'HS256',
+      expiresIn: '7d',
+    },
+    local: {
+      usernameField: 'email',
+      passwordField: 'password',
+    },
+  });
+
+  // Configure authentication
+  const authentication = new AuthenticationService(app);
+
+  authentication.register('jwt', new JWTStrategy());
+  authentication.register('local', new LocalStrategy());
+  authentication.register('anonymous', new AnonymousStrategy());
+
+  app.use('/authentication', authentication);
 
   // Initialize repositories for ClaudeTool
   const messagesRepo = new MessagesRepository(db);
@@ -333,12 +380,17 @@ async function main() {
   app.listen(PORT).then(() => {
     console.log(`🚀 Agor daemon running at http://localhost:${PORT}`);
     console.log(`   Health: http://localhost:${PORT}/health`);
+    console.log(
+      `   Authentication: ${config.daemon?.allowAnonymous !== false ? '🔓 Anonymous (default)' : '🔐 Required'}`
+    );
+    console.log(`   Login: POST http://localhost:${PORT}/authentication`);
     console.log(`   Services:`);
     console.log(`     - /sessions`);
     console.log(`     - /tasks`);
     console.log(`     - /messages`);
     console.log(`     - /boards`);
     console.log(`     - /repos`);
+    console.log(`     - /users`);
   });
 
   // Graceful shutdown

@@ -1,25 +1,56 @@
-import { GithubOutlined, MenuOutlined, SettingOutlined } from '@ant-design/icons';
-import { Button, Layout, Space, Typography } from 'antd';
+import type { User } from '@agor/core/types';
+import {
+  GithubOutlined,
+  LogoutOutlined,
+  MenuOutlined,
+  SettingOutlined,
+  UserOutlined,
+} from '@ant-design/icons';
+import type { MenuProps } from 'antd';
+import { Button, Dropdown, Layout, Space, Typography } from 'antd';
 
 const { Header } = Layout;
 const { Title, Text } = Typography;
 
-// GitHub icon added to navbar
-// HMR TEST 5 - Minimal config test
-
 export interface AppHeaderProps {
+  user?: User | null;
   onMenuClick?: () => void;
   onSettingsClick?: () => void;
+  onLogout?: () => void;
   currentBoardName?: string;
   currentBoardIcon?: string;
 }
 
 export const AppHeader: React.FC<AppHeaderProps> = ({
+  user,
   onMenuClick,
   onSettingsClick,
+  onLogout,
   currentBoardName,
   currentBoardIcon,
 }) => {
+  const userMenuItems: MenuProps['items'] = [
+    {
+      key: 'user-info',
+      label: (
+        <div style={{ padding: '4px 0' }}>
+          <div style={{ fontWeight: 500 }}>{user?.name || 'User'}</div>
+          <div style={{ fontSize: 12, color: 'rgba(255, 255, 255, 0.45)' }}>{user?.email}</div>
+        </div>
+      ),
+      disabled: true,
+    },
+    {
+      type: 'divider',
+    },
+    {
+      key: 'logout',
+      label: 'Logout',
+      icon: <LogoutOutlined />,
+      onClick: onLogout,
+    },
+  ];
+
   return (
     <Header
       style={{
@@ -92,6 +123,14 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
           onClick={onSettingsClick}
           style={{ color: '#fff' }}
         />
+        <Dropdown menu={{ items: userMenuItems }} placement="bottomRight" trigger={['click']}>
+          <Button
+            type="text"
+            icon={<UserOutlined />}
+            style={{ color: '#fff' }}
+            title={user?.name || 'User menu'}
+          />
+        </Dropdown>
       </Space>
     </Header>
   );

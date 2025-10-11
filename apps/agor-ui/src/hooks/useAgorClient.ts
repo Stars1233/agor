@@ -15,15 +15,21 @@ interface UseAgorClientResult {
   error: string | null;
 }
 
+interface UseAgorClientOptions {
+  url?: string;
+  accessToken?: string | null;
+}
+
 /**
  * Create and manage Agor daemon client connection
  *
- * @param url - Daemon URL (default: http://localhost:3030)
+ * @param options - Connection options (url, accessToken)
  * @returns Client instance, connection state, and error
  */
-export function useAgorClient(url: string = 'http://localhost:3030'): UseAgorClientResult {
+export function useAgorClient(options: UseAgorClientOptions = {}): UseAgorClientResult {
+  const { url = 'http://localhost:3030', accessToken } = options;
   const [connected, setConnected] = useState(false);
-  const [connecting, setConnecting] = useState(true);
+  const [connecting, setConnecting] = useState(!!accessToken); // Only connecting if we have a token
   const [error, setError] = useState<string | null>(null);
   const clientRef = useRef<AgorClient | null>(null);
 
@@ -32,12 +38,45 @@ export function useAgorClient(url: string = 'http://localhost:3030'): UseAgorCli
     let client: AgorClient | null = null;
 
     async function connect() {
+      // Don't create client if no access token
+      if (!accessToken) {
+        setConnecting(false);
+        setConnected(false);
+        setError(null);
+        clientRef.current = null;
+        return;
+      }
+
       setConnecting(true);
       setError(null);
 
       // Create client and let socket.io handle connection
       client = createClient(url);
       clientRef.current = client;
+
+      // Authenticate with JWT
+      try {
+        await client.authenticate({
+          strategy: 'jwt',
+          accessToken,
+        });
+      } catch (err) {
+        if (mounted) {
+          setError('Authentication failed. Please log in again.');
+          setConnecting(false);
+          setConnected(false);
+        }
+        return;
+      }
+
+      // Check if socket is already connected after authentication
+      if (client.io.connected) {
+        if (mounted) {
+          setConnected(true);
+          setConnecting(false);
+          setError(null);
+        }
+      }
 
       // Setup socket event listeners
       client.io.on('connect', () => {
@@ -80,7 +119,7 @@ export function useAgorClient(url: string = 'http://localhost:3030'): UseAgorCli
         client.io.close();
       }
     };
-  }, [url]);
+  }, [url, accessToken]);
 
   return {
     client: clientRef.current,
