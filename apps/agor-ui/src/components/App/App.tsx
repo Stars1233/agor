@@ -1,5 +1,5 @@
 import type { AgorClient } from '@agor/core/api';
-import type { Repo } from '@agor/core/types';
+import type { CreateUserInput, Repo, UpdateUserInput, User } from '@agor/core/types';
 import { Layout } from 'antd';
 import { useState } from 'react';
 import type { Agent, Board, Session, Task } from '../../types';
@@ -25,6 +25,7 @@ export interface AppProps {
   availableAgents: Agent[];
   boards: Board[];
   repos: Repo[];
+  users: User[];
   worktreeOptions: RepoReferenceOption[];
   repoOptions: RepoReferenceOption[];
   initialBoardId?: string;
@@ -44,6 +45,9 @@ export interface AppProps {
     repoId: string,
     data: { name: string; ref: string; createBranch: boolean }
   ) => void;
+  onCreateUser?: (data: CreateUserInput) => void;
+  onUpdateUser?: (userId: string, updates: UpdateUserInput) => void;
+  onDeleteUser?: (userId: string) => void;
   onLogout?: () => void;
 }
 
@@ -55,6 +59,7 @@ export const App: React.FC<AppProps> = ({
   availableAgents,
   boards,
   repos,
+  users,
   worktreeOptions,
   repoOptions,
   initialBoardId,
@@ -71,6 +76,9 @@ export const App: React.FC<AppProps> = ({
   onDeleteRepo,
   onDeleteWorktree,
   onCreateWorktree,
+  onCreateUser,
+  onUpdateUser,
+  onDeleteUser,
   onLogout,
 }) => {
   const [modalOpen, setModalOpen] = useState(false);
@@ -172,6 +180,7 @@ export const App: React.FC<AppProps> = ({
         onClose={() => setSettingsOpen(false)}
         boards={boards}
         repos={repos}
+        users={users}
         onCreateBoard={onCreateBoard}
         onUpdateBoard={onUpdateBoard}
         onDeleteBoard={onDeleteBoard}
@@ -179,6 +188,9 @@ export const App: React.FC<AppProps> = ({
         onDeleteRepo={onDeleteRepo}
         onDeleteWorktree={onDeleteWorktree}
         onCreateWorktree={onCreateWorktree}
+        onCreateUser={onCreateUser}
+        onUpdateUser={onUpdateUser}
+        onDeleteUser={onDeleteUser}
       />
     </Layout>
   );

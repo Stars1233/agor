@@ -1,13 +1,15 @@
-import type { Board, Repo } from '@agor/core/types';
+import type { Board, CreateUserInput, Repo, UpdateUserInput, User } from '@agor/core/types';
 import { Modal, Tabs } from 'antd';
 import { BoardsTable } from './BoardsTable';
 import { ReposTable } from './ReposTable';
+import { UsersTable } from './UsersTable';
 
 export interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
   boards: Board[];
   repos: Repo[];
+  users: User[];
   onCreateBoard?: (board: Partial<Board>) => void;
   onUpdateBoard?: (boardId: string, updates: Partial<Board>) => void;
   onDeleteBoard?: (boardId: string) => void;
@@ -18,6 +20,9 @@ export interface SettingsModalProps {
     repoId: string,
     data: { name: string; ref: string; createBranch: boolean }
   ) => void;
+  onCreateUser?: (data: CreateUserInput) => void;
+  onUpdateUser?: (userId: string, updates: UpdateUserInput) => void;
+  onDeleteUser?: (userId: string) => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -25,6 +30,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClose,
   boards,
   repos,
+  users,
   onCreateBoard,
   onUpdateBoard,
   onDeleteBoard,
@@ -32,6 +38,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onDeleteRepo,
   onDeleteWorktree,
   onCreateWorktree,
+  onCreateUser,
+  onUpdateUser,
+  onDeleteUser,
 }) => {
   return (
     <Modal
@@ -69,6 +78,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 onDelete={onDeleteRepo}
                 onDeleteWorktree={onDeleteWorktree}
                 onCreateWorktree={onCreateWorktree}
+              />
+            ),
+          },
+          {
+            key: 'users',
+            label: 'Users',
+            children: (
+              <UsersTable
+                users={users}
+                onCreate={onCreateUser}
+                onUpdate={onUpdateUser}
+                onDelete={onDeleteUser}
               />
             ),
           },

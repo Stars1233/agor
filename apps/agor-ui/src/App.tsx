@@ -52,6 +52,7 @@ function AppContent() {
     tasks,
     boards,
     repos,
+    users,
     loading,
     error: dataError,
   } = useAgorData(connected ? client : null);
@@ -302,6 +303,48 @@ function AppContent() {
     }
   };
 
+  // Handle create user
+  const handleCreateUser = async (data: import('@agor/core/types').CreateUserInput) => {
+    if (!client) return;
+    try {
+      await client.service('users').create(data);
+      message.success('User created successfully!');
+    } catch (error) {
+      message.error(
+        `Failed to create user: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  };
+
+  // Handle update user
+  const handleUpdateUser = async (
+    userId: string,
+    updates: import('@agor/core/types').UpdateUserInput
+  ) => {
+    if (!client) return;
+    try {
+      await client.service('users').patch(userId, updates);
+      message.success('User updated successfully!');
+    } catch (error) {
+      message.error(
+        `Failed to update user: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  };
+
+  // Handle delete user
+  const handleDeleteUser = async (userId: string) => {
+    if (!client) return;
+    try {
+      await client.service('users').remove(userId);
+      message.success('User deleted successfully!');
+    } catch (error) {
+      message.error(
+        `Failed to delete user: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  };
+
   // Handle board CRUD
   const handleCreateBoard = async (board: Partial<import('@agor/core/types').Board>) => {
     const created = await createBoard(board);
@@ -411,6 +454,7 @@ function AppContent() {
       availableAgents={mockAgents}
       boards={boards}
       repos={repos}
+      users={users}
       worktreeOptions={worktreeOptions}
       repoOptions={repoOptions}
       initialBoardId={boards[0]?.board_id}
@@ -427,6 +471,9 @@ function AppContent() {
       onDeleteRepo={handleDeleteRepo}
       onDeleteWorktree={handleDeleteWorktree}
       onCreateWorktree={handleCreateWorktree}
+      onCreateUser={handleCreateUser}
+      onUpdateUser={handleUpdateUser}
+      onDeleteUser={handleDeleteUser}
       onLogout={logout}
     />
   );
