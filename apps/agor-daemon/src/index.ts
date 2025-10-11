@@ -98,11 +98,16 @@ async function main() {
   // Generate or load JWT secret
   let jwtSecret = config.daemon?.jwtSecret;
   if (!jwtSecret) {
-    // Generate a random secret for local development
-    jwtSecret = Math.random().toString(36).substring(2) + Math.random().toString(36).substring(2);
-    console.log(
-      '⚠️  Using auto-generated JWT secret (set daemon.jwtSecret in config for production)'
-    );
+    // Generate a random secret and save it to config for persistence
+    const crypto = await import('node:crypto');
+    jwtSecret = crypto.randomBytes(32).toString('hex');
+
+    // Save to config so it persists across restarts
+    const { ConfigManager } = await import('@agor/core/config');
+    const configManager = new ConfigManager();
+    await configManager.set('daemon.jwtSecret', jwtSecret);
+
+    console.log('🔑 Generated and saved persistent JWT secret to config');
   }
 
   // Configure authentication options BEFORE creating service
