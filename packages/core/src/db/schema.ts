@@ -70,6 +70,10 @@ export const sessions = sqliteTable(
         permission_config?: {
           allowedTools?: string[];
         };
+
+        // External references
+        issue_url?: string;
+        pull_request_url?: string;
       }>()
       .notNull(),
   },

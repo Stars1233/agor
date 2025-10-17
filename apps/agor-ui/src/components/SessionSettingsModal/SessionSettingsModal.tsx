@@ -47,6 +47,8 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
         mcpServerIds: sessionMcpServerIds,
         modelConfig: session.model_config,
         permissionMode: session.permission_config?.mode || 'auto',
+        issue_url: session.issue_url || '',
+        pull_request_url: session.pull_request_url || '',
       });
     }
   }, [
@@ -55,6 +57,8 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
     sessionMcpServerIds,
     session.model_config,
     session.permission_config?.mode,
+    session.issue_url,
+    session.pull_request_url,
     form,
   ]);
 
@@ -82,6 +86,14 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
           ...session.permission_config,
           mode: values.permissionMode,
         };
+      }
+
+      // Update URLs
+      if (values.issue_url !== session.issue_url) {
+        updates.issue_url = values.issue_url || undefined;
+      }
+      if (values.pull_request_url !== session.pull_request_url) {
+        updates.pull_request_url = values.pull_request_url || undefined;
       }
 
       // Apply session updates if any
@@ -126,6 +138,8 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
           mcpServerIds: sessionMcpServerIds,
           modelConfig: session.model_config,
           permissionMode: session.permission_config?.mode || 'auto',
+          issue_url: session.issue_url || '',
+          pull_request_url: session.pull_request_url || '',
         }}
       >
         <Form.Item
@@ -134,6 +148,22 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
           rules={[{ required: false, message: 'Please enter a session title' }]}
         >
           <Input placeholder="Enter session title" />
+        </Form.Item>
+
+        <Form.Item
+          label="Issue URL"
+          name="issue_url"
+          rules={[{ type: 'url', message: 'Please enter a valid URL' }]}
+        >
+          <Input placeholder="https://github.com/org/repo/issues/123" />
+        </Form.Item>
+
+        <Form.Item
+          label="Pull Request URL"
+          name="pull_request_url"
+          rules={[{ type: 'url', message: 'Please enter a valid URL' }]}
+        >
+          <Input placeholder="https://github.com/org/repo/pull/456" />
         </Form.Item>
 
         <Form.Item

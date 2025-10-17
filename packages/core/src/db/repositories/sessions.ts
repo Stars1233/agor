@@ -130,6 +130,8 @@ export class SessionRepository implements BaseRepository<Session, Partial<Sessio
         message_count: session.message_count ?? 0,
         tool_use_count: session.tool_use_count ?? 0,
         permission_config: session.permission_config,
+        issue_url: session.issue_url,
+        pull_request_url: session.pull_request_url,
       },
     };
   }

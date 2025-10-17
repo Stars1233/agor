@@ -84,4 +84,10 @@ export interface Session {
     /** Optional user notes about why this model was selected */
     notes?: string;
   };
+
+  // External references
+  /** GitHub issue URL or issue tracker URL */
+  issue_url?: string;
+  /** Pull request URL */
+  pull_request_url?: string;
 }
