@@ -1,12 +1,13 @@
 import type { MCPServer } from '@agor/core/types';
-import { Divider, Form, Input, Modal } from 'antd';
+import { DownOutlined } from '@ant-design/icons';
+import { Collapse, Form, Modal, Typography } from 'antd';
 import React from 'react';
 import type { Session } from '../../types';
-import { JSONEditor, validateJSON } from '../JSONEditor';
-import { MCPServerSelect } from '../MCPServerSelect';
+import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
 import type { ModelConfig } from '../ModelSelector';
-import { ModelSelector } from '../ModelSelector';
-import { PermissionModeSelector } from '../PermissionModeSelector';
+import { SessionMetadataForm } from '../SessionMetadataForm';
+
+const { Text } = Typography;
 
 export interface SessionSettingsModalProps {
   open: boolean;
@@ -170,59 +171,31 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
             : '',
         }}
       >
-        <Form.Item
-          label="Title"
-          name="title"
-          rules={[{ required: false, message: 'Please enter a session title' }]}
-        >
-          <Input placeholder="Enter session title" />
-        </Form.Item>
-
-        <Form.Item
-          label="Issue URL"
-          name="issue_url"
-          rules={[{ type: 'url', message: 'Please enter a valid URL' }]}
-        >
-          <Input placeholder="https://github.com/org/repo/issues/123" />
-        </Form.Item>
-
-        <Form.Item
-          label="Pull Request URL"
-          name="pull_request_url"
-          rules={[{ type: 'url', message: 'Please enter a valid URL' }]}
-        >
-          <Input placeholder="https://github.com/org/repo/pull/456" />
-        </Form.Item>
-
-        <Form.Item
-          label="Custom Context (JSON)"
-          name="custom_context"
-          help="Add custom fields for use in zone trigger templates (e.g., {{ session.context.yourField }})"
-          rules={[{ validator: validateJSON }]}
-        >
-          <JSONEditor placeholder='{"teamName": "Backend", "sprintNumber": 42}' rows={4} />
-        </Form.Item>
-
-        <Form.Item
-          name="modelConfig"
-          label={session.agentic_tool === 'codex' ? 'Codex Model' : 'Claude Model'}
-        >
-          <ModelSelector agentic_tool={session.agentic_tool} />
-        </Form.Item>
-
-        <Form.Item
-          name="permissionMode"
-          label="Permission Mode"
-          help="Control how the agentic tool handles tool execution approvals"
-        >
-          <PermissionModeSelector agentic_tool={session.agentic_tool} />
-        </Form.Item>
-
-        <Divider />
-
-        <Form.Item name="mcpServerIds" label="MCP Servers">
-          <MCPServerSelect mcpServers={mcpServers} placeholder="No MCP servers attached" />
-        </Form.Item>
+        <Collapse
+          ghost
+          defaultActiveKey={['metadata', 'agentic-tool-config']}
+          expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
+          items={[
+            {
+              key: 'metadata',
+              label: <Text strong>Session Metadata</Text>,
+              children: (
+                <SessionMetadataForm showHelpText={true} titleRequired={false} titleLabel="Title" />
+              ),
+            },
+            {
+              key: 'agentic-tool-config',
+              label: <Text strong>Agentic Tool Configuration</Text>,
+              children: (
+                <AgenticToolConfigForm
+                  agenticTool={session.agentic_tool}
+                  mcpServers={mcpServers}
+                  showHelpText={true}
+                />
+              ),
+            },
+          ]}
+        />
       </Form>
     </Modal>
   );

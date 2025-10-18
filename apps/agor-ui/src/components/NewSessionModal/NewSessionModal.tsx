@@ -1,13 +1,12 @@
 import type { AgentName as CoreAgentName, MCPServer, PermissionMode } from '@agor/core/types';
 import { getDefaultPermissionMode } from '@agor/core/types';
 import { DownOutlined } from '@ant-design/icons';
-import { Collapse, Form, Input, Modal, Radio, Select, Space, Typography } from 'antd';
-import { useState } from 'react';
+import { Checkbox, Collapse, Form, Input, Modal, Radio, Select, Space, Typography } from 'antd';
+import { useEffect, useState } from 'react';
 import type { Agent, AgentName } from '../../types';
+import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
 import { AgentSelectionCard } from '../AgentSelectionCard';
-import { MCPServerSelect } from '../MCPServerSelect';
-import { type ModelConfig, ModelSelector } from '../ModelSelector';
-import { PermissionModeSelector } from '../PermissionModeSelector';
+import type { ModelConfig } from '../ModelSelector';
 
 const { TextArea } = Input;
 const { Text } = Typography;
@@ -76,6 +75,23 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
   const [selectedAgent, setSelectedAgent] = useState<string | null>('claude-code');
   const [repoSetupMode, setRepoSetupMode] = useState<RepoSetupMode>('existing-worktree');
   const [isFormValid, setIsFormValid] = useState(false);
+  const [useSameBranchName, setUseSameBranchName] = useState(true);
+
+  // Handle mode change
+  const handleModeChange = (newMode: RepoSetupMode) => {
+    setRepoSetupMode(newMode);
+    // With preserve={false}, fields will reset when unmounted
+    // Re-check form validity after mode change
+    setTimeout(() => handleFormChange(), 10);
+  };
+
+  // Re-validate when useSameBranchName changes (affects which fields are required)
+  // biome-ignore lint/correctness/useExhaustiveDependencies: We only want to re-validate when useSameBranchName changes
+  useEffect(() => {
+    if (repoSetupMode === 'new-worktree') {
+      handleFormChange();
+    }
+  }, [useSameBranchName]);
 
   const handleCreate = () => {
     form
@@ -118,6 +134,7 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
     form.resetFields();
     setSelectedAgent('claude-code');
     setRepoSetupMode('existing-worktree');
+    setUseSameBranchName(true);
     onClose();
   };
 
@@ -126,27 +143,29 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
     // TODO: Implement installation flow
   };
 
-  // Validate form whenever fields change (debounced to avoid UI freeze)
+  // Check form validity without triggering error display
   const handleFormChange = () => {
     // Use setTimeout to debounce and avoid blocking the UI
     setTimeout(() => {
-      // Only validate visible/required fields based on current mode
-      const fieldsToValidate: string[] = ['worktreeRef'];
+      // Get current form values
+      const values = form.getFieldsValue();
 
-      if (repoSetupMode === 'new-worktree') {
-        fieldsToValidate.push('existingRepoSlug', 'newWorktreeName');
+      // Check if required fields are filled based on current mode
+      let isValid = false;
+
+      if (repoSetupMode === 'existing-worktree') {
+        isValid = !!values.worktreeRef;
+      } else if (repoSetupMode === 'new-worktree') {
+        isValid = !!values.existingRepoSlug && !!values.newWorktreeName;
+        // If checkbox is unchecked, branch name is also required
+        if (!useSameBranchName) {
+          isValid = isValid && !!values.newWorktreeBranch;
+        }
       } else if (repoSetupMode === 'new-repo') {
-        fieldsToValidate.push('gitUrl', 'initialWorktreeName');
+        isValid = !!values.gitUrl && !!values.initialWorktreeName;
       }
 
-      form
-        .validateFields(fieldsToValidate)
-        .then(() => {
-          setIsFormValid(true);
-        })
-        .catch(() => {
-          setIsFormValid(false);
-        });
+      setIsFormValid(isValid);
     }, 0);
   };
 
@@ -173,6 +192,7 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
         layout="vertical"
         style={{ marginTop: 16 }}
         onFieldsChange={handleFormChange}
+        preserve={false}
       >
         <Form.Item label="Select Coding Agent" required>
           <Space direction="vertical" style={{ width: '100%' }} size="small">
@@ -193,89 +213,135 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
           </Space>
         </Form.Item>
 
-        <Form.Item label="Repository & Worktree" required>
-          <Radio.Group value={repoSetupMode} onChange={e => setRepoSetupMode(e.target.value)}>
-            <Space direction="vertical" style={{ width: '100%' }} size="small">
-              <Radio value="existing-worktree">Use existing worktree</Radio>
-              <Radio value="new-worktree">Create new worktree on existing repo</Radio>
-              <Radio value="new-repo">Add new repository</Radio>
-            </Space>
-          </Radio.Group>
-        </Form.Item>
+        <Collapse
+          ghost
+          defaultActiveKey={['repository']}
+          expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
+          items={[
+            {
+              key: 'repository',
+              label: <Text strong>Repository & Worktree</Text>,
+              children: (
+                <>
+                  <Form.Item required>
+                    <Radio.Group
+                      value={repoSetupMode}
+                      onChange={e => handleModeChange(e.target.value)}
+                    >
+                      <Space direction="vertical" style={{ width: '100%' }} size="small">
+                        <Radio value="existing-worktree">Use existing worktree</Radio>
+                        <Radio value="new-worktree">Create new worktree on existing repo</Radio>
+                        <Radio value="new-repo">Add new repository</Radio>
+                      </Space>
+                    </Radio.Group>
+                  </Form.Item>
 
-        {repoSetupMode === 'existing-worktree' && (
-          <Form.Item
-            name="worktreeRef"
-            label="Select Worktree"
-            rules={[{ required: true, message: 'Please select a worktree' }]}
-          >
-            <Select
-              placeholder="Select worktree..."
-              options={worktreeOptions}
-              showSearch
-              optionFilterProp="label"
-            />
-          </Form.Item>
-        )}
+                  {repoSetupMode === 'existing-worktree' && (
+                    <Form.Item
+                      name="worktreeRef"
+                      label="Select Worktree"
+                      rules={[{ required: true, message: 'Please select a worktree' }]}
+                      validateTrigger={['onBlur', 'onChange']}
+                    >
+                      <Select
+                        placeholder="Select worktree..."
+                        options={worktreeOptions}
+                        showSearch
+                        optionFilterProp="label"
+                      />
+                    </Form.Item>
+                  )}
 
-        {repoSetupMode === 'new-worktree' && (
-          <>
-            <Form.Item
-              name="existingRepoSlug"
-              label="Repository"
-              rules={[{ required: true, message: 'Please select a repository' }]}
-            >
-              <Select
-                placeholder="Select repository..."
-                options={repoOptions}
-                showSearch
-                optionFilterProp="label"
-              />
-            </Form.Item>
-            <Form.Item
-              name="newWorktreeName"
-              label="Worktree Name"
-              rules={[{ required: true, message: 'Please enter worktree name' }]}
-            >
-              <Input placeholder="e.g., feat-auth" />
-            </Form.Item>
-            <Form.Item name="newWorktreeBranch" label="Branch (optional)">
-              <Input placeholder="e.g., feature/auth" />
-            </Form.Item>
-          </>
-        )}
+                  {repoSetupMode === 'new-worktree' && (
+                    <>
+                      <Form.Item
+                        name="existingRepoSlug"
+                        label="Repository"
+                        rules={[{ required: true, message: 'Please select a repository' }]}
+                        validateTrigger={['onBlur', 'onChange']}
+                      >
+                        <Select
+                          placeholder="Select repository..."
+                          options={repoOptions}
+                          showSearch
+                          optionFilterProp="label"
+                        />
+                      </Form.Item>
+                      <Form.Item
+                        name="newWorktreeName"
+                        label="Worktree Name"
+                        rules={[{ required: true, message: 'Please enter worktree name' }]}
+                        validateTrigger={['onBlur', 'onChange']}
+                      >
+                        <Input placeholder="e.g., feat-auth" />
+                      </Form.Item>
+                      <Form.Item>
+                        <Checkbox
+                          checked={useSameBranchName}
+                          onChange={e => {
+                            setUseSameBranchName(e.target.checked);
+                            if (e.target.checked) {
+                              // Clear branch field when checkbox is checked
+                              form.setFieldValue('newWorktreeBranch', undefined);
+                            }
+                            // Re-validate form after checkbox change
+                            handleFormChange();
+                          }}
+                        >
+                          Use worktree name as branch name
+                        </Checkbox>
+                      </Form.Item>
+                      {!useSameBranchName && (
+                        <Form.Item
+                          name="newWorktreeBranch"
+                          label="Branch Name"
+                          rules={[{ required: true, message: 'Please enter branch name' }]}
+                          validateTrigger={['onBlur', 'onChange']}
+                        >
+                          <Input placeholder="e.g., feature/auth" />
+                        </Form.Item>
+                      )}
+                    </>
+                  )}
 
-        {repoSetupMode === 'new-repo' && (
-          <>
-            <Form.Item
-              name="gitUrl"
-              label="Git URL"
-              rules={[
-                { required: true, message: 'Please enter git URL' },
-                { type: 'url', message: 'Please enter a valid URL' },
-              ]}
-            >
-              <Input placeholder="https://github.com/org/repo.git" />
-            </Form.Item>
-            <Form.Item
-              name="repoSlug"
-              label="Repository Slug"
-              help="Auto-detected from URL (can be customized)"
-            >
-              <Input placeholder="org/repo" />
-            </Form.Item>
-            <Form.Item
-              name="initialWorktreeName"
-              label="Initial Worktree Name"
-              rules={[{ required: true, message: 'Please enter initial worktree name' }]}
-            >
-              <Input placeholder="main" />
-            </Form.Item>
-            <Form.Item name="initialWorktreeBranch" label="Branch (optional)">
-              <Input placeholder="main" />
-            </Form.Item>
-          </>
-        )}
+                  {repoSetupMode === 'new-repo' && (
+                    <>
+                      <Form.Item
+                        name="gitUrl"
+                        label="Git URL"
+                        rules={[
+                          { required: true, message: 'Please enter git URL' },
+                          { type: 'url', message: 'Please enter a valid URL' },
+                        ]}
+                        validateTrigger={['onBlur', 'onChange']}
+                      >
+                        <Input placeholder="https://github.com/org/repo.git" />
+                      </Form.Item>
+                      <Form.Item
+                        name="repoSlug"
+                        label="Repository Slug"
+                        help="Auto-detected from URL (can be customized)"
+                      >
+                        <Input placeholder="org/repo" />
+                      </Form.Item>
+                      <Form.Item
+                        name="initialWorktreeName"
+                        label="Initial Worktree Name"
+                        rules={[{ required: true, message: 'Please enter initial worktree name' }]}
+                        validateTrigger={['onBlur', 'onChange']}
+                      >
+                        <Input placeholder="main" />
+                      </Form.Item>
+                      <Form.Item name="initialWorktreeBranch" label="Branch (optional)">
+                        <Input placeholder="main" />
+                      </Form.Item>
+                    </>
+                  )}
+                </>
+              ),
+            },
+          ]}
+        />
 
         <Form.Item
           name="title"
@@ -301,39 +367,14 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
           expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
           items={[
             {
-              key: 'advanced',
-              label: <Text strong>Advanced Configuration</Text>,
+              key: 'agentic-tool-config',
+              label: <Text strong>Agentic Tool Configuration</Text>,
               children: (
-                <>
-                  <Form.Item
-                    name="modelConfig"
-                    label="Claude Model"
-                    help="Choose which Claude model to use (defaults to claude-sonnet-4-5-latest)"
-                  >
-                    <ModelSelector />
-                  </Form.Item>
-
-                  <Form.Item
-                    name="permissionMode"
-                    label="Permission Mode"
-                    help="Control how the agent handles tool execution approvals"
-                    initialValue={getDefaultPermissionMode(
-                      (selectedAgent as CoreAgentName) || 'claude-code'
-                    )}
-                  >
-                    <PermissionModeSelector
-                      agentic_tool={(selectedAgent as AgentName) || 'claude-code'}
-                    />
-                  </Form.Item>
-
-                  <Form.Item
-                    name="mcpServerIds"
-                    label="MCP Servers"
-                    help="Select MCP servers to make available in this session"
-                  >
-                    <MCPServerSelect mcpServers={mcpServers} />
-                  </Form.Item>
-                </>
+                <AgenticToolConfigForm
+                  agenticTool={(selectedAgent as AgentName) || 'claude-code'}
+                  mcpServers={mcpServers}
+                  showHelpText={true}
+                />
               ),
             },
           ]}

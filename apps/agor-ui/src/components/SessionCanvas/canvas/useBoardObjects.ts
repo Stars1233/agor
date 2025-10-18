@@ -57,31 +57,16 @@ export const useBoardObjects = ({
       // Mark as deleted to prevent re-appearance during WebSocket updates
       deletedObjectsRef.current.add(objectId);
 
-      // Find sessions that will be affected (for optimistic update)
+      // Find sessions that will be affected (pinned sessions via parentId)
       const zoneObject = board.objects?.[objectId];
       if (!zoneObject || zoneObject.type !== 'zone') return;
 
-      const zoneBounds = {
-        x: zoneObject.x,
-        y: zoneObject.y,
-        width: zoneObject.width,
-        height: zoneObject.height,
-      };
-
-      // Find affected sessions
+      // Find affected sessions (those pinned to this zone)
       const affectedSessionIds: string[] = [];
       for (const sessionId of board.sessions) {
         const position = board.layout?.[sessionId];
-        if (position) {
-          const isInZone =
-            position.x >= zoneBounds.x &&
-            position.x <= zoneBounds.x + zoneBounds.width &&
-            position.y >= zoneBounds.y &&
-            position.y <= zoneBounds.y + zoneBounds.height;
-
-          if (isInZone) {
-            affectedSessionIds.push(sessionId);
-          }
+        if (position?.parentId === objectId) {
+          affectedSessionIds.push(sessionId);
         }
       }
 
@@ -140,28 +125,13 @@ export const useBoardObjects = ({
         return hasValidPosition;
       })
       .map(([objectId, objectData]) => {
-        // Calculate session count for this zone
+        // Calculate session count for this zone (count pinned sessions via parentId)
         let sessionCount = 0;
         if (objectData.type === 'zone') {
-          const zoneBounds = {
-            x: objectData.x,
-            y: objectData.y,
-            width: objectData.width,
-            height: objectData.height,
-          };
-
           for (const sessionId of board.sessions) {
             const position = board.layout?.[sessionId];
-            if (position) {
-              const isInZone =
-                position.x >= zoneBounds.x &&
-                position.x <= zoneBounds.x + zoneBounds.width &&
-                position.y >= zoneBounds.y &&
-                position.y <= zoneBounds.y + zoneBounds.height;
-
-              if (isInZone) {
-                sessionCount++;
-              }
+            if (position?.parentId === objectId) {
+              sessionCount++;
             }
           }
         }
