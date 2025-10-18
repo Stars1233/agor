@@ -14,6 +14,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   ApprovalMode,
+  AuthType,
   Config,
   GeminiClient,
   GeminiEventType,
@@ -295,7 +296,15 @@ export class GeminiPromptService {
       // System prompt will be added via first message if provided
     });
 
-    // Create client
+    // CRITICAL: Initialize config first to set up tool registry, etc.
+    await config.initialize();
+
+    // CRITICAL: Set up authentication (creates ContentGenerator and BaseLlmClient)
+    // Use AuthType.USE_GEMINI for API key authentication
+    // The SDK will look for GEMINI_API_KEY environment variable
+    await config.refreshAuth(AuthType.USE_GEMINI);
+
+    // Create client (config must be initialized and authenticated first!)
     const client = new GeminiClient(config);
     await client.initialize();
 

@@ -60,9 +60,9 @@ export function useSessionActions(client: AgorClient | null): UseSessionActionsR
       }
 
       // Create session with repo/worktree data
-      const agent = config.agent as AgentName;
+      const agenticTool = config.agent as AgentName;
       const newSession = await client.service('sessions').create({
-        agent,
+        agentic_tool: agenticTool,
         status: 'idle' as const,
         description: config.initialPrompt || config.title || undefined,
         repo: {
@@ -82,7 +82,7 @@ export function useSessionActions(client: AgorClient | null): UseSessionActionsR
             }
           : undefined,
         permission_config: {
-          mode: config.permissionMode || getDefaultPermissionMode(agent),
+          mode: config.permissionMode || getDefaultPermissionMode(agenticTool),
         },
         contextFiles: [],
         genealogy: {

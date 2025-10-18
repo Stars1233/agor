@@ -550,6 +550,10 @@ async function main() {
     console.warn('⚠️  No GEMINI_API_KEY found - Gemini sessions will fail');
     console.warn('   Run: agor config set credentials.GEMINI_API_KEY <your-key>');
     console.warn('   Or set GEMINI_API_KEY environment variable');
+  } else {
+    // CRITICAL: Set environment variable for Gemini SDK
+    // Unlike Claude Code, Gemini SDK reads GEMINI_API_KEY from process.env
+    process.env.GEMINI_API_KEY = geminiApiKey;
   }
   // NOTE: Do NOT set process.env.OPENAI_API_KEY here for the same reason as ANTHROPIC_API_KEY
   // Let the Codex CLI use its own auth system
