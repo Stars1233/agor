@@ -31,6 +31,14 @@ import type { PermissionMode, SessionID, TaskID } from '../../types';
 import { DEFAULT_GEMINI_MODEL, type GeminiModel } from './models';
 
 /**
+ * GeminiClient with internal config property exposed
+ * The SDK doesn't expose this in types, but we need it for executeToolCall()
+ */
+interface GeminiClientWithConfig extends GeminiClient {
+  config: Config;
+}
+
+/**
  * Streaming event types for prompt service consumers
  */
 export type GeminiStreamEvent =
@@ -287,8 +295,7 @@ export class GeminiPromptService {
         // We need to manually execute the tools using SDK's executeToolCall() and send results back.
 
         // Get config for executeToolCall
-        // biome-ignore lint/suspicious/noExplicitAny: GeminiClient doesn't expose config property in types
-        const config = (client as any).config;
+        const config = (client as GeminiClientWithConfig).config;
 
         // Execute all pending tool calls using SDK's executeToolCall function
         const functionResponseParts: Part[] = [];
@@ -410,8 +417,7 @@ export class GeminiPromptService {
     if (this.sessionClients.has(sessionId)) {
       const existingClient = this.sessionClients.get(sessionId)!;
       // Update approval mode on existing client (in case it changed)
-      // biome-ignore lint/suspicious/noExplicitAny: GeminiClient doesn't expose config property in types
-      const config = (existingClient as any).config;
+      const config = (existingClient as GeminiClientWithConfig).config;
       if (config && typeof config.setApprovalMode === 'function') {
         config.setApprovalMode(approvalMode);
         console.log(`🔄 [Gemini] Updated approval mode for existing client: ${approvalMode}`);

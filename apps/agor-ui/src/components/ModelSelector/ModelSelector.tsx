@@ -1,3 +1,4 @@
+import { GEMINI_MODELS, type GeminiModel } from '@agor/core/tools';
 import { AVAILABLE_CLAUDE_MODEL_ALIASES } from '@agor/core/tools/models';
 import { InfoCircleOutlined } from '@ant-design/icons';
 import { Input, Radio, Select, Space, Tooltip, Typography } from 'antd';
@@ -29,6 +30,13 @@ const CODEX_MODEL_OPTIONS = [
   { id: 'gpt-4o-mini', label: 'GPT-4o Mini', description: 'Smaller, faster model' },
 ];
 
+// Gemini model options (convert from GEMINI_MODELS metadata)
+const GEMINI_MODEL_OPTIONS = Object.entries(GEMINI_MODELS).map(([modelId, meta]) => ({
+  id: modelId as GeminiModel,
+  label: meta.name,
+  description: meta.description,
+}));
+
 /**
  * Model Selector Component
  *
@@ -46,8 +54,12 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
 }) => {
   // Determine which model list to use based on agentic_tool (with backwards compat for agent prop)
   const effectiveTool = agentic_tool || agent || 'claude-code';
-  const isCodex = effectiveTool === 'codex';
-  const modelList = isCodex ? CODEX_MODEL_OPTIONS : AVAILABLE_CLAUDE_MODEL_ALIASES;
+  const modelList =
+    effectiveTool === 'codex'
+      ? CODEX_MODEL_OPTIONS
+      : effectiveTool === 'gemini'
+        ? GEMINI_MODEL_OPTIONS
+        : AVAILABLE_CLAUDE_MODEL_ALIASES;
 
   // Determine initial mode based on whether the value is in the aliases list
   // If no value provided, default to 'alias' mode (recommended)
@@ -63,9 +75,11 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       const defaultModel =
         newMode === 'alias'
           ? modelList[0].id
-          : isCodex
+          : effectiveTool === 'codex'
             ? 'gpt-5-codex'
-            : 'claude-sonnet-4-5-20250929';
+            : effectiveTool === 'gemini'
+              ? 'gemini-2.5-flash'
+              : 'claude-sonnet-4-5-20250929';
       onChange({
         mode: newMode,
         model: value?.model || defaultModel,
@@ -123,16 +137,24 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
               <Input
                 value={value?.model}
                 onChange={e => handleModelChange(e.target.value)}
-                placeholder={isCodex ? 'e.g., gpt-5-codex' : 'e.g., claude-opus-4-20250514'}
+                placeholder={
+                  effectiveTool === 'codex'
+                    ? 'e.g., gpt-5-codex'
+                    : effectiveTool === 'gemini'
+                      ? 'e.g., gemini-2.5-pro'
+                      : 'e.g., claude-opus-4-20250514'
+                }
                 style={{ width: '100%', minWidth: 400 }}
               />
               <div style={{ marginTop: 8, fontSize: 12, color: 'rgba(255, 255, 255, 0.45)' }}>
                 Enter any model ID to pin to a specific version.{' '}
                 <Link
                   href={
-                    isCodex
+                    effectiveTool === 'codex'
                       ? 'https://platform.openai.com/docs/models'
-                      : 'https://docs.anthropic.com/en/docs/about-claude/models'
+                      : effectiveTool === 'gemini'
+                        ? 'https://ai.google.dev/gemini-api/docs/models'
+                        : 'https://docs.anthropic.com/en/docs/about-claude/models'
                   }
                   target="_blank"
                   style={{ fontSize: 12 }}
