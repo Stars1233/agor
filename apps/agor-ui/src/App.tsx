@@ -2,6 +2,7 @@ import { getRepoReferenceOptions } from '@agor/core/config/browser';
 import { Alert, App as AntApp, ConfigProvider, Spin, theme } from 'antd';
 import { App as AgorApp } from './components/App';
 import { LoginPage } from './components/LoginPage';
+import { SandboxBanner } from './components/SandboxBanner';
 import {
   useAgorClient,
   useAgorData,
@@ -605,45 +606,48 @@ function AppContent() {
 
   // Render main app
   return (
-    <AgorApp
-      client={client}
-      user={user}
-      sessions={sessions}
-      tasks={tasks}
-      availableAgents={mockAgents}
-      boards={boards}
-      repos={repos}
-      worktrees={worktrees}
-      users={users}
-      mcpServers={mcpServers}
-      sessionMcpServerIds={sessionMcpServerIds}
-      worktreeOptions={worktreeOptions}
-      repoOptions={repoOptions}
-      initialBoardId={boards[0]?.board_id}
-      onCreateSession={handleCreateSession}
-      onForkSession={handleForkSession}
-      onSpawnSession={handleSpawnSession}
-      onSendPrompt={handleSendPrompt}
-      onUpdateSession={handleUpdateSession}
-      onDeleteSession={handleDeleteSession}
-      onCreateBoard={handleCreateBoard}
-      onUpdateBoard={handleUpdateBoard}
-      onDeleteBoard={handleDeleteBoard}
-      onCreateRepo={handleCreateRepo}
-      onUpdateRepo={handleUpdateRepo}
-      onDeleteRepo={handleDeleteRepo}
-      onDeleteWorktree={handleDeleteWorktree}
-      onUpdateWorktree={handleUpdateWorktree}
-      onCreateWorktree={handleCreateWorktree}
-      onCreateUser={handleCreateUser}
-      onUpdateUser={handleUpdateUser}
-      onDeleteUser={handleDeleteUser}
-      onCreateMCPServer={handleCreateMCPServer}
-      onUpdateMCPServer={handleUpdateMCPServer}
-      onDeleteMCPServer={handleDeleteMCPServer}
-      onUpdateSessionMcpServers={handleUpdateSessionMcpServers}
-      onLogout={logout}
-    />
+    <>
+      <SandboxBanner />
+      <AgorApp
+        client={client}
+        user={user}
+        sessions={sessions}
+        tasks={tasks}
+        availableAgents={mockAgents}
+        boards={boards}
+        repos={repos}
+        worktrees={worktrees}
+        users={users}
+        mcpServers={mcpServers}
+        sessionMcpServerIds={sessionMcpServerIds}
+        worktreeOptions={worktreeOptions}
+        repoOptions={repoOptions}
+        initialBoardId={boards[0]?.board_id}
+        onCreateSession={handleCreateSession}
+        onForkSession={handleForkSession}
+        onSpawnSession={handleSpawnSession}
+        onSendPrompt={handleSendPrompt}
+        onUpdateSession={handleUpdateSession}
+        onDeleteSession={handleDeleteSession}
+        onCreateBoard={handleCreateBoard}
+        onUpdateBoard={handleUpdateBoard}
+        onDeleteBoard={handleDeleteBoard}
+        onCreateRepo={handleCreateRepo}
+        onUpdateRepo={handleUpdateRepo}
+        onDeleteRepo={handleDeleteRepo}
+        onDeleteWorktree={handleDeleteWorktree}
+        onUpdateWorktree={handleUpdateWorktree}
+        onCreateWorktree={handleCreateWorktree}
+        onCreateUser={handleCreateUser}
+        onUpdateUser={handleUpdateUser}
+        onDeleteUser={handleDeleteUser}
+        onCreateMCPServer={handleCreateMCPServer}
+        onUpdateMCPServer={handleUpdateMCPServer}
+        onDeleteMCPServer={handleDeleteMCPServer}
+        onUpdateSessionMcpServers={handleUpdateSessionMcpServers}
+        onLogout={logout}
+      />
+    </>
   );
 }
 

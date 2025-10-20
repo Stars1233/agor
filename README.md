@@ -8,11 +8,44 @@ _The multiplayer, spatial layer that connects Claude Code, Codex, Gemini, and an
 
 ---
 
-A platform for **real-time, multiplayer agentic development**.  
-Visualize, coordinate, and automate your AI workflows across tools.  
+A platform for **real-time, multiplayer agentic development**.
+Visualize, coordinate, and automate your AI workflows across tools.
 Agor turns every AI session into a composable, inspectable, and reusable building block.
 
 ---
+
+## 🚀 Try Agor in GitHub Codespaces (Sandbox)
+
+**No installation required** – Get a fully functional Agor instance in < 60 seconds:
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/mistercrunch/agor?quickstart=1)
+
+**What you get:**
+
+- ✅ Daemon + UI auto-running on :3030 and :5173
+- ✅ Docker-in-Docker for environment management
+- ✅ Port-forwarded URLs (private or public)
+- ✅ Full multiplayer support
+- ✅ Pre-installed AI agent CLIs (Claude Code, Gemini)
+
+**⚠️ Sandbox Mode:**
+
+- Early beta - Not production-ready
+- Avoid storing sensitive data (API keys, credentials)
+- Codespaces free tier: 60 hours/month ([check your usage](https://github.com/settings/billing))
+
+**Getting Started:**
+
+1. Click the badge above → Wait for services to start (~60s)
+2. Open forwarded URL for port 5173 (UI) in browser
+3. Run `agor init` in terminal to configure API keys (optional)
+4. Create a session and start orchestrating!
+
+**Collaborating:**
+
+1. Open **Ports** panel in VS Code
+2. Right-click port 5173 → **Port Visibility** → **Public**
+3. Share the public URL with teammates
 
 ---
 

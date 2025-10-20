@@ -1,0 +1,42 @@
+{
+  "name": "Agor Sandbox",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "enableNonRootDocker": "true"
+    }
+  },
+  "containerEnv": {
+    "VITE_CODESPACES": "true"
+  },
+  "forwardPorts": [3030, 5173],
+  "portsAttributes": {
+    "3030": {
+      "label": "Agor Daemon",
+      "onAutoForward": "notify"
+    },
+    "5173": {
+      "label": "Agor UI",
+      "onAutoForward": "openBrowserOnce"
+    }
+  },
+  "postCreateCommand": "pnpm install && pnpm -r build",
+  "postStartCommand": "bash .devcontainer/start-services.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-vscode.vscode-typescript-next",
+        "alexcvzz.vscode-sqlite"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "remoteUser": "node"
+}
