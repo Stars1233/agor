@@ -15,7 +15,8 @@ export interface WorktreeModalProps {
   repo: Repo | null;
   sessions: Session[];
   client: Application | null;
-  onUpdate?: (worktreeId: string, updates: Partial<Worktree>) => void;
+  onUpdateWorktree?: (worktreeId: string, updates: Partial<Worktree>) => void;
+  onUpdateRepo?: (repoId: string, updates: Partial<Repo>) => void;
   onDelete?: (worktreeId: string) => void;
   onOpenSettings?: () => void; // Navigate to Settings → Repositories
 }
@@ -27,7 +28,8 @@ export const WorktreeModal: React.FC<WorktreeModalProps> = ({
   repo,
   sessions,
   client,
-  onUpdate,
+  onUpdateWorktree,
+  onUpdateRepo,
   onDelete,
   onOpenSettings,
 }) => {
@@ -60,7 +62,7 @@ export const WorktreeModal: React.FC<WorktreeModalProps> = ({
                 worktree={worktree}
                 repo={repo}
                 sessions={sessions}
-                onUpdate={onUpdate}
+                onUpdate={onUpdateWorktree}
                 onDelete={onDelete}
               />
             ),
@@ -68,7 +70,14 @@ export const WorktreeModal: React.FC<WorktreeModalProps> = ({
           {
             key: 'environment',
             label: 'Environment',
-            children: <EnvironmentTab worktree={worktree} repo={repo} onUpdate={onUpdate} />,
+            children: (
+              <EnvironmentTab
+                worktree={worktree}
+                repo={repo}
+                onUpdateRepo={onUpdateRepo}
+                onUpdateWorktree={onUpdateWorktree}
+              />
+            ),
           },
           {
             key: 'concepts',

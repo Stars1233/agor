@@ -440,6 +440,21 @@ function AppContent() {
     }
   };
 
+  const handleUpdateRepo = async (
+    repoId: string,
+    updates: Partial<import('@agor/core/types').Repo>
+  ) => {
+    if (!client) return;
+    try {
+      await client.service('repos').patch(repoId, updates);
+      message.success('Repository updated successfully!');
+    } catch (error) {
+      message.error(
+        `Failed to update repository: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  };
+
   const handleDeleteRepo = async (repoId: string) => {
     if (!client) return;
     try {
@@ -615,6 +630,7 @@ function AppContent() {
       onUpdateBoard={handleUpdateBoard}
       onDeleteBoard={handleDeleteBoard}
       onCreateRepo={handleCreateRepo}
+      onUpdateRepo={handleUpdateRepo}
       onDeleteRepo={handleDeleteRepo}
       onDeleteWorktree={handleDeleteWorktree}
       onUpdateWorktree={handleUpdateWorktree}

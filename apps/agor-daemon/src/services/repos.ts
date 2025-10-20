@@ -9,6 +9,7 @@ import { type Database, RepoRepository } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
 import { cloneRepo, getWorktreePath, createWorktree as gitCreateWorktree } from '@agor/core/git';
 import type { QueryParams, Repo, Worktree } from '@agor/core/types';
+import { autoAssignWorktreeUniqueId } from '@agor/core/environment/variable-resolver';
 import { DrizzleService } from '../adapters/drizzle';
 
 /**
@@ -156,8 +157,16 @@ export class ReposService extends DrizzleService<Repo, Partial<Repo>, RepoParams
       data.sourceBranch
     );
 
-    // Create worktree record in database using the service (broadcasts WebSocket event)
+    // Get all existing worktrees to auto-assign unique ID
     const worktreesService = this.app.service('worktrees');
+    const existingWorktrees = await worktreesService.find({
+      query: { $limit: 1000 },
+      paginate: false,
+    }) as unknown as Worktree[];
+
+    const worktreeUniqueId = autoAssignWorktreeUniqueId(existingWorktrees);
+
+    // Create worktree record in database using the service (broadcasts WebSocket event)
     return worktreesService.create({
       repo_id: repo.repo_id,
       name: data.name,
@@ -165,6 +174,7 @@ export class ReposService extends DrizzleService<Repo, Partial<Repo>, RepoParams
       ref: data.ref,
       base_ref: data.sourceBranch,
       new_branch: data.createBranch ?? false,
+      worktree_unique_id: worktreeUniqueId,
       sessions: [],
       last_used: new Date().toISOString(),
     }) as Promise<Worktree>;

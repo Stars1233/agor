@@ -1,5 +1,5 @@
 // src/mocks/sessions.ts
-import type { Session, SessionID, TaskID } from '../types';
+import type { Session, SessionID, TaskID, WorktreeID } from '../types';
 
 export const mockSessionA: Session = {
   session_id: 'abc123' as SessionID,
@@ -10,10 +10,7 @@ export const mockSessionA: Session = {
   created_at: '2025-10-01T10:00:00Z',
   last_updated: '2025-10-01T10:30:00Z',
   created_by: 'user-123',
-  repo: {
-    cwd: '../my-project-auth',
-    managed_worktree: true,
-  },
+  worktree_id: 'worktree-auth-123' as WorktreeID,
   git_state: {
     ref: 'feature/auth',
     base_sha: 'a4f2e91',
@@ -38,10 +35,7 @@ export const mockSessionB: Session = {
   created_at: '2025-10-01T10:20:00Z',
   last_updated: '2025-10-01T10:35:00Z',
   created_by: 'user-123',
-  repo: {
-    cwd: '../my-project-oauth',
-    managed_worktree: true,
-  },
+  worktree_id: 'worktree-oauth-456' as WorktreeID,
   git_state: {
     ref: 'feature/oauth',
     base_sha: 'a4f2e91',
@@ -68,10 +62,7 @@ export const mockSessionC: Session = {
   created_at: '2025-10-01T10:18:00Z',
   last_updated: '2025-10-01T10:28:00Z',
   created_by: 'user-123',
-  repo: {
-    cwd: '../my-project-database',
-    managed_worktree: true,
-  },
+  worktree_id: 'worktree-database-789' as WorktreeID,
   git_state: {
     ref: 'feature/auth',
     base_sha: 'b3e4d12',

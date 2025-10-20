@@ -10,6 +10,7 @@ import {
   GithubOutlined,
   MessageOutlined,
   ToolOutlined,
+  ApartmentOutlined,
 } from '@ant-design/icons';
 import { message, Tag, theme } from 'antd';
 import type React from 'react';
@@ -233,16 +234,29 @@ export const BranchPill: React.FC<BranchPillProps> = ({ branch, size, style }) =
 interface RepoPillProps extends BasePillProps {
   repoName: string;
   worktreeName?: string;
+  onClick?: () => void;
 }
 
-export const RepoPill: React.FC<RepoPillProps> = ({ repoName, worktreeName, size, style }) => {
+export const RepoPill: React.FC<RepoPillProps> = ({ repoName, worktreeName, onClick, size, style }) => {
   const { token } = theme.useToken();
 
   return (
-    <Tag icon={<GithubOutlined />} color={PILL_COLORS.git} style={style}>
+    <Tag
+      icon={<BranchesOutlined />}
+      color="cyan"
+      style={{ ...style, cursor: onClick ? 'pointer' : 'default' }}
+      onClick={onClick}
+    >
       <span style={{ fontFamily: token.fontFamilyCode }}>
         {repoName}
-        {worktreeName && `:${worktreeName}`}
+        {worktreeName && (
+          <>
+            {' '}
+            <ApartmentOutlined style={{ fontSize: '0.85em', opacity: 0.7 }} />
+            {' '}
+            {worktreeName}
+          </>
+        )}
       </span>
     </Tag>
   );

@@ -26,6 +26,16 @@ export interface Worktree {
   /** Repository this worktree belongs to */
   repo_id: UUID;
 
+  /**
+   * Unique numeric ID for this worktree (auto-assigned, sequential)
+   *
+   * Used in environment templates for port allocation:
+   * Example: {{add 9000 WORKTREE_UNIQUE_ID}} → 9001, 9002, 9003, ...
+   *
+   * Auto-incremented when worktree is created (1, 2, 3, ...)
+   */
+  worktree_unique_id: number;
+
   /** Timestamps */
   created_at: string;
   updated_at: string;
@@ -180,17 +190,11 @@ export interface Worktree {
  * Worktree environment instance
  *
  * Runtime state for a worktree's environment (dev server, Docker, etc.).
- * Resolves template variables from repo-level environment config.
+ * Template variables are resolved from:
+ * - Built-in: WORKTREE_UNIQUE_ID, WORKTREE_NAME, WORKTREE_PATH, REPO_SLUG
+ * - Custom: worktree.custom_context (JSON object)
  */
 export interface WorktreeEnvironmentInstance {
-  /**
-   * Instance-specific variable values
-   *
-   * Resolves template variables from repo config.
-   * Example: { UI_PORT: 5173, DAEMON_PORT: 3030 }
-   */
-  variables: Record<string, string | number>;
-
   /**
    * Current environment status
    */
@@ -242,37 +246,35 @@ export interface WorktreeEnvironmentInstance {
  * Repository environment configuration template
  *
  * Defines how to run environments for all worktrees in a repo.
- * Each worktree creates an instance with specific variable values.
+ * Uses Handlebars templating with scoped entity references.
+ *
+ * Template context (always available):
+ * - {{worktree.unique_id}} - Auto-assigned unique number (1, 2, 3, ...)
+ * - {{worktree.name}} - Worktree name (e.g., "feat-auth")
+ * - {{worktree.path}} - Absolute path to worktree directory
+ * - {{repo.slug}} - Repository slug (e.g., "agor")
+ * - {{custom.*}} - Any custom context from worktree.custom_context
+ * - {{add a b}}, {{sub a b}}, {{mul a b}} - Math helpers
  */
 export interface RepoEnvironmentConfig {
   /**
-   * Command to start environment (templated)
-   *
-   * Template variables are resolved from worktree.environment_instance.variables.
+   * Command to start environment (Handlebars template)
    *
    * Examples:
    * - "docker compose -p {{worktree.name}} up -d"
-   * - "PORT={{UI_PORT}} pnpm dev"
+   * - "UI_PORT={{add 9000 worktree.unique_id}} DAEMON_PORT={{add 8000 worktree.unique_id}} pnpm dev"
+   * - "PORT={{add 5000 worktree.unique_id}} npm start"
    */
   up_command: string;
 
   /**
-   * Command to stop environment (templated)
+   * Command to stop environment (Handlebars template)
    *
    * Examples:
    * - "docker compose -p {{worktree.name}} down"
-   * - "pkill -f 'vite.*{{UI_PORT}}'"
+   * - "pkill -f 'vite.*{{add 9000 worktree.unique_id}}'"
    */
   down_command: string;
-
-  /**
-   * Template variables that worktrees must provide
-   *
-   * Example: ["UI_PORT", "DAEMON_PORT"]
-   *
-   * Agor can auto-assign values (e.g., find available ports).
-   */
-  template_vars: string[];
 
   /**
    * Optional health check configuration
@@ -280,9 +282,11 @@ export interface RepoEnvironmentConfig {
   health_check?: {
     /** Health check type */
     type: 'http' | 'tcp' | 'process';
-    /** URL template for HTTP checks (e.g., "http://localhost:{{UI_PORT}}/health") */
+    /**
+     * URL template for HTTP checks
+     *
+     * Example: "http://localhost:{{add 9000 worktree.unique_id}}/health"
+     */
     url_template?: string;
-    /** Port variable for TCP checks (e.g., "UI_PORT") */
-    port_var?: string;
   };
 }

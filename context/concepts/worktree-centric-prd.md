@@ -35,7 +35,7 @@
 - ✅ Clickable worktree badges in SessionHeader
 - ✅ Row click in WorktreesTable opens modal
 
-**Phase 1.5 (Session-Worktree Integration):** 🚧 **IN PROGRESS**
+**Phase 1.5 (Session-Worktree Integration):** ✅ **COMPLETE**
 
 - ✅ Session creation requires worktree selection
   - ✅ Simplified NewSessionModal (removed complex repo modes)
@@ -44,16 +44,22 @@
   - ✅ Updated `getRepoReferenceOptions()` to accept worktrees parameter
 - ✅ Sessions store `worktree_id` instead of nested repo object
   - ✅ Updated session creation flow to lookup worktree by reference
-  - ✅ Sessions service hook populates `repo.cwd` from worktree automatically
-- 🚧 Docker environment includes agent CLIs
-  - ✅ Claude Code CLI installed globally in container
-  - ✅ Gemini CLI added to Dockerfile
-  - ⏳ Testing agent execution in worktree directories
-- ⏳ Sessions run in correct worktree directory
-  - ✅ Hook implemented to populate repo.cwd from worktree.path
-  - ⏳ Verifying agent execution picks up the correct cwd
+  - ✅ Sessions service hook populates `repo.cwd` from worktree automatically (backward compatibility)
+- ✅ Docker environment includes agent CLIs
+  - ✅ Claude Code CLI installed globally in container (@anthropic-ai/claude-code)
+  - ✅ Gemini CLI added to Dockerfile (@google/gemini-cli)
+  - ✅ Agent execution tested and working in worktree directories
+- ✅ Sessions run in correct worktree directory
+  - ✅ Hook implemented to populate repo.cwd from worktree.path (backward compatibility)
+  - ✅ ClaudePromptService directly fetches worktree and uses worktree.path as cwd
+  - ✅ WorktreeRepository injected into ClaudeTool and prompt service
+  - ✅ Verified Claude Code and Codex execute with correct cwd
+  - ✅ Comprehensive logging for debugging cwd resolution
+- ✅ UI Improvements
+  - ✅ Removed Context tab from Settings (was showing Agor meta-docs)
+  - ✅ Concept files now only in WorktreeModal → Concepts tab (worktree-specific)
 
-**Next Up:** Complete Phase 1.5 integration, then Environment Execution (Phase 2)
+**Next Up:** Phase 2 - Environment Execution (start/stop/restart functionality)
 
 ---
 

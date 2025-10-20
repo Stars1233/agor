@@ -70,6 +70,16 @@
       "types": "./dist/feathers/index.d.ts",
       "import": "./dist/feathers/index.js",
       "require": "./dist/feathers/index.cjs"
+    },
+    "./templates/handlebars-helpers": {
+      "types": "./dist/templates/handlebars-helpers.d.ts",
+      "import": "./dist/templates/handlebars-helpers.js",
+      "require": "./dist/templates/handlebars-helpers.cjs"
+    },
+    "./environment/variable-resolver": {
+      "types": "./dist/environment/variable-resolver.d.ts",
+      "import": "./dist/environment/variable-resolver.js",
+      "require": "./dist/environment/variable-resolver.cjs"
     }
   },
   "scripts": {
@@ -111,5 +121,8 @@
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
     "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "handlebars": "^4.7.8"
   }
 }

@@ -169,7 +169,10 @@ export const WorktreesTable: React.FC<WorktreesTableProps> = ({
                 )}
               </>
             }
-            onConfirm={() => handleDelete(record.worktree_id)}
+            onConfirm={e => {
+              e?.stopPropagation();
+              handleDelete(record.worktree_id);
+            }}
             okText="Delete"
             cancelText="Cancel"
             okButtonProps={{ danger: true }}

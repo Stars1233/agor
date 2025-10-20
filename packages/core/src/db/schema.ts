@@ -256,13 +256,11 @@ export const repos = sqliteTable(
         local_path: string; // Always ~/.agor/repos/{slug}
         default_branch?: string;
         environment_config?: {
-          up_command: string;
-          down_command: string;
-          template_vars: string[];
+          up_command: string; // Handlebars template
+          down_command: string; // Handlebars template
           health_check?: {
             type: 'http' | 'tcp' | 'process';
-            url_template?: string;
-            port_var?: string;
+            url_template?: string; // Handlebars template
           };
         };
       }>()
@@ -297,6 +295,7 @@ export const worktrees = sqliteTable(
     // Materialized for queries
     name: text('name').notNull(), // "feat-auth", "main"
     ref: text('ref').notNull(), // Current branch/tag/commit
+    worktree_unique_id: integer('worktree_unique_id').notNull(), // Auto-assigned sequential ID for templates
 
     // JSON blob for everything else
     data: text('data', { mode: 'json' })
@@ -316,9 +315,8 @@ export const worktrees = sqliteTable(
         pull_request_url?: string; // PR link
         notes?: string; // Freeform user notes
 
-        // Environment instance
+        // Environment instance (runtime state only, no variables)
         environment_instance?: {
-          variables: Record<string, string | number>;
           status: 'stopped' | 'starting' | 'running' | 'stopping' | 'error';
           process?: {
             pid?: number;
@@ -341,7 +339,7 @@ export const worktrees = sqliteTable(
         sessions: string[]; // SessionID[]
         last_used: string; // ISO timestamp
 
-        // Custom context for templates
+        // Custom context for templates (accessible as {{custom.*}})
         custom_context?: Record<string, unknown>;
       }>()
       .notNull(),

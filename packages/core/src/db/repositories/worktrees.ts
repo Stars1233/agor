@@ -36,6 +36,7 @@ export class WorktreeRepository implements BaseRepository<Worktree, Partial<Work
       created_by: row.created_by as UUID,
       name: row.name,
       ref: row.ref,
+      worktree_unique_id: row.worktree_unique_id,
       ...row.data,
       sessions: (row.data.sessions || []) as UUID[],
     };
@@ -56,6 +57,7 @@ export class WorktreeRepository implements BaseRepository<Worktree, Partial<Work
       created_by: worktree.created_by ?? 'anonymous',
       name: worktree.name!,
       ref: worktree.ref!,
+      worktree_unique_id: worktree.worktree_unique_id!, // Required field
       data: {
         path: worktree.path!,
         base_ref: worktree.base_ref,

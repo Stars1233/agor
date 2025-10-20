@@ -181,6 +181,7 @@ async function createInitialSchema(db: Database): Promise<void> {
         created_by TEXT NOT NULL DEFAULT 'anonymous',
         name TEXT NOT NULL,
         ref TEXT NOT NULL,
+        worktree_unique_id INTEGER NOT NULL,
         data TEXT NOT NULL,
         FOREIGN KEY (repo_id) REFERENCES repos(repo_id) ON DELETE CASCADE
       )

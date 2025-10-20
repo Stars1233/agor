@@ -34,6 +34,7 @@ export interface SettingsModalProps {
   onUpdateBoard?: (boardId: string, updates: Partial<Board>) => void;
   onDeleteBoard?: (boardId: string) => void;
   onCreateRepo?: (data: { url: string; slug: string }) => void;
+  onUpdateRepo?: (repoId: string, updates: Partial<Repo>) => void;
   onDeleteRepo?: (repoId: string) => void;
   onDeleteWorktree?: (worktreeId: string) => void;
   onUpdateWorktree?: (worktreeId: string, updates: Partial<Worktree>) => void;
@@ -63,6 +64,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onUpdateBoard,
   onDeleteBoard,
   onCreateRepo,
+  onUpdateRepo,
   onDeleteRepo,
   onDeleteWorktree,
   onUpdateWorktree,
@@ -173,7 +175,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         repo={selectedRepo}
         sessions={worktreeSessions}
         client={client}
-        onUpdate={onUpdateWorktree}
+        onUpdateWorktree={onUpdateWorktree}
+        onUpdateRepo={onUpdateRepo}
         onDelete={onDeleteWorktree}
         onOpenSettings={onClose} // Close worktree modal and keep settings modal open
       />

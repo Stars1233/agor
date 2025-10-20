@@ -1,16 +1,17 @@
 /**
  * Context Service
  *
- * Provides read-only REST + WebSocket API for browsing markdown files in context/.
+ * Provides read-only REST + WebSocket API for browsing markdown files in worktree context/ directories.
  * Does not use database - reads directly from filesystem.
  *
  * Configuration:
- * - Currently reads from: <project-root>/context/
- * - Future: May move to ~/.agor/context/
+ * - Scans context/ folder from worktree path when worktree_id is provided
+ * - Recursively finds all .md files in context/ and subdirectories
  */
 
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { WorktreeRepository } from '@agor/core/db';
 import type {
   ContextFileDetail,
   ContextFileListItem,
@@ -23,10 +24,12 @@ import type {
 /**
  * Context service params (read-only, no create/update/delete)
  */
-export type ContextParams = QueryParams<Record<string, never>>;
+export type ContextParams = QueryParams<{
+  worktree_id?: string;
+}>;
 
 /**
- * Context service - read-only filesystem browser for context/ folder
+ * Context service - read-only filesystem browser for worktree concept files
  */
 export class ContextService
   implements
@@ -35,34 +38,66 @@ export class ContextService
       'find' | 'get' | 'setup' | 'teardown'
     >
 {
-  private contextPath: string;
+  private worktreeRepo: WorktreeRepository;
 
-  constructor(contextPath: string) {
-    this.contextPath = contextPath;
+  constructor(worktreeRepo: WorktreeRepository) {
+    this.worktreeRepo = worktreeRepo;
   }
 
   /**
-   * Find all markdown files (GET /context)
+   * Find all markdown files (GET /context?worktree_id=xxx)
    * Returns lightweight list items without content
    */
-  async find(_params?: ContextParams): Promise<ContextFileListItem[]> {
+  async find(params?: ContextParams): Promise<ContextFileListItem[]> {
+    const worktreeId = params?.query?.worktree_id;
+
+    if (!worktreeId) {
+      throw new Error('worktree_id query parameter is required');
+    }
+
+    // Get worktree to find its path
+    const worktree = await this.worktreeRepo.findById(worktreeId);
+    if (!worktree) {
+      throw new Error(`Worktree not found: ${worktreeId}`);
+    }
+
+    console.log('[Context Service] Worktree:', {
+      worktree_id: worktree.worktree_id,
+      name: worktree.name,
+      path: worktree.path,
+    });
+
     const files: ContextFileListItem[] = [];
 
-    // Read all markdown files recursively from context/
-    await this.scanDirectory(this.contextPath, '', files);
+    // Scan context/ directory
+    await this.scanDirectory(worktree.path, 'context', files);
+
+    console.log('[Context Service] Found files:', files.length);
 
     return files;
   }
 
   /**
-   * Get specific markdown file (GET /context/:path)
+   * Get specific markdown file (GET /context/:path?worktree_id=xxx)
    * Returns full details with content
    *
-   * @param id - Relative path from context/ (e.g., "concepts/core.md", "README.md")
+   * @param id - Relative path from worktree root (e.g., "context/concepts/core.md", "CLAUDE.md")
    */
-  async get(id: Id, _params?: ContextParams): Promise<ContextFileDetail> {
+  async get(id: Id, params?: ContextParams): Promise<ContextFileDetail> {
+    const worktreeId = params?.query?.worktree_id;
+
+    if (!worktreeId) {
+      throw new Error('worktree_id query parameter is required');
+    }
+
+    // Get worktree to find its path
+    const worktree = await this.worktreeRepo.findById(worktreeId);
+    if (!worktree) {
+      throw new Error(`Worktree not found: ${worktreeId}`);
+    }
+
     const relativePath = id.toString();
-    const fullPath = join(this.contextPath, relativePath);
+    const fullPath = join(worktree.path, relativePath);
 
     try {
       // Read file content
@@ -83,6 +118,34 @@ export class ContextService
       };
     } catch (error) {
       throw new Error(`Failed to read context file: ${error}`);
+    }
+  }
+
+  /**
+   * Scan a single file and add to list if it exists
+   */
+  private async scanFile(
+    basePath: string,
+    relativePath: string,
+    files: ContextFileListItem[]
+  ): Promise<void> {
+    const fullPath = join(basePath, relativePath);
+
+    try {
+      const stats = await stat(fullPath);
+      if (stats.isFile() && relativePath.endsWith('.md')) {
+        const content = await readFile(fullPath, 'utf-8');
+        const title = this.extractTitle(content, relativePath);
+
+        files.push({
+          path: relativePath,
+          title,
+          size: stats.size,
+          lastModified: stats.mtime.toISOString(),
+        });
+      }
+    } catch (error) {
+      // File doesn't exist, ignore
     }
   }
 
@@ -121,7 +184,7 @@ export class ContextService
         }
       }
     } catch (error) {
-      console.error(`Failed to scan directory ${dirPath}:`, error);
+      // Directory doesn't exist, ignore
     }
   }
 
@@ -152,6 +215,6 @@ export class ContextService
 /**
  * Service factory function
  */
-export function createContextService(contextPath: string): ContextService {
-  return new ContextService(contextPath);
+export function createContextService(worktreeRepo: WorktreeRepository): ContextService {
+  return new ContextService(worktreeRepo);
 }

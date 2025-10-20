@@ -1,5 +1,5 @@
 import type { AgorClient } from '@agor/core/api';
-import type { MCPServer, PermissionMode, User } from '@agor/core/types';
+import type { MCPServer, PermissionMode, Repo, User, Worktree } from '@agor/core/types';
 import {
   ApiOutlined,
   BranchesOutlined,
@@ -51,6 +51,8 @@ interface SessionDrawerProps {
   session: Session | null;
   users?: User[];
   currentUserId?: string;
+  repos?: Repo[];
+  worktrees?: Worktree[];
   mcpServers?: MCPServer[];
   sessionMcpServerIds?: string[];
   open: boolean;
@@ -65,6 +67,7 @@ interface SessionDrawerProps {
     allow: boolean
   ) => void;
   onOpenSettings?: (sessionId: string) => void;
+  onOpenWorktree?: (worktreeId: string) => void;
   onUpdateSession?: (sessionId: string, updates: Partial<Session>) => void;
 }
 
@@ -73,6 +76,8 @@ const SessionDrawer = ({
   session,
   users = [],
   currentUserId,
+  repos = [],
+  worktrees = [],
   mcpServers = [],
   sessionMcpServerIds = [],
   open,
@@ -82,6 +87,7 @@ const SessionDrawer = ({
   onSubtask,
   onPermissionDecision,
   onOpenSettings,
+  onOpenWorktree,
   onUpdateSession,
 }: SessionDrawerProps) => {
   const { token } = theme.useToken();
@@ -287,14 +293,25 @@ const SessionDrawer = ({
       {/* Git & Repo Info */}
       <div style={{ marginBottom: token.sizeUnit }}>
         <Space size={4} wrap>
-          {session.repo?.repo_slug ? (
-            <RepoPill repoName={session.repo.repo_slug} worktreeName={session.repo.worktree_name} />
-          ) : session.repo?.cwd ? (
-            <RepoPill repoName={session.repo.cwd.split('/').pop() || session.repo.cwd} />
-          ) : null}
-          {session.repo?.managed_worktree && <WorktreePill managed={true} />}
-          <BranchPill branch={session.git_state.ref} />
-          <GitShaPill sha={session.git_state.current_sha} isDirty={isDirty} />
+          {(() => {
+            // Find worktree and repo from session.worktree_id
+            const worktree = worktrees.find(w => w.worktree_id === session.worktree_id);
+            const repo = worktree ? repos.find(r => r.repo_id === worktree.repo_id) : null;
+
+            return (
+              <>
+                {worktree && repo && (
+                  <RepoPill
+                    repoName={repo.slug}
+                    worktreeName={worktree.name}
+                    onClick={onOpenWorktree ? () => onOpenWorktree(worktree.worktree_id) : undefined}
+                  />
+                )}
+                <BranchPill branch={session.git_state.ref} />
+                <GitShaPill sha={session.git_state.current_sha} isDirty={isDirty} />
+              </>
+            );
+          })()}
         </Space>
       </div>
 
