@@ -2,8 +2,11 @@
 # Supports hot-reload for both daemon and UI
 FROM node:20-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
+# Install system dependencies (including git for repo cloning)
+RUN apt-get update && apt-get install -y \
+  sqlite3 \
+  git \
+  && rm -rf /var/lib/apt/lists/*
 
 # Install pnpm
 RUN npm install -g pnpm@9.15.1

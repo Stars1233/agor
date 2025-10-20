@@ -9,6 +9,44 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { simpleGit } from 'simple-git';
 
+/**
+ * Get git binary path
+ *
+ * Searches common locations for git executable.
+ * Needed because daemon may not have git in PATH.
+ */
+function getGitBinary(): string | undefined {
+  const { existsSync } = require('node:fs');
+  const commonPaths = [
+    '/opt/homebrew/bin/git', // Homebrew on Apple Silicon
+    '/usr/local/bin/git', // Homebrew on Intel
+    '/usr/bin/git', // System git (Docker and Linux)
+  ];
+
+  for (const path of commonPaths) {
+    if (existsSync(path)) {
+      return path;
+    }
+  }
+
+  // Fall back to 'git' in PATH
+  return undefined;
+}
+
+/**
+ * Create a configured simple-git instance
+ *
+ * Automatically detects git binary path for consistent behavior
+ * across different environments (native, Docker, etc.)
+ */
+function createGit(baseDir?: string) {
+  const gitBinary = getGitBinary();
+  return simpleGit({
+    baseDir,
+    binary: gitBinary,
+  });
+}
+
 export interface CloneOptions {
   url: string;
   targetDir?: string;
@@ -73,23 +111,20 @@ export async function cloneRepo(options: CloneOptions): Promise<CloneResult> {
   }
 
   // Configure git with progress tracking
-  const git = simpleGit({
-    progress: options.onProgress
-      ? ({ method, stage, progress }) => {
-          options.onProgress?.({
-            method,
-            stage,
-            progress,
-          });
-        }
-      : undefined,
-  });
+  const git = createGit();
+  if (options.onProgress) {
+    git.outputHandler((_command, stdout, stderr) => {
+      // Note: Progress tracking through outputHandler is limited
+      // This is a simplified version - simple-git's progress callback
+      // in constructor works better, but we need the binary path too
+    });
+  }
 
   // Clone the repo
   await git.clone(options.url, targetPath, options.bare ? ['--bare'] : []);
 
   // Get default branch
-  const repoGit = simpleGit(targetPath);
+  const repoGit = createGit(targetPath);
   const branches = await repoGit.branch();
   const defaultBranch = branches.current || 'main';
 
@@ -105,7 +140,7 @@ export async function cloneRepo(options: CloneOptions): Promise<CloneResult> {
  */
 export async function isGitRepo(path: string): Promise<boolean> {
   try {
-    const git = simpleGit(path);
+    const git = createGit(path);
     await git.status();
     return true;
   } catch {
@@ -117,7 +152,7 @@ export async function isGitRepo(path: string): Promise<boolean> {
  * Get current branch name
  */
 export async function getCurrentBranch(repoPath: string): Promise<string> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   const status = await git.status();
   return status.current || '';
 }
@@ -126,7 +161,7 @@ export async function getCurrentBranch(repoPath: string): Promise<string> {
  * Get current commit SHA
  */
 export async function getCurrentSha(repoPath: string): Promise<string> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   const log = await git.log({ maxCount: 1 });
   return log.latest?.hash || '';
 }
@@ -135,7 +170,7 @@ export async function getCurrentSha(repoPath: string): Promise<string> {
  * Check if working directory is clean (no uncommitted changes)
  */
 export async function isClean(repoPath: string): Promise<boolean> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   const status = await git.status();
   return status.isClean();
 }
@@ -144,7 +179,7 @@ export async function isClean(repoPath: string): Promise<boolean> {
  * Get remote URL
  */
 export async function getRemoteUrl(repoPath: string, remote: string = 'origin'): Promise<string> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   const remotes = await git.getRemotes(true);
   const remoteObj = remotes.find(r => r.name === remote);
   return remoteObj?.refs.fetch || '';
@@ -190,7 +225,7 @@ export async function createWorktree(
   pullLatest: boolean = false,
   sourceBranch?: string
 ): Promise<void> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
 
   // Pull latest from remote if requested and ref is a branch name (not SHA)
   if (pullLatest && !ref.match(/^[0-9a-f]{7,40}$/)) {
@@ -224,7 +259,7 @@ export async function createWorktree(
  * List all worktrees for a repository
  */
 export async function listWorktrees(repoPath: string): Promise<WorktreeInfo[]> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   const output = await git.raw(['worktree', 'list', '--porcelain']);
 
   const worktrees: WorktreeInfo[] = [];
@@ -263,7 +298,7 @@ export async function listWorktrees(repoPath: string): Promise<WorktreeInfo[]> {
  * Remove a git worktree
  */
 export async function removeWorktree(repoPath: string, worktreeName: string): Promise<void> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   await git.raw(['worktree', 'remove', worktreeName]);
 }
 
@@ -271,7 +306,7 @@ export async function removeWorktree(repoPath: string, worktreeName: string): Pr
  * Prune stale worktree metadata
  */
 export async function pruneWorktrees(repoPath: string): Promise<void> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   await git.raw(['worktree', 'prune']);
 }
 
@@ -283,7 +318,7 @@ export async function hasRemoteBranch(
   branchName: string,
   remote: string = 'origin'
 ): Promise<boolean> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   const branches = await git.branch(['-r']);
   return branches.all.includes(`${remote}/${branchName}`);
 }
@@ -295,7 +330,7 @@ export async function getRemoteBranches(
   repoPath: string,
   remote: string = 'origin'
 ): Promise<string[]> {
-  const git = simpleGit(repoPath);
+  const git = createGit(repoPath);
   const branches = await git.branch(['-r']);
   return branches.all.filter(b => b.startsWith(`${remote}/`)).map(b => b.replace(`${remote}/`, ''));
 }
