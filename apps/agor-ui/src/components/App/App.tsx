@@ -379,8 +379,7 @@ export const App: React.FC<AppProps> = ({
         worktree={selectedWorktree || null}
         repo={selectedWorktreeRepo || null}
         sessions={worktreeSessions}
-        // biome-ignore lint/suspicious/noExplicitAny: AgorClient vs Application type incompatibility
-        client={client as any}
+        client={client}
         onUpdateWorktree={onUpdateWorktree}
         onUpdateRepo={onUpdateRepo}
         onDelete={onDeleteWorktree}
