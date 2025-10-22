@@ -5,6 +5,7 @@
  */
 
 export * from './config-manager';
+export * from './constants';
 export * from './context-resolver';
 export * from './repo-list';
 export * from './repo-reference';

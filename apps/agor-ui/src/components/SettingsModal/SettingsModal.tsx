@@ -105,7 +105,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     ? sessions.filter(s => s.worktree_id === selectedWorktree.worktree_id)
     : [];
   return (
-    <Modal title="Settings" open={open} onCancel={onClose} footer={null} width={900}>
+    <Modal title="Settings" open={open} onCancel={onClose} footer={null} width={1200}>
       <Tabs
         defaultActiveKey="boards"
         items={[
@@ -134,7 +134,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           },
           {
             key: 'worktrees',
-            label: 'Worktrees',
+            label: 'Worktrees & Environments',
             children: (
               <div style={{ padding: '0 24px' }}>
                 <WorktreesTable

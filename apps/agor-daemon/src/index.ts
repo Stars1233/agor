@@ -65,6 +65,7 @@ import type {
 } from './declarations';
 import { createBoardsService } from './services/boards';
 import { createContextService } from './services/context';
+import { createHealthMonitor } from './services/health-monitor';
 import { createMCPServersService } from './services/mcp-servers';
 import { createMessagesService } from './services/messages';
 import { createReposService } from './services/repos';
@@ -132,9 +133,15 @@ async function main() {
     `http://localhost:${UI_PORT + 3}`,
   ];
 
+  // In Codespaces or if CORS_ORIGIN=* is set, allow all origins
+  const corsOrigin =
+    process.env.CORS_ORIGIN === '*' || process.env.CODESPACES === 'true'
+      ? true // Allow all origins
+      : corsOrigins;
+
   app.use(
     cors({
-      origin: corsOrigins,
+      origin: corsOrigin,
       credentials: true,
     })
   );
@@ -153,7 +160,7 @@ async function main() {
     socketio(
       {
         cors: {
-          origin: corsOrigins,
+          origin: corsOrigin,
           methods: ['GET', 'POST', 'PATCH', 'DELETE'],
           credentials: true,
         },
@@ -272,7 +279,8 @@ async function main() {
   app.use('/boards', createBoardsService(db));
 
   // Register worktrees service first (repos service needs to access it)
-  app.use('/worktrees', createWorktreesService(db));
+  // NOTE: Pass app instance for environment management (needs to access repos service)
+  app.use('/worktrees', createWorktreesService(db, app));
 
   // Register repos service (accesses worktrees via app.service('worktrees'))
   app.use('/repos', createReposService(db, app));
@@ -1211,6 +1219,51 @@ async function main() {
     },
   });
 
+  // Configure custom methods for worktrees service (environment management)
+  const worktreesService = app.service(
+    'worktrees'
+  ) as unknown as import('./declarations').WorktreesServiceImpl;
+
+  // POST /worktrees/:id/start - Start environment
+  app.use('/worktrees/:id/start', {
+    async create(_data: unknown, params: RouteParams) {
+      const id = params.route?.id;
+      if (!id) throw new Error('Worktree ID required');
+      return worktreesService.startEnvironment(id as import('@agor/core/types').WorktreeID, params);
+    },
+  });
+
+  // POST /worktrees/:id/stop - Stop environment
+  app.use('/worktrees/:id/stop', {
+    async create(_data: unknown, params: RouteParams) {
+      const id = params.route?.id;
+      if (!id) throw new Error('Worktree ID required');
+      return worktreesService.stopEnvironment(id as import('@agor/core/types').WorktreeID, params);
+    },
+  });
+
+  // POST /worktrees/:id/restart - Restart environment
+  app.use('/worktrees/:id/restart', {
+    async create(_data: unknown, params: RouteParams) {
+      const id = params.route?.id;
+      if (!id) throw new Error('Worktree ID required');
+      return worktreesService.restartEnvironment(
+        id as import('@agor/core/types').WorktreeID,
+        params
+      );
+    },
+  });
+
+  // GET /worktrees/:id/health - Check environment health
+  app.use('/worktrees/:id/health', {
+    async find(_data: unknown, params: RouteParams) {
+      const id = params.route?.id;
+      if (!id) throw new Error('Worktree ID required');
+      return worktreesService.checkHealth(id as import('@agor/core/types').WorktreeID, params);
+    },
+    // biome-ignore lint/suspicious/noExplicitAny: Service type not compatible with Express
+  } as any);
+
   // Configure custom methods for boards service
   const boardsService = app.service('boards') as unknown as BoardsServiceImpl;
   app.use('/boards/:id/sessions', {
@@ -1419,6 +1472,9 @@ async function main() {
     console.log('   No orphaned tasks or sessions found');
   }
 
+  // Initialize Health Monitor for periodic environment health checks
+  const healthMonitor = await createHealthMonitor(app);
+
   // Start server and store reference for shutdown
   const server = await app.listen(DAEMON_PORT);
 
@@ -1443,6 +1499,9 @@ async function main() {
     console.log(`\n⏳ Received ${signal}, shutting down gracefully...`);
 
     try {
+      // Clean up health monitor
+      healthMonitor.cleanup();
+
       // Clean up terminal sessions
       console.log('🖥️  Cleaning up terminal sessions...');
       terminalsService.cleanup();

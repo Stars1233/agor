@@ -1,9 +1,9 @@
 // @ts-nocheck - ConceptsTab has type errors, will be refactored
 import type { AgorClient } from '@agor/core/api';
+import type { ContextFileDetail, ContextFileListItem, Worktree } from '@agor/core/types';
 import { InfoCircleOutlined } from '@ant-design/icons';
 import { Alert, Space, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import type { ContextFileDetail, ContextFileListItem, Worktree } from '@agor/core/types';
 import { MarkdownFileCollection } from '../../MarkdownFileCollection/MarkdownFileCollection';
 import { MarkdownModal } from '../../MarkdownModal/MarkdownModal';
 
@@ -83,46 +83,44 @@ export const ConceptsTab: React.FC<ConceptsTabProps> = ({ worktree, client }) =>
   };
 
   return (
-    <Space direction="vertical" size="large" style={{ width: '100%', padding: '0 24px' }}>
-      <Alert
-        message="Concept Files"
-        description={
-          <Space direction="vertical" size="small">
-            <Text>Markdown files from the context/ directory in this worktree</Text>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              Worktree path:{' '}
+    <div style={{ width: '100%', padding: '0 24px', maxHeight: '70vh', overflowY: 'auto' }}>
+      <Space direction="vertical" size="large" style={{ width: '100%' }}>
+        <Alert
+          message={
+            <Text style={{ fontSize: 12 }}>
+              Agor looks for markdown files in{' '}
               <Text code style={{ fontSize: 11 }}>
-                {worktree.path}/context
+                {'{REPO}'}/context/
               </Text>
             </Text>
-          </Space>
-        }
-        type="info"
-        icon={<InfoCircleOutlined />}
-        showIcon
-      />
-
-      {error && <Alert message="Error" description={error} type="error" showIcon />}
-
-      <MarkdownFileCollection
-        files={files}
-        loading={loading}
-        onFileClick={handleFileClick}
-        emptyMessage="No concept files found in context/ directory"
-      />
-
-      {selectedFile && (
-        <MarkdownModal
-          open={modalOpen}
-          title={selectedFile.title}
-          content={selectedFile.content}
-          filePath={selectedFile.path.replace(/^context\//, '')}
-          onClose={handleModalClose}
+          }
+          type="info"
+          showIcon
+          style={{ padding: '8px 12px' }}
         />
-      )}
 
-      {/* TODO: Phase 4 - Add "Create New Concept File" button */}
-      {/* TODO: Phase 4 - Implement markdown editor for editing files */}
-    </Space>
+        {error && <Alert message="Error" description={error} type="error" showIcon />}
+
+        <MarkdownFileCollection
+          files={files}
+          loading={loading}
+          onFileClick={handleFileClick}
+          emptyMessage="No concept files found in context/ directory"
+        />
+
+        {selectedFile && (
+          <MarkdownModal
+            open={modalOpen}
+            title={selectedFile.title}
+            content={selectedFile.content}
+            filePath={selectedFile.path.replace(/^context\//, '')}
+            onClose={handleModalClose}
+          />
+        )}
+
+        {/* TODO: Phase 4 - Add "Create New Concept File" button */}
+        {/* TODO: Phase 4 - Implement markdown editor for editing files */}
+      </Space>
+    </div>
   );
 };

@@ -1,12 +1,10 @@
 import type { AgorClient } from '@agor/core/api';
+import type { Repo, Session, Worktree } from '@agor/core/types';
 import { Modal, Tabs } from 'antd';
 import { useState } from 'react';
-import type { Repo, Session, Worktree } from '@agor/core/types';
 import { ConceptsTab } from './tabs/ConceptsTab';
 import { EnvironmentTab } from './tabs/EnvironmentTab';
 import { GeneralTab } from './tabs/GeneralTab';
-import { RepoTab } from './tabs/RepoTab';
-import { SessionsTab } from './tabs/SessionsTab';
 
 export interface WorktreeModalProps {
   open: boolean;
@@ -45,9 +43,9 @@ export const WorktreeModal: React.FC<WorktreeModalProps> = ({
       open={open}
       onCancel={onClose}
       footer={null}
-      width={900}
+      width={1200}
       styles={{
-        body: { padding: '24px 0' },
+        body: { padding: '24px 0', overflow: 'hidden' },
       }}
     >
       <Tabs
@@ -74,6 +72,7 @@ export const WorktreeModal: React.FC<WorktreeModalProps> = ({
               <EnvironmentTab
                 worktree={worktree}
                 repo={repo}
+                client={client}
                 onUpdateRepo={onUpdateRepo}
                 onUpdateWorktree={onUpdateWorktree}
               />
@@ -83,16 +82,6 @@ export const WorktreeModal: React.FC<WorktreeModalProps> = ({
             key: 'concepts',
             label: 'Concepts',
             children: <ConceptsTab worktree={worktree} client={client} />,
-          },
-          {
-            key: 'sessions',
-            label: 'Sessions',
-            children: <SessionsTab worktree={worktree} sessions={sessions} />,
-          },
-          {
-            key: 'repo',
-            label: 'Repo',
-            children: <RepoTab repo={repo} onOpenSettings={onOpenSettings} />,
           },
         ]}
       />

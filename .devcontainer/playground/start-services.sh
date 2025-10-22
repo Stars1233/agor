@@ -65,7 +65,7 @@ fi
 # Start daemon in background using tsx (simpler, avoids ESM module resolution issues)
 cd /workspaces/agor/apps/agor-daemon
 echo "🔧 Starting daemon on :3030 (tsx)..."
-pnpm exec tsx src/index.ts > /tmp/agor-daemon.log 2>&1 &
+nohup pnpm exec tsx src/index.ts > /tmp/agor-daemon.log 2>&1 &
 DAEMON_PID=$!
 
 # Wait for daemon to be ready
@@ -98,7 +98,7 @@ if [ -n "$CODESPACE_NAME" ]; then
   export VITE_DAEMON_URL="$DAEMON_URL"
 fi
 
-pnpm dev > /tmp/agor-ui.log 2>&1 &
+nohup pnpm dev > /tmp/agor-ui.log 2>&1 &
 UI_PID=$!
 
 # Wait for UI to be ready
@@ -135,4 +135,6 @@ echo "🎮 PLAYGROUND MODE"
 echo "   - Try Agor without setup"
 echo "   - Create sessions, orchestrate AI agents"
 echo "   - Source code is read-only (for dev, use 'dev' container)"
+echo ""
+echo "💡 Services are running in the background and will persist until Codespace stops."
 echo ""

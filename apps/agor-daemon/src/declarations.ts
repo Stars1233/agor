@@ -19,6 +19,8 @@ import type {
   Repo,
   Session,
   Task,
+  Worktree,
+  WorktreeID,
 } from '@agor/core/types';
 
 // Re-export core types for convenience
@@ -115,4 +117,14 @@ export interface BoardsServiceImpl extends Service<Board, Partial<Board>, Feathe
  */
 export interface MessagesServiceImpl extends Service<Message, Partial<Message>, FeathersParams> {
   createMany(data: Array<Partial<Message>>): Promise<Message[]>;
+}
+
+/**
+ * Worktrees service with custom methods (server-side implementation)
+ */
+export interface WorktreesServiceImpl extends Service<Worktree, Partial<Worktree>, FeathersParams> {
+  startEnvironment(id: WorktreeID, params?: FeathersParams): Promise<Worktree>;
+  stopEnvironment(id: WorktreeID, params?: FeathersParams): Promise<Worktree>;
+  restartEnvironment(id: WorktreeID, params?: FeathersParams): Promise<Worktree>;
+  checkHealth(id: WorktreeID, params?: FeathersParams): Promise<Worktree>;
 }

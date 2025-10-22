@@ -1,11 +1,18 @@
+import type { Repo, Worktree } from '@agor/core/types';
 import {
   BranchesOutlined,
+  CheckCircleOutlined,
+  CloseCircleOutlined,
   DeleteOutlined,
   EditOutlined,
   FolderOutlined,
+  LoadingOutlined,
+  MinusCircleOutlined,
   PlusOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import {
+  Badge,
   Button,
   Checkbox,
   Empty,
@@ -16,11 +23,11 @@ import {
   Select,
   Space,
   Table,
-  Tag,
+  Tooltip,
   Typography,
+  theme,
 } from 'antd';
 import { useState } from 'react';
-import type { Repo, Worktree } from '@agor/core/types';
 
 const { Text } = Typography;
 
@@ -48,6 +55,7 @@ export const WorktreesTable: React.FC<WorktreesTableProps> = ({
   onCreate,
   onRowClick,
 }) => {
+  const { token } = theme.useToken();
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [form] = Form.useForm();
   const [useSameBranchName, setUseSameBranchName] = useState(true);
@@ -57,6 +65,66 @@ export const WorktreesTable: React.FC<WorktreesTableProps> = ({
   const getRepoName = (repoId: string): string => {
     const repo = repos.find(r => r.repo_id === repoId);
     return repo?.name || 'Unknown Repo';
+  };
+
+  // Helper to get environment status icon
+  const getEnvStatusIcon = (worktree: Worktree) => {
+    const status = worktree.environment_instance?.status;
+    const healthStatus = worktree.environment_instance?.last_health_check?.status;
+
+    if (!status || status === 'stopped') {
+      return (
+        <Tooltip title="Environment stopped">
+          <MinusCircleOutlined style={{ color: token.colorTextDisabled }} />
+        </Tooltip>
+      );
+    }
+
+    if (status === 'starting' || status === 'stopping') {
+      return (
+        <Tooltip title={`Environment ${status}`}>
+          <LoadingOutlined style={{ color: token.colorPrimary }} />
+        </Tooltip>
+      );
+    }
+
+    if (status === 'error') {
+      return (
+        <Tooltip
+          title={`Error: ${worktree.environment_instance?.last_health_check?.message || 'Unknown'}`}
+        >
+          <CloseCircleOutlined style={{ color: token.colorError }} />
+        </Tooltip>
+      );
+    }
+
+    if (status === 'running') {
+      // Show health status if available
+      if (healthStatus === 'healthy') {
+        return (
+          <Tooltip title="Running (healthy)">
+            <CheckCircleOutlined style={{ color: token.colorSuccess }} />
+          </Tooltip>
+        );
+      }
+      if (healthStatus === 'unhealthy') {
+        return (
+          <Tooltip
+            title={`Running (unhealthy): ${worktree.environment_instance?.last_health_check?.message || ''}`}
+          >
+            <WarningOutlined style={{ color: token.colorWarning }} />
+          </Tooltip>
+        );
+      }
+      // Running but no health check yet
+      return (
+        <Tooltip title="Running">
+          <Badge status="processing" />
+        </Tooltip>
+      );
+    }
+
+    return null;
   };
 
   // Get selected repo's default branch
@@ -111,20 +179,22 @@ export const WorktreesTable: React.FC<WorktreesTableProps> = ({
       title: 'Name',
       dataIndex: 'name',
       key: 'name',
-      render: (name: string, record: Worktree) => (
+      render: (name: string, _record: Worktree) => (
         <Space>
           <BranchesOutlined />
           <Text strong>{name}</Text>
-          {record.new_branch && (
-            <Tag color="green" style={{ fontSize: 11 }}>
-              New Branch
-            </Tag>
-          )}
         </Space>
       ),
     },
     {
-      title: 'Repository',
+      title: 'Env',
+      key: 'env',
+      width: 50,
+      align: 'center' as const,
+      render: (_: unknown, record: Worktree) => getEnvStatusIcon(record),
+    },
+    {
+      title: 'Repo',
       dataIndex: 'repo_id',
       key: 'repo_id',
       render: (repoId: string) => (

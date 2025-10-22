@@ -67,15 +67,6 @@ See [context/explorations/single-package.md](context/explorations/single-package
 - [ ] Publish `agor` meta-package
 - [ ] Update README with simplified instructions
 
-**Phase 4c: Desktop Application (Q4 2025) - 6-8 weeks**
-
-- [ ] Choose framework: Tauri (recommended) or Electron
-- [ ] Embed daemon as Tauri sidecar
-- [ ] Build native installers (macOS .dmg, Windows .exe, Linux .deb)
-- [ ] Add system tray integration
-- [ ] Publish to Homebrew, winget, apt repositories
-- [ ] Implement native auto-update mechanism
-
 ---
 
 ### Future (Phase 5+)

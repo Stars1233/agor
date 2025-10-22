@@ -15,11 +15,13 @@
   "portsAttributes": {
     "3030": {
       "label": "Agor Daemon",
-      "onAutoForward": "notify"
+      "onAutoForward": "notify",
+      "visibility": "public"
     },
     "5173": {
       "label": "Agor UI",
-      "onAutoForward": "openBrowserOnce"
+      "onAutoForward": "openBrowserOnce",
+      "visibility": "public"
     }
   },
   "postStartCommand": "bash .devcontainer/playground/start-services.sh",
