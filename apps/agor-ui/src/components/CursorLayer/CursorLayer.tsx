@@ -8,7 +8,7 @@ import { theme } from 'antd';
 import { useMemo } from 'react';
 import type { ReactFlowInstance } from 'reactflow';
 import { useViewport } from 'reactflow';
-import type { User } from '../../types';
+import type { User } from '@agor/core/types';
 import './CursorLayer.css';
 
 const { useToken } = theme;

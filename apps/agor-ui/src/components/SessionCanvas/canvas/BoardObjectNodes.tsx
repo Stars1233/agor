@@ -6,7 +6,7 @@ import { DeleteOutlined, SettingOutlined } from '@ant-design/icons';
 import { theme } from 'antd';
 import React, { useEffect, useRef, useState } from 'react';
 import { NodeResizer, useViewport } from 'reactflow';
-import type { BoardObject } from '../../../types';
+import type { BoardObject } from '@agor/core/types';
 import { DeleteZoneModal } from './DeleteZoneModal';
 import { ZoneConfigModal } from './ZoneConfigModal';
 

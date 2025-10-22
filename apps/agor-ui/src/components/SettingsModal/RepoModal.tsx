@@ -9,7 +9,7 @@
 
 import { FolderOutlined, SettingOutlined } from '@ant-design/icons';
 import { Modal, Tabs, Typography } from 'antd';
-import type { Repo } from '../../types';
+import type { Repo } from '@agor/core/types';
 
 const { Text } = Typography;
 

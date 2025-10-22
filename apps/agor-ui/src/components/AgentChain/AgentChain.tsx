@@ -26,7 +26,7 @@ import { ThoughtChain } from '@ant-design/x';
 import { Space, Tag, Tooltip, Typography, theme } from 'antd';
 import type React from 'react';
 import { useMemo, useState } from 'react';
-import type { Message } from '../../types';
+import type { Message } from '@agor/core/types';
 import { MarkdownRenderer } from '../MarkdownRenderer';
 import { ToolIcon } from '../ToolIcon';
 import { ToolUseRenderer } from '../ToolUseRenderer';

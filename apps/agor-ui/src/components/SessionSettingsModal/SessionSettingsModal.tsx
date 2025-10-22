@@ -1,7 +1,7 @@
 import { DownOutlined } from '@ant-design/icons';
 import { Collapse, Form, Modal, Typography } from 'antd';
 import React from 'react';
-import type { MCPServer, Session } from '../../types';
+import type { MCPServer, Session } from '@agor/core/types';
 import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
 import type { ModelConfig } from '../ModelSelector';
 import { SessionMetadataForm } from '../SessionMetadataForm';

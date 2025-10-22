@@ -3,7 +3,7 @@ import { Button } from 'antd';
 import { useState } from 'react';
 import { mockSessionA, mockSessionB, mockSessionC } from '../../mocks/sessions';
 import { mockTasksBySession } from '../../mocks/tasks';
-import { TaskStatus } from '../../types';
+import { TaskStatus } from '@agor/core/types';
 import SessionDrawer from './SessionDrawer';
 
 const meta = {

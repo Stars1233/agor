@@ -1,7 +1,7 @@
 import type { AgorClient } from '@agor/core/api';
 import { Modal, Tabs } from 'antd';
 import { useState } from 'react';
-import type { Repo, Session, Worktree } from '../../types';
+import type { Repo, Session, Worktree } from '@agor/core/types';
 import { ConceptsTab } from './tabs/ConceptsTab';
 import { EnvironmentTab } from './tabs/EnvironmentTab';
 import { GeneralTab } from './tabs/GeneralTab';

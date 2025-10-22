@@ -8,8 +8,8 @@ import type { AgorClient } from '@agor/core/api';
 import { useState } from 'react';
 import type { NewSessionConfig } from '../components/NewSessionModal';
 import { getDaemonUrl } from '../config/daemon';
-import type { AgenticToolName, Repo, Session, SessionID, Worktree } from '../types';
-import { getDefaultPermissionMode } from '../types';
+import type { AgenticToolName, Repo, Session, SessionID, Worktree } from '@agor/core/types';
+import { getDefaultPermissionMode } from '@agor/core/types';
 
 interface UseSessionActionsResult {
   createSession: (config: NewSessionConfig) => Promise<Session | null>;

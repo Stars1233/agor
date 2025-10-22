@@ -20,7 +20,7 @@ import {
   Typography,
 } from 'antd';
 import { useState } from 'react';
-import type { Repo, Worktree } from '../../types';
+import type { Repo, Worktree } from '@agor/core/types';
 
 const { Text } = Typography;
 

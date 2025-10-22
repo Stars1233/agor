@@ -6,7 +6,7 @@
 
 import { theme } from 'antd';
 import { useViewport } from 'reactflow';
-import type { User } from '../../../types';
+import type { User } from '@agor/core/types';
 
 const { useToken } = theme;
 

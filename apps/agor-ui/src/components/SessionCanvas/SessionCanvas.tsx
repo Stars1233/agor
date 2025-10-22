@@ -17,12 +17,12 @@ import {
   useEdgesState,
   useNodesState,
 } from 'reactflow';
-import type { BoardID, MCPServer, User, ZoneTrigger } from '../../types';
+import type { BoardID, MCPServer, User, ZoneTrigger } from '@agor/core/types';
 import 'reactflow/dist/style.css';
 import './SessionCanvas.css';
 import { useCursorTracking } from '../../hooks/useCursorTracking';
 import { usePresence } from '../../hooks/usePresence';
-import type { Board, BoardObject, Session, Task } from '../../types';
+import type { Board, BoardObject, Session, Task } from '@agor/core/types';
 import SessionCard from '../SessionCard';
 import { ZoneNode } from './canvas/BoardObjectNodes';
 import { CursorNode } from './canvas/CursorNode';

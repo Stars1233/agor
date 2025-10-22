@@ -15,7 +15,7 @@ import {
   Typography,
 } from 'antd';
 import { useState } from 'react';
-import type { CreateMCPServerInput, MCPServer, UpdateMCPServerInput } from '../../types';
+import type { CreateMCPServerInput, MCPServer, UpdateMCPServerInput } from '@agor/core/types';
 
 const { Text } = Typography;
 const { TextArea } = Input;

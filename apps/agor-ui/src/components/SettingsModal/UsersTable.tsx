@@ -14,7 +14,7 @@ import {
 } from 'antd';
 import EmojiPicker, { type EmojiClickData, Theme } from 'emoji-picker-react';
 import { useState } from 'react';
-import type { CreateUserInput, UpdateUserInput, User } from '../../types';
+import type { CreateUserInput, UpdateUserInput, User } from '@agor/core/types';
 
 const { Text } = Typography;
 

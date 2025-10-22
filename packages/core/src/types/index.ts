@@ -1,6 +1,6 @@
 // src/types/index.ts
 
-export type { PermissionDecision, PermissionRequest, PermissionScope } from '../permissions';
+export type { PermissionDecision, PermissionRequest } from '../permissions';
 export * from './agentic-tool';
 export * from './board';
 export * from './context';

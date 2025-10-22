@@ -6,7 +6,7 @@ import {
   UnlockOutlined,
 } from '@ant-design/icons';
 import { Radio, Select, Space, Typography } from 'antd';
-import type { PermissionMode } from '../../types';
+import type { PermissionMode } from '@agor/core/types';
 
 const { Text } = Typography;
 

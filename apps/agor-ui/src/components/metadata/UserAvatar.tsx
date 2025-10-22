@@ -1,5 +1,5 @@
 import { Space, Tooltip } from 'antd';
-import type { User } from '../../types';
+import type { User } from '@agor/core/types';
 
 export interface UserAvatarProps {
   user: User;

@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from '@storybook/react';
 import { mockSessionA, mockSessionB, mockSessionC } from '../../mocks/sessions';
-import { TaskStatus } from '../../types';
+import { TaskStatus } from '@agor/core/types';
 import SessionHeader from './SessionHeader';
 
 const meta = {

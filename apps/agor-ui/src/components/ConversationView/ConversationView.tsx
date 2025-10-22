@@ -16,7 +16,7 @@ import type { AgorClient } from '@agor/core/api';
 import { Alert, Empty, Spin } from 'antd';
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useMessages, useStreamingMessages, useTasks } from '../../hooks';
-import type { Message, SessionID, User } from '../../types';
+import type { Message, SessionID, User } from '@agor/core/types';
 import { TaskBlock } from '../TaskBlock';
 
 export interface ConversationViewProps {

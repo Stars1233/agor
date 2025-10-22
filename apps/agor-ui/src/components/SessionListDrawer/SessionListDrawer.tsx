@@ -2,7 +2,7 @@ import { SearchOutlined } from '@ant-design/icons';
 import { Badge, Drawer, Input, List, Select, Space, Typography, theme } from 'antd';
 import type React from 'react';
 import { useState } from 'react';
-import type { Board, Session } from '../../types';
+import type { Board, Session } from '@agor/core/types';
 
 const { Title, Text } = Typography;
 const { useToken } = theme;

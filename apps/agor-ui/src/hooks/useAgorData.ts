@@ -7,7 +7,7 @@
 
 import type { AgorClient } from '@agor/core/api';
 import { useCallback, useEffect, useState } from 'react';
-import type { Board, MCPServer, Repo, Session, Task, User, Worktree } from '../types';
+import type { Board, MCPServer, Repo, Session, Task, User, Worktree } from '@agor/core/types';
 
 interface UseAgorDataResult {
   sessions: Session[];

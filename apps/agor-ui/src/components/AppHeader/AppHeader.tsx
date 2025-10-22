@@ -8,7 +8,7 @@ import {
 } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
 import { Button, Dropdown, Layout, Space, Typography } from 'antd';
-import type { ActiveUser, User } from '../../types';
+import type { ActiveUser, User } from '@agor/core/types';
 import { Facepile } from '../Facepile';
 
 const { Header } = Layout;

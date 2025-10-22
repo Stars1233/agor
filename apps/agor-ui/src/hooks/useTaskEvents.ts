@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import type { TaskID } from '../types';
+import type { TaskID } from '@agor/core/types';
 import type { useAgorClient } from './useAgorClient';
 
 export interface ToolExecution {

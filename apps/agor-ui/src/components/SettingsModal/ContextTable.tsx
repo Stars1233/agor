@@ -8,7 +8,7 @@
 import type { AgorClient } from '@agor/core/api';
 import { Alert } from 'antd';
 import { useEffect, useState } from 'react';
-import type { ContextFileDetail, ContextFileListItem } from '../../types';
+import type { ContextFileDetail, ContextFileListItem } from '@agor/core/types';
 import { MarkdownFileCollection } from '../MarkdownFileCollection/MarkdownFileCollection';
 import { MarkdownModal } from '../MarkdownModal/MarkdownModal';
 

@@ -5,7 +5,7 @@
 import type { AgorClient } from '@agor/core/api';
 import { useCallback, useRef } from 'react';
 import type { Node } from 'reactflow';
-import type { Board, BoardObject } from '../../../types';
+import type { Board, BoardObject } from '@agor/core/types';
 
 interface UseBoardObjectsProps {
   board: Board | null;

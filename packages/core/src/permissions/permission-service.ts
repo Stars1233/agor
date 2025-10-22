@@ -41,7 +41,9 @@ export interface PermissionRequest {
   timestamp: string;
 }
 
-export type PermissionScope = 'once' | 'session' | 'project';
+// NOTE: PermissionScope is now defined as an enum in types/message.ts
+// Import it from there instead of using this type union
+import { PermissionScope } from '../types/message';
 
 export interface PermissionDecision {
   requestId: string;
@@ -108,7 +110,7 @@ export class PermissionService {
           allow: false,
           reason: 'Cancelled',
           remember: false,
-          scope: 'once',
+          scope: PermissionScope.ONCE,
           decidedBy: 'system', // System-initiated cancel
         });
       });
@@ -123,7 +125,7 @@ export class PermissionService {
           allow: false,
           reason: 'Timeout',
           remember: false,
-          scope: 'once',
+          scope: PermissionScope.ONCE,
           decidedBy: 'system', // System-initiated timeout
         });
       }, 60000);

@@ -14,7 +14,7 @@ import {
 } from '@ant-design/icons';
 import { message, Tag, theme } from 'antd';
 import type React from 'react';
-import { TaskStatus } from '../../types';
+import { TaskStatus } from '@agor/core/types';
 
 /**
  * Standardized color palette for pills/badges

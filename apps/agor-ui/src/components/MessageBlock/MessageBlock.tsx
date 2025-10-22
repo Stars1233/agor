@@ -13,8 +13,9 @@ import { RobotOutlined } from '@ant-design/icons';
 import { Bubble } from '@ant-design/x';
 import { Avatar, theme } from 'antd';
 import type React from 'react';
-import type { Message, User } from '../../types';
 import {
+  type Message,
+  type User,
   type PermissionRequestContent,
   PermissionScope,
   PermissionStatus,

@@ -1,7 +1,7 @@
 import { DeleteOutlined, FolderOutlined, PlusOutlined } from '@ant-design/icons';
 import { Button, Card, Empty, Form, Input, Modal, Popconfirm, Space, Tag, Typography } from 'antd';
 import { useState } from 'react';
-import type { Repo } from '../../types';
+import type { Repo } from '@agor/core/types';
 
 const { Text } = Typography;
 

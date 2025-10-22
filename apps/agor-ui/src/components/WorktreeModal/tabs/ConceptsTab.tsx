@@ -3,7 +3,7 @@ import type { AgorClient } from '@agor/core/api';
 import { InfoCircleOutlined } from '@ant-design/icons';
 import { Alert, Space, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import type { ContextFileDetail, ContextFileListItem, Worktree } from '../../../types';
+import type { ContextFileDetail, ContextFileListItem, Worktree } from '@agor/core/types';
 import { MarkdownFileCollection } from '../../MarkdownFileCollection/MarkdownFileCollection';
 import { MarkdownModal } from '../../MarkdownModal/MarkdownModal';
 

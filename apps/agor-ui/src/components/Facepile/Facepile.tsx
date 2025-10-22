@@ -6,7 +6,7 @@
 
 import { Avatar, Tooltip, theme } from 'antd';
 import type { CSSProperties } from 'react';
-import type { ActiveUser } from '../../types';
+import type { ActiveUser } from '@agor/core/types';
 import './Facepile.css';
 
 const { useToken } = theme;

@@ -11,8 +11,8 @@ import {
   SettingOutlined,
 } from '@ant-design/icons';
 import { App, Badge, Button, Card, Collapse, Space, Spin, Tag, Typography } from 'antd';
-import type { Session, Task, User } from '../../types';
-import { TaskStatus } from '../../types';
+import type { Session, Task, User } from '@agor/core/types';
+import { TaskStatus } from '@agor/core/types';
 import { CreatedByTag } from '../metadata';
 import TaskListItem from '../TaskListItem';
 import { ToolIcon } from '../ToolIcon';

@@ -1,6 +1,6 @@
 import { FolderOutlined, SettingOutlined } from '@ant-design/icons';
 import { Button, Descriptions, Space, Typography } from 'antd';
-import type { Repo } from '../../../types';
+import type { Repo } from '@agor/core/types';
 
 const { Text, Paragraph } = Typography;
 

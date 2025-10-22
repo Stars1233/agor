@@ -1,6 +1,6 @@
 import { CheckCircleOutlined, DownloadOutlined } from '@ant-design/icons';
 import { Button, Card, Space, Tag, Typography } from 'antd';
-import type { AgenticTool } from '../../types';
+import type { AgenticTool } from '@agor/core/types';
 import { ToolIcon } from '../ToolIcon';
 
 const { Text } = Typography;

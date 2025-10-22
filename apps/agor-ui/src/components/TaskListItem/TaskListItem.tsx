@@ -10,7 +10,7 @@ import {
   ToolOutlined,
 } from '@ant-design/icons';
 import { List, Space, Spin, Tag, Tooltip, Typography, theme } from 'antd';
-import type { Task } from '../../types';
+import type { Task } from '@agor/core/types';
 
 const { Text } = Typography;
 const { useToken } = theme;

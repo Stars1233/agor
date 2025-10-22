@@ -29,8 +29,8 @@ import type {
   Session,
   User,
   Worktree,
-} from '../../types';
-import { TaskStatus } from '../../types';
+} from '@agor/core/types';
+import { TaskStatus } from '@agor/core/types';
 import { ConversationView } from '../ConversationView';
 import { CreatedByTag } from '../metadata';
 import { PermissionModeSelector } from '../PermissionModeSelector';

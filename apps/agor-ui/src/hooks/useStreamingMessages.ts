@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import type { MessageID, SessionID } from '../types';
+import type { MessageID, SessionID } from '@agor/core/types';
 import type { useAgorClient } from './useAgorClient';
 
 export interface StreamingMessage {

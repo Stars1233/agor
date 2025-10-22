@@ -26,7 +26,7 @@ import {
   theme,
 } from 'antd';
 import { useMemo, useState } from 'react';
-import type { Repo, RepoEnvironmentConfig, Worktree } from '../../../types';
+import type { Repo, RepoEnvironmentConfig, Worktree } from '@agor/core/types';
 
 const { Text, Paragraph, Title } = Typography;
 const { TextArea } = Input;

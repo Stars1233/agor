@@ -12,7 +12,7 @@ import type {
   UpdateUserInput,
   User,
   Worktree,
-} from '../../types';
+} from '@agor/core/types';
 import { WorktreeModal } from '../WorktreeModal';
 import { BoardsTable } from './BoardsTable';
 import { MCPServersTable } from './MCPServersTable';

@@ -12,8 +12,8 @@ import { CheckOutlined, CloseOutlined, LockOutlined } from '@ant-design/icons';
 import { Button, Card, Descriptions, Radio, Space, Tag, Typography, theme } from 'antd';
 import type React from 'react';
 import { useState } from 'react';
-import type { Message } from '../../types';
 import {
+  type Message,
   type PermissionRequestContent,
   PermissionScope,
   PermissionStatus,

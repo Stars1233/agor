@@ -4,7 +4,7 @@
 
 import { Alert, Input, Modal, Select, theme } from 'antd';
 import { useEffect, useId, useState } from 'react';
-import type { BoardObject, ZoneTriggerType } from '../../../types';
+import type { BoardObject, ZoneTriggerType } from '@agor/core/types';
 
 interface ZoneConfigModalProps {
   open: boolean;

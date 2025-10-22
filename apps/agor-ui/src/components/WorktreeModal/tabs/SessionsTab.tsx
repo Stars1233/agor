@@ -1,7 +1,7 @@
 import { MessageOutlined, ToolOutlined } from '@ant-design/icons';
 import { Button, Empty, List, Space, Tag, Typography } from 'antd';
-import type { Session, Worktree } from '../../../types';
-import { TaskStatus } from '../../../types';
+import type { Session, Worktree } from '@agor/core/types';
+import { TaskStatus } from '@agor/core/types';
 
 const { Text } = Typography;
 

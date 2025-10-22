@@ -5,7 +5,7 @@
 import type { AgorClient } from '@agor/core/api';
 import { useCallback, useEffect, useState } from 'react';
 import { flushSync } from 'react-dom';
-import type { Message, SessionID } from '../types';
+import type { Message, SessionID } from '@agor/core/types';
 
 interface UseMessagesResult {
   messages: Message[];

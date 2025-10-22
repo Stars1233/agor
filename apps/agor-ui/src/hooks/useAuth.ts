@@ -8,7 +8,7 @@
 import { createClient } from '@agor/core/api';
 import { useCallback, useEffect, useState } from 'react';
 import { getDaemonUrl } from '../config/daemon';
-import type { User } from '../types';
+import type { User } from '@agor/core/types';
 
 interface AuthState {
   user: User | null;

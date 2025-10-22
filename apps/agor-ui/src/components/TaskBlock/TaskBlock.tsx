@@ -30,7 +30,7 @@ import type React from 'react';
 import { useMemo } from 'react';
 import { useTaskEvents } from '../../hooks/useTaskEvents';
 import { useAgorClient } from '../../hooks/useAgorClient';
-import { type Message, type Task, type User, TaskStatus } from '../../types';
+import { type Message, type Task, type User, TaskStatus } from '@agor/core/types';
 import { PermissionStatus, PermissionScope, type PermissionRequestContent } from '@agor/core/types';
 import { AgentChain } from '../AgentChain';
 import { MessageBlock } from '../MessageBlock';

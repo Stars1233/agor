@@ -11,8 +11,8 @@ import {
   Typography,
 } from 'antd';
 import { useState } from 'react';
-import type { Repo, Session, Worktree } from '../../../types';
-import { TaskStatus } from '../../../types';
+import type { Repo, Session, Worktree } from '@agor/core/types';
+import { TaskStatus } from '@agor/core/types';
 
 const { Text, Paragraph } = Typography;
 const { TextArea } = Input;

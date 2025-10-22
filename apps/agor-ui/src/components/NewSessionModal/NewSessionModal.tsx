@@ -1,7 +1,7 @@
 import { DownOutlined, SettingOutlined } from '@ant-design/icons';
 import { Alert, Button, Collapse, Form, Input, Modal, Select, Space, Typography } from 'antd';
 import { useState } from 'react';
-import type { AgenticTool, AgenticToolName, MCPServer, PermissionMode } from '../../types';
+import type { AgenticTool, AgenticToolName, MCPServer, PermissionMode } from '@agor/core/types';
 import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
 import { AgentSelectionCard } from '../AgentSelectionCard';
 import type { ModelConfig } from '../ModelSelector';
