@@ -386,7 +386,7 @@ export class SessionRepository implements BaseRepository<Session, Partial<Sessio
    * Find sessions with running tasks
    */
   async findRunning(): Promise<Session[]> {
-    return this.findByStatus('running');
+    return this.findByStatus(SessionStatus.RUNNING);
   }
 
   /**

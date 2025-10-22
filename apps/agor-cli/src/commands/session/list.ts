@@ -6,6 +6,7 @@
 
 import { formatShortId } from '@agor/core/db';
 import type { Session } from '@agor/core/types';
+import { SessionStatus } from '@agor/core/types';
 import { Flags } from '@oclif/core';
 import chalk from 'chalk';
 import Table from 'cli-table3';
@@ -33,7 +34,12 @@ export default class SessionList extends BaseCommand {
     status: Flags.string({
       char: 's',
       description: 'Filter by status',
-      options: ['idle', 'running', 'completed', 'failed'],
+      options: [
+        SessionStatus.IDLE,
+        SessionStatus.RUNNING,
+        SessionStatus.COMPLETED,
+        SessionStatus.FAILED,
+      ],
     }),
     agent: Flags.string({
       char: 'a',

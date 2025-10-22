@@ -15,7 +15,7 @@
 
 import { formatShortId, generateId } from '../../lib/ids';
 import type { Session, TaskID, UserID, WorktreeID } from '../../types';
-import { TaskStatus } from '../../types';
+import { SessionStatus, TaskStatus } from '../../types';
 import { createDatabase } from '../client';
 import { initializeDatabase, seedInitialData } from '../migrate';
 import {
@@ -74,7 +74,7 @@ async function testSessionRepository(db: ReturnType<typeof createDatabase>) {
   // Create session
   const session = await repo.create({
     agentic_tool: 'claude-code',
-    status: 'idle',
+    status: SessionStatus.IDLE,
     created_by: 'test-user' as UserID,
     worktree_id: 'test-worktree-id' as WorktreeID,
     git_state: {
@@ -272,7 +272,7 @@ async function testGenealogy(db: ReturnType<typeof createDatabase>) {
   // Create forked child
   const fork = await repo.create({
     agentic_tool: 'claude-code',
-    status: 'idle',
+    status: SessionStatus.IDLE,
     created_by: 'test-user' as UserID,
     worktree_id: 'test-worktree-id' as WorktreeID,
     git_state: { ref: 'main', base_sha: 'def', current_sha: 'def' },
@@ -292,7 +292,7 @@ async function testGenealogy(db: ReturnType<typeof createDatabase>) {
   // Create spawned child
   const spawn = await repo.create({
     agentic_tool: 'cursor',
-    status: 'idle',
+    status: SessionStatus.IDLE,
     created_by: 'test-user' as UserID,
     worktree_id: 'test-worktree-id' as WorktreeID,
     git_state: { ref: 'main', base_sha: 'def', current_sha: 'def' },

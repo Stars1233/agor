@@ -223,7 +223,11 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
    */
   async findRunning(): Promise<Task[]> {
     try {
-      const rows = await this.db.select().from(tasks).where(eq(tasks.status, 'running')).all();
+      const rows = await this.db
+        .select()
+        .from(tasks)
+        .where(eq(tasks.status, TaskStatus.RUNNING))
+        .all();
 
       return rows.map(row => this.rowToTask(row));
     } catch (error) {
