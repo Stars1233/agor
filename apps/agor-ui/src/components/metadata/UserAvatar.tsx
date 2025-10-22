@@ -1,5 +1,5 @@
-import { Space, Tooltip } from 'antd';
 import type { User } from '@agor/core/types';
+import { Space, Tooltip } from 'antd';
 
 export interface UserAvatarProps {
   user: User;
@@ -8,9 +8,9 @@ export interface UserAvatarProps {
 }
 
 const sizeMap = {
-  small: 16,
-  default: 20,
-  large: 24,
+  small: 12,
+  default: 14,
+  large: 18,
 };
 
 /**
