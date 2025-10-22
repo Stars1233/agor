@@ -6,8 +6,8 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install pnpm
-RUN npm install -g pnpm@9.15.1
+# Install pnpm (use latest)
+RUN npm install -g pnpm@latest
 
 # Set working directory for build
 WORKDIR /build

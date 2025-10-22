@@ -6,6 +6,15 @@ echo ""
 echo "⚡ Fast boot mode - Pre-built production binaries"
 echo ""
 
+# Ensure dependencies are installed (in case build didn't complete)
+if [ ! -d "node_modules" ]; then
+  echo "📦 Installing dependencies..."
+  cd /workspaces/agor
+  pnpm install
+  echo "✅ Dependencies installed"
+  echo ""
+fi
+
 # Check if this is first run
 if [ ! -d ~/.agor ]; then
   echo "📦 First run - initializing Agor..."
