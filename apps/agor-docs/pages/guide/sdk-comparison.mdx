@@ -1,0 +1,283 @@
+# SDK Feature Comparison
+
+Agor integrates with multiple AI coding agents. Each SDK has different capabilities based on their native features and API design.
+
+## Feature Matrix
+
+| Feature | Claude Code | Codex | Gemini | Notes |
+|---------|-------------|-------|--------|-------|
+| **Streaming responses** | ✅ Yes | ✅ Yes | ✅ Yes | All support token-level streaming for typewriter effect |
+| **Stop mid-execution** | ✅ Yes | ⚠️ Limited | ⚠️ Limited | Claude has `interrupt()`, others may lose partial work |
+| **Session import/export** | ✅ Yes | ❌ No | ❌ No | Only Claude Code stores sessions as JSONL transcripts |
+| **Session forkable** | ✅ Yes (via replay) | ✅ Yes (via replay) | ✅ Yes (via replay) | Agor emulates forking by replaying messages to new session |
+| **MCP integration** | ✅ Native | ❌ No | ❌ No | Claude Code has first-class MCP server support |
+| **Permission requests** | ✅ Rich | ⚠️ Basic | ⚠️ Basic | Claude has granular tool permissions, others use simpler modes |
+| **Project instructions** | ✅ CLAUDE.md | ⚠️ Manual | ⚠️ Manual | Claude auto-loads CLAUDE.md, others need manual injection |
+| **Git awareness** | ✅ Built-in | ❌ Manual | ❌ Manual | Claude tracks git state natively, Agor manages it for others |
+| **Tool execution** | ✅ Rich widgets | ⚠️ Basic | ⚠️ Basic | Claude exposes detailed tool metadata for rich visualization |
+| **Session continuity** | ✅ SDK-managed | ✅ History-based | ✅ History-based | Claude uses `session_id`, others replay message history |
+| **Conversation history** | ✅ Automatic | 🟡 Manual | 🟡 Manual | Claude SDK manages history, others require explicit passing |
+
+**Legend:**
+- ✅ **Full support** - Feature works natively via SDK
+- ⚠️ **Limited** - Partial support or workarounds needed
+- 🟡 **Emulated** - Agor implements the feature
+- ❌ **Not supported** - Not available
+
+---
+
+## Detailed Feature Breakdown
+
+### 1. Streaming Responses
+
+**All SDKs support streaming, but with different patterns:**
+
+**Claude Code:**
+- Token-level streaming via async generators
+- True real-time with minimal latency
+- Supports stopping mid-stream
+
+**Codex:**
+- Streaming via OpenAI's SSE (Server-Sent Events)
+- Chunks may be larger than tokens
+- Good real-time performance
+
+**Gemini:**
+- Streaming via `sendMessageStream()`
+- Token-level chunks
+- Reliable streaming performance
+
+**Agor Implementation:** StreamingCallbacks interface provides unified streaming for all agents.
+
+---
+
+### 2. Stop Mid-Execution
+
+**Claude Code:** ✅ **Full support**
+- Native `interrupt()` method in Agent SDK
+- Gracefully stops execution
+- Returns partial results
+- Safe cleanup of resources
+
+**Codex:** ⚠️ **Limited**
+- Can abort HTTP request
+- May lose partial work
+- Less graceful than Claude
+
+**Gemini:** ⚠️ **Limited**
+- Can abort stream
+- May lose partial tool execution results
+- Similar to Codex limitations
+
+---
+
+### 3. Session Import/Export
+
+**Claude Code:** ✅ **Full support**
+- Sessions stored as JSONL transcript files in `~/.claude/projects/`
+- Rich metadata (git state, tool uses, timestamps)
+- Agor can parse and replay transcripts
+- Enables session portability
+
+**Codex:** ❌ **Not supported**
+- No native session persistence format
+- Agor stores sessions in own database
+- Cannot import external Codex sessions
+
+**Gemini:** ❌ **Not supported**
+- Has checkpoint system but format undocumented
+- Agor stores sessions in own database
+- Cannot import external Gemini sessions
+
+---
+
+### 4. Session Forking
+
+**All agents support forking via Agor's replay mechanism:**
+
+1. User requests fork at specific message
+2. Agor creates new session
+3. Replays messages up to fork point
+4. New prompts diverge from original
+5. Full genealogy tracking in database
+
+**Note:** This is an Agor feature, not SDK-native. Works identically across all agents.
+
+---
+
+### 5. MCP Integration
+
+**Claude Code:** ✅ **Native support**
+- MCP servers configured in Agent SDK options
+- Tools automatically exposed to Claude
+- Supports MCP prompts, resources, and tools
+- Agor UI for managing MCP server configs per session
+
+**Codex:** ❌ **Not supported**
+- No MCP protocol support
+- Would require custom tool definitions
+
+**Gemini:** ❌ **Not supported**
+- No MCP protocol support
+- Uses Google's function calling instead
+
+**See [MCP Integration Guide](/guide/mcp) for details on using MCP with Claude Code.**
+
+---
+
+### 6. Permission Requests
+
+**Claude Code:** ✅ **Rich permission system**
+- Granular tool-level permissions (`Read`, `Write`, `Edit`, `Bash`, etc.)
+- Permission modes: `'ask'`, `'auto'`, `'allow-all'`
+- Tool-specific context (file paths, command previews)
+- Diff previews for file edits
+- Agor shows rich permission modals with previews
+
+**Codex:** ⚠️ **Basic permission modes**
+- Simpler permission system
+- Modes: `'ask'`, `'auto'`, `'allow-all'`
+- Less granular than Claude
+
+**Gemini:** ⚠️ **Basic permission modes**
+- Similar to Codex
+- Function calling requires explicit approval
+- Less detailed context than Claude
+
+**Agor Implementation:** Permission modals adapt based on available SDK metadata. Claude shows richest UX.
+
+---
+
+### 7. Project Instructions
+
+**Claude Code:** ✅ **CLAUDE.md auto-loading**
+- Agent SDK automatically loads `CLAUDE.md` from working directory
+- Supports both project-level (`.claude/`) and personal (`~/.claude/`) instructions
+- No manual injection needed
+- Agor sessions inherit project instructions automatically
+
+**Codex:** ⚠️ **Manual injection**
+- No standard instruction file format
+- Agor can inject instructions via system prompt
+- Requires explicit configuration
+
+**Gemini:** ⚠️ **Manual injection**
+- No standard instruction file format
+- Agor can inject instructions via system prompt
+- Requires explicit configuration
+
+**Recommendation:** Use Claude Code for projects with rich context requirements. For Codex/Gemini, manage instructions in Agor session config.
+
+---
+
+### 8. Git Awareness
+
+**Claude Code:** ✅ **Built-in git tracking**
+- SDK tracks git state natively
+- Knows current branch, commit SHA, dirty state
+- Can reference git history in responses
+
+**Codex:** ❌ **No native git awareness**
+- Agor manages git state for worktrees
+- Git context injected via prompts if needed
+
+**Gemini:** ❌ **No native git awareness**
+- Agor manages git state for worktrees
+- Git context injected via prompts if needed
+
+**Agor Implementation:** All sessions track git state in database. Claude gets it "for free", others rely on Agor's worktree management.
+
+---
+
+### 9. Tool Execution & Visualization
+
+**Claude Code:** ✅ **Rich tool metadata**
+- Detailed tool use objects with `id`, `name`, `input`
+- Tool result blocks with rich content types
+- Supports rendering custom tool widgets (Todo lists, diffs, etc.)
+- Agor can build sophisticated tool visualizations
+
+**Codex:** ⚠️ **Basic function calling**
+- OpenAI function calling format
+- Less structured than Claude's tools
+- Agor normalizes to common format
+
+**Gemini:** ⚠️ **Basic function calling**
+- Google function calling format
+- Similar to Codex in structure
+- Agor normalizes to common format
+
+**Agor's Tool Widgets:**
+- **Todo lists** - Rendered from Claude's TodoWrite tool
+- **File diffs** - Syntax-highlighted edits (Claude Write/Edit tools)
+- **Bash output** - Terminal-style output rendering
+- **Permission requests** - Interactive approval modals
+
+Works best with Claude Code due to richer tool metadata.
+
+---
+
+### 10. Session Continuity
+
+**Claude Code:** ✅ **SDK-managed conversation**
+- Agent SDK assigns `session_id` for multi-turn conversations
+- Agor captures and stores `sdk_session_id`
+- Seamless continuity across multiple prompts
+- No message replay needed
+
+**Codex:** 🟡 **History-based continuity**
+- No native session concept
+- Agor passes message history array to each API call
+- Seamless from user perspective, more work behind the scenes
+
+**Gemini:** 🟡 **History-based continuity**
+- Uses `setHistory()` to restore conversation state
+- Similar to Codex pattern
+- Works reliably but requires explicit history management
+
+**Performance Consideration:** Claude's session_id approach scales better for very long conversations (no need to resend full history). Codex/Gemini history-based approach works fine for typical sessions.
+
+---
+
+## Choosing an Agent
+
+### Use Claude Code when:
+- You need rich project instructions (CLAUDE.md)
+- MCP server integration is required
+- You want detailed tool execution visualization
+- Session import/export is important
+- You need the best permission request UX
+
+### Use Codex when:
+- You prefer OpenAI's models
+- You don't need MCP integration
+- Basic permissions are sufficient
+- You're okay with Agor managing context
+
+### Use Gemini when:
+- You prefer Google's models
+- Cost is a primary concern (Gemini pricing)
+- Streaming is important (Gemini has good streaming)
+- You don't need MCP integration
+
+---
+
+## Future Improvements
+
+As agent SDKs evolve, Agor will gain new capabilities:
+
+- **Codex MCP support** - If OpenAI adds MCP protocol
+- **Gemini project files** - If Google adds instruction file support
+- **Better stop controls** - More graceful cancellation for all agents
+- **Richer tool metadata** - If Codex/Gemini expose more tool details
+
+Check the [Native CLI Feature Gaps](/guide/native-cli-gaps) doc for SDK feature requests and advocacy.
+
+---
+
+## Related Documentation
+
+- [Agent Integration Architecture](/guide/architecture#agent-integration)
+- [MCP Integration](/guide/mcp)
+- [Permission System](/guide/permissions)
+- [Tool Visualization](/guide/tool-widgets)
