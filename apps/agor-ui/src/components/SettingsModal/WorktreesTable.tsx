@@ -1,5 +1,5 @@
 import { renderTemplate } from '@agor/core/templates/handlebars-helpers';
-import type { Repo, Worktree } from '@agor/core/types';
+import type { Repo, Session, Worktree } from '@agor/core/types';
 import {
   BranchesOutlined,
   CheckCircleOutlined,
@@ -38,6 +38,7 @@ const { Text } = Typography;
 interface WorktreesTableProps {
   worktrees: Worktree[];
   repos: Repo[];
+  sessions: Session[];
   onDelete?: (worktreeId: string, deleteFromFilesystem: boolean) => void;
   onCreate?: (
     repoId: string,
@@ -57,6 +58,7 @@ interface WorktreesTableProps {
 export const WorktreesTable: React.FC<WorktreesTableProps> = ({
   worktrees,
   repos,
+  sessions,
   onDelete,
   onCreate,
   onRowClick,
@@ -322,7 +324,7 @@ export const WorktreesTable: React.FC<WorktreesTableProps> = ({
           />
           <DeleteWorktreePopconfirm
             worktree={record}
-            sessionCount={record.sessions.length}
+            sessionCount={sessions.filter(s => s.worktree_id === record.worktree_id).length}
             onConfirm={deleteFromFilesystem =>
               handleDelete(record.worktree_id, deleteFromFilesystem)
             }
