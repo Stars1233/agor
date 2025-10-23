@@ -43,10 +43,18 @@ Agor is a **multi-client agent orchestration platform** with a clean separation 
 │         Feathers Server (agor-daemon)                  │
 │  ┌──────────────────────────────────────────────────┐ │
 │  │  Services (Business Logic)                       │ │
-│  │  - SessionService: CRUD + fork/spawn/genealogy  │ │
-│  │  - BoardService: CRUD + session management      │ │
-│  │  - RepoService: Git + worktree operations       │ │
-│  │  - TaskService: CRUD + git state tracking       │ │
+│  │  - SessionsService: CRUD + fork/spawn/genealogy │ │
+│  │  - BoardsService: CRUD + session management     │ │
+│  │  - ReposService: Git repository operations      │ │
+│  │  - WorktreesService: Git worktree management    │ │
+│  │  - TasksService: CRUD + git state tracking      │ │
+│  │  - MessagesService: Conversation storage        │ │
+│  │  - UsersService: User management + auth         │ │
+│  │  - MCPServersService: MCP server configs        │ │
+│  │  - SessionMCPServersService: Session MCP links  │ │
+│  │  - TerminalsService: WebSocket terminal proxy   │ │
+│  │  - ContextService: Context file browser         │ │
+│  │  - HealthMonitorService: Real-time diagnostics  │ │
 │  └──────────────────┬───────────────────────────────┘ │
 │                     │                                   │
 │  ┌──────────────────▼───────────────────────────────┐ │
@@ -133,12 +141,14 @@ Store in `data` column:
 {
   session_id: text('session_id').primaryKey(),
   status: text('status', { enum: ['idle', 'running', 'completed', 'failed'] }),
-  agent: text('agent', { enum: ['claude-code', 'cursor', 'codex', 'gemini'] }),
+  agentic_tool: text('agentic_tool', { enum: ['claude-code', 'cursor', 'codex', 'gemini'] }),
   board_id: text('board_id'),
   parent_session_id: text('parent_session_id'),
   forked_from_session_id: text('forked_from_session_id'),
-  created_at: integer('created_at'),
-  updated_at: integer('updated_at'),
+  worktree_id: text('worktree_id').notNull().references(() => worktrees.worktree_id),
+  created_by: text('created_by').notNull().default('anonymous'),
+  created_at: integer('created_at', { mode: 'timestamp_ms' }),
+  updated_at: integer('updated_at', { mode: 'timestamp_ms' }),
 }
 ```
 
@@ -146,15 +156,19 @@ Store in `data` column:
 
 ```typescript
 data: json('data').$type<{
-  agent_version?: string;
-  description?: string;
-  repo?: { repo_id, repo_slug, worktree_name, cwd, ... };
+  agentic_tool_version?: string;
+  sdk_session_id?: string; // SDK session ID for conversation continuity
+  title?: string; // Session title
+  description?: string; // Legacy field
   git_state: { ref, base_sha, current_sha };
-  genealogy: { fork_point_task_id, spawn_point_task_id, children[] };
-  concepts: string[];
-  tasks: string[];
+  genealogy: { fork_point_task_id?, spawn_point_task_id?, children[] };
+  contextFiles: string[]; // Context file paths
+  tasks: string[]; // Task IDs
   message_count: number;
   tool_use_count: number;
+  permission_config?: { allowedTools?, mode? };
+  model_config?: { mode, model, updated_at, notes? };
+  custom_context?: Record<string, unknown>; // Handlebars template context
 }>()
 ```
 
@@ -692,13 +706,21 @@ agor/
 ├── apps/
 │   ├── agor-daemon/              # Feathers API server
 │   │   ├── src/
-│   │   │   ├── app.ts           # Feathers app
+│   │   │   ├── index.ts         # Main daemon entry
 │   │   │   ├── services/
-│   │   │   │   ├── sessions/
-│   │   │   │   ├── boards/
-│   │   │   │   ├── tasks/
-│   │   │   │   └── repos/
-│   │   │   └── hooks/           # Global hooks
+│   │   │   │   ├── sessions.ts
+│   │   │   │   ├── boards.ts
+│   │   │   │   ├── tasks.ts
+│   │   │   │   ├── messages.ts
+│   │   │   │   ├── repos.ts
+│   │   │   │   ├── worktrees.ts
+│   │   │   │   ├── users.ts
+│   │   │   │   ├── mcp-servers.ts
+│   │   │   │   ├── session-mcp-servers.ts
+│   │   │   │   ├── terminals.ts
+│   │   │   │   ├── context.ts
+│   │   │   │   └── health-monitor.ts
+│   │   │   └── strategies/      # Auth strategies
 │   │   └── package.json
 │   │
 │   ├── agor-cli/                 # CLI (oclif)
@@ -706,15 +728,27 @@ agor/
 │   │   │   ├── commands/
 │   │   │   │   ├── repo/
 │   │   │   │   ├── session/
-│   │   │   │   └── init.ts
+│   │   │   │   ├── board/
+│   │   │   │   ├── user/
+│   │   │   │   ├── worktree/
+│   │   │   │   └── config/
 │   │   │   └── lib/
 │   │   └── package.json
 │   │
-│   └── agor-ui/                  # React + Vite
-│       ├── src/
-│       │   ├── components/
-│       │   ├── hooks/
-│       │   └── lib/
+│   ├── agor-ui/                  # React + Vite + Ant Design
+│   │   ├── src/
+│   │   │   ├── components/
+│   │   │   ├── hooks/
+│   │   │   └── lib/
+│   │   └── package.json
+│   │
+│   └── agor-docs/                # Nextra documentation site
+│       ├── pages/
+│       │   ├── guide/           # Getting started, Docker, development
+│       │   ├── cli/             # CLI reference (auto-generated)
+│       │   └── api-reference/   # REST + WebSocket docs
+│       ├── scripts/
+│       │   └── generate-cli-docs.ts
 │       └── package.json
 │
 ├── packages/
@@ -825,30 +859,54 @@ Feathers supports multiple ORMs. Drizzle gives:
 - Monorepo structure (Turborepo + pnpm)
 - Drizzle schema with hybrid materialization
 - UUIDv7 ID generation + short ID resolution
-- FeathersJS daemon with services (sessions, repos, boards, tasks, messages)
-- CLI commands (repo add/list/rm, session list/load-claude, worktree management)
+- FeathersJS daemon with all core services:
+  - SessionsService, BoardsService, TasksService, MessagesService
+  - WorktreesService, ReposService
+  - UsersService, MCPServersService, SessionMCPServersService
+  - TerminalsService (WebSocket terminal proxy)
+  - ContextService (context file browser)
+  - HealthMonitorService (real-time diagnostics)
+- CLI commands (repo, session, board, user, worktree, config)
 - Feathers client integration (@agor/core/api)
-- Repository + worktree management
-- Git operations via daemon
-- Real-time WebSocket events for GUI
-- React UI with session canvas, message display, task visualization
+- Worktree-based session isolation (required foreign key)
+- Git operations via simple-git
+- Real-time WebSocket events for multiplayer UI
+- React UI with multiplayer canvas, session drawer, task visualization
 - Claude Code session import from JSONL transcripts
-- Basic Claude API integration (messages-only mode)
+- **Claude Agent SDK integration:**
+  - CLAUDE.md auto-loading via `settingSources: ['project']`
+  - Preset system prompts (`preset: 'claude_code'`)
+  - Live prompt execution with streaming
+  - Tool support (Read, Write, Bash, etc.) with permission system
+  - Conversation continuity via sdk_session_id
+- **Multi-agent support:**
+  - Claude Code (Claude Agent SDK)
+  - OpenAI Codex (OpenAI SDK with custom permission system)
+  - Google Gemini (Google Generative AI SDK - beta)
+- **MCP (Model Context Protocol) integration:**
+  - MCP server configuration UI
+  - Session-level MCP server selection
+  - Dynamic tool integration
+- **Documentation website:**
+  - Nextra-based docs at apps/agor-docs
+  - Auto-generated CLI reference
+  - Manual REST API documentation
+  - Guide and API reference sections
 
 **🚧 In Progress:**
 
-- Claude Agent SDK migration (CLAUDE.md auto-loading, preset prompts)
-- Session fork/spawn operations
-- Task completion tracking and git state
+- Session fork/spawn UI and genealogy visualization
+- Task completion tracking improvements
+- Concept management system
+- Report generation system
 
 **📋 Planned:**
 
-- Claude Agent SDK tool support (Read, Write, Bash)
 - Desktop app (Electron/Tauri)
-- Cloud sync (V2)
-- Concept management
-- Report generation
-- Multi-agent support (Cursor, Codex, Gemini)
+- Cloud sync (V2 with PostgreSQL)
+- Advanced permission modes for all agents
+- Automated test generation
+- CI/CD pipeline integration
 
 ---
 
