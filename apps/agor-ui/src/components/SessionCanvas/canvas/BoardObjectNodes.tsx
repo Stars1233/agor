@@ -489,7 +489,7 @@ const CommentNodeComponent = ({ data }: { data: CommentNodeData }) => {
               minWidth: '20px',
               height: '20px',
               borderRadius: '10px',
-              background: token.colorPrimary,
+              background: `${token.colorPrimary}80`,
               border: `2px solid ${token.colorBgContainer}`,
               color: token.colorBgContainer,
               fontSize: '11px',
