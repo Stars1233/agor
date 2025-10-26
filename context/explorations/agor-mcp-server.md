@@ -1997,16 +1997,17 @@ Agents should understand the task context within sessions.
 **Read-only introspection tools (safe, no side effects):**
 
 - [x] `agor_sessions_list` - ✅ Implemented
-- [ ] `agor_sessions_get` - Get session by ID
-- [ ] `agor_sessions_get_current` - Get current session info
-- [ ] `agor_worktrees_get` - Get worktree by ID
-- [ ] `agor_worktrees_list` - List all worktrees
-- [ ] `agor_boards_get` - Get board by ID
-- [ ] `agor_boards_list` - List all boards
-- [ ] `agor_tasks_list` - List tasks in a session
-- [ ] `agor_tasks_get` - Get task by ID
+- [x] `agor_sessions_get` - ✅ Implemented
+- [x] `agor_sessions_get_current` - ✅ Implemented
+- [x] `agor_sessions_spawn` - ✅ Implemented (write operation, moved from second batch)
+- [x] `agor_worktrees_get` - ✅ Implemented
+- [x] `agor_worktrees_list` - ✅ Implemented
+- [x] `agor_boards_get` - ✅ Implemented
+- [x] `agor_boards_list` - ✅ Implemented
+- [x] `agor_tasks_list` - ✅ Implemented
+- [x] `agor_tasks_get` - ✅ Implemented
 
-**Estimated effort:** ~6 hours (all are simple service proxies)
+**Total:** 10 tools implemented (9 read-only + 1 write)
 
 **Success criteria:**
 
@@ -2023,7 +2024,7 @@ Agents should understand the task context within sessions.
 **Note:** Implement these AFTER first batch is stable.
 
 - [ ] `agor_sessions_create` - Create new session
-- [ ] `agor_sessions_spawn` - Spawn child session (subsession)
+- [x] `agor_sessions_spawn` - ✅ Implemented (moved to first batch)
 - [ ] `agor_sessions_fork` - Fork session at specific point
 - [ ] `agor_sessions_update` - Update session metadata (title, description)
 - [ ] `agor_boards_create` - Create new board

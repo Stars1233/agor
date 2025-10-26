@@ -135,6 +135,31 @@ export function setupMCPRoutes(app: Application): void {
                 properties: {},
               },
             },
+            {
+              name: 'agor_sessions_spawn',
+              description:
+                'Spawn a child session (subsession) for delegating work to another agent. Creates a new session with parent genealogy tracking.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  prompt: {
+                    type: 'string',
+                    description: 'The prompt/task for the subsession agent to execute',
+                  },
+                  agenticTool: {
+                    type: 'string',
+                    enum: ['claude-code', 'cursor', 'codex', 'gemini'],
+                    description:
+                      'Which agent to use for the subsession (defaults to same as parent)',
+                  },
+                  taskId: {
+                    type: 'string',
+                    description: 'Optional task ID to link the spawned session to',
+                  },
+                },
+                required: ['prompt'],
+              },
+            },
 
             // Worktree tools
             {
@@ -292,6 +317,46 @@ export function setupMCPRoutes(app: Application): void {
               {
                 type: 'text',
                 text: JSON.stringify(session, null, 2),
+              },
+            ],
+          };
+        } else if (name === 'agor_sessions_spawn') {
+          // Spawn a child session (subsession)
+          if (!args?.prompt) {
+            return res.status(400).json({
+              jsonrpc: '2.0',
+              id: mcpRequest.id,
+              error: {
+                code: -32602,
+                message: 'Invalid params: prompt is required',
+              },
+            });
+          }
+
+          const spawnData: {
+            prompt: string;
+            agentic_tool?: string;
+            task_id?: string;
+          } = {
+            prompt: args.prompt,
+          };
+
+          if (args.agenticTool) {
+            spawnData.agentic_tool = args.agenticTool;
+          }
+
+          if (args.taskId) {
+            spawnData.task_id = args.taskId;
+          }
+
+          // Call spawn method on sessions service
+          const childSession = await app.service('sessions').spawn(context.sessionId, spawnData);
+
+          mcpResponse = {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(childSession, null, 2),
               },
             ],
           };

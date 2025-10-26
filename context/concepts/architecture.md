@@ -45,7 +45,7 @@ Agor is a **multi-client agent orchestration platform** with a clean separation 
 │  │  MCP HTTP Endpoint (Self-Access for Agents)     │ │
 │  │  POST /mcp?sessionToken={token}                 │ │
 │  │  - JSON-RPC 2.0 protocol                        │ │
-│  │  - 9 introspection tools (sessions, boards...)  │ │
+│  │  - 10 tools (9 read + spawn subsessions)        │ │
 │  │  - Token authentication (24h, in-memory cache)  │ │
 │  └──────────────────┬───────────────────────────────┘ │
 │                     │                                   │
@@ -683,21 +683,22 @@ const sdkOptions = {
 - Expiration: 24 hours
 - Scope: Session-specific (agent can only access its own context)
 
-### MCP Tools (First Batch - Read-Only)
+### MCP Tools (Implemented)
 
-**9 introspection tools** enable agents to understand their environment:
+**10 tools** enable agents to understand and orchestrate their environment:
 
-| Tool                        | Description                | Returns                 |
-| --------------------------- | -------------------------- | ----------------------- |
-| `agor_sessions_list`        | List sessions with filters | Paginated sessions      |
-| `agor_sessions_get`         | Get specific session       | Full session object     |
-| `agor_sessions_get_current` | Get current session        | Current session context |
-| `agor_worktrees_get`        | Get worktree details       | Path, branch, git state |
-| `agor_worktrees_list`       | List all worktrees         | Paginated worktrees     |
-| `agor_boards_get`           | Get board by ID            | Board with zones        |
-| `agor_boards_list`          | List all boards            | Paginated boards        |
-| `agor_tasks_list`           | List tasks in session      | Paginated tasks         |
-| `agor_tasks_get`            | Get specific task          | Full task object        |
+| Tool                        | Description                          | Returns                 |
+| --------------------------- | ------------------------------------ | ----------------------- |
+| `agor_sessions_list`        | List sessions with filters           | Paginated sessions      |
+| `agor_sessions_get`         | Get specific session                 | Full session object     |
+| `agor_sessions_get_current` | Get current session                  | Current session context |
+| `agor_sessions_spawn`       | **Spawn child session (subsession)** | New child session       |
+| `agor_worktrees_get`        | Get worktree details                 | Path, branch, git state |
+| `agor_worktrees_list`       | List all worktrees                   | Paginated worktrees     |
+| `agor_boards_get`           | Get board by ID                      | Board with zones        |
+| `agor_boards_list`          | List all boards                      | Paginated boards        |
+| `agor_tasks_list`           | List tasks in session                | Paginated tasks         |
+| `agor_tasks_get`            | Get specific task                    | Full task object        |
 
 **Example agent usage:**
 
@@ -874,10 +875,11 @@ Read-only tools are stable. Next batch will enable agents to modify their enviro
 - ✅ JSON-RPC 2.0 protocol handler
 - ✅ Session token authentication
 - ✅ Auto-configuration in Claude sessions
-- ✅ 9 read-only introspection tools
+- ✅ 10 tools (9 read-only + spawn subsessions)
 - ✅ Service layer integration
-- ✅ Vitest integration tests
-- ⏳ Write operations (second batch)
+- ✅ Vitest integration tests (11 tests)
+- ✅ **agor_sessions_spawn** - First write operation!
+- ⏳ Additional write operations (create, fork, update)
 - ⏳ Permission system for tool execution
 - ⏳ Rate limiting and abuse prevention
 

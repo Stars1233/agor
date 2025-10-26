@@ -47,7 +47,7 @@ async function callMCPTool(name: string, args: any = {}) {
 }
 
 describe('MCP Tools - Session Tools', () => {
-  it('tools/list returns all 9 tools', async () => {
+  it('tools/list returns all 10 tools', async () => {
     const resp = await fetch(`${DAEMON_URL}/mcp?sessionToken=${sessionToken}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -59,13 +59,14 @@ describe('MCP Tools - Session Tools', () => {
     });
 
     const data = await resp.json();
-    expect(data.result.tools).toHaveLength(9);
+    expect(data.result.tools).toHaveLength(10);
 
     // biome-ignore lint/suspicious/noExplicitAny: JSON response type from MCP server
     const toolNames = data.result.tools.map((t: any) => t.name);
     expect(toolNames).toContain('agor_sessions_list');
     expect(toolNames).toContain('agor_sessions_get');
     expect(toolNames).toContain('agor_sessions_get_current');
+    expect(toolNames).toContain('agor_sessions_spawn');
     expect(toolNames).toContain('agor_worktrees_get');
     expect(toolNames).toContain('agor_worktrees_list');
     expect(toolNames).toContain('agor_boards_get');
@@ -102,6 +103,17 @@ describe('MCP Tools - Session Tools', () => {
 
     expect(result.session_id).toBe(sessionId);
     expect(result).toHaveProperty('status');
+  });
+
+  it('agor_sessions_spawn creates child session', async () => {
+    const result = await callMCPTool('agor_sessions_spawn', {
+      prompt: 'Test subsession task',
+    });
+
+    expect(result).toHaveProperty('session_id');
+    expect(result).toHaveProperty('parent_session_id');
+    expect(result).toHaveProperty('status');
+    expect(result).toHaveProperty('worktree_id');
   });
 });
 
