@@ -7,8 +7,9 @@
 import { LockOutlined, MailOutlined } from '@ant-design/icons';
 import { Alert, Button, Card, Form, Input, Space, Typography } from 'antd';
 import { useState } from 'react';
+import { ParticleBackground } from './ParticleBackground';
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
 
 interface LoginPageProps {
   onLogin: (email: string, password: string) => Promise<boolean>;
@@ -32,20 +33,55 @@ export function LoginPage({ onLogin, loading = false, error }: LoginPageProps) {
   return (
     <div
       style={{
-        minHeight: '100vh',
+        width: '100vw',
+        height: '100vh',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%)',
+        background: 'linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 50%, #0f1f1e 100%)',
         padding: '24px',
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        overflow: 'hidden',
       }}
     >
+      {/* Particle background */}
+      <ParticleBackground />
+
+      {/* Attribution */}
+      <a
+        href="https://particles.js.org"
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{
+          position: 'fixed',
+          bottom: 16,
+          right: 16,
+          fontSize: 10,
+          color: 'rgba(46, 154, 146, 0.3)',
+          textDecoration: 'none',
+          zIndex: 0,
+          transition: 'color 0.3s',
+        }}
+        onMouseEnter={e => {
+          e.currentTarget.style.color = 'rgba(46, 154, 146, 0.6)';
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.color = 'rgba(46, 154, 146, 0.3)';
+        }}
+      >
+        🤍 tsparticles
+      </a>
+
       <Card
         style={{
           width: '100%',
           maxWidth: 420,
           borderRadius: 12,
           boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4)',
+          position: 'relative',
+          zIndex: 1,
         }}
         variant="borderless"
       >
@@ -68,7 +104,7 @@ export function LoginPage({ onLogin, loading = false, error }: LoginPageProps) {
             <Title level={2} style={{ margin: 0 }}>
               Agor
             </Title>
-            <Typography.Text type="secondary">Next-gen agent orchestration</Typography.Text>
+            <Text type="secondary">Next-gen agent orchestration</Text>
           </div>
         </Space>
 
@@ -77,7 +113,24 @@ export function LoginPage({ onLogin, loading = false, error }: LoginPageProps) {
           <Alert
             type="error"
             message="Login Failed"
-            description={error}
+            description={
+              <Space direction="vertical" size="small" style={{ width: '100%' }}>
+                <div>{error}</div>
+                <div
+                  style={{
+                    marginTop: 8,
+                    paddingTop: 8,
+                    borderTop: '1px solid rgba(255,255,255,0.1)',
+                  }}
+                >
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    💡 First time setting up? Create an admin user:
+                  </Text>
+                  <br />
+                  <code style={{ fontSize: 11 }}>agor user create-admin</code>
+                </div>
+              </Space>
+            }
             showIcon
             closable
             style={{ marginBottom: 24 }}
@@ -121,9 +174,9 @@ export function LoginPage({ onLogin, loading = false, error }: LoginPageProps) {
         {/* Footer */}
         <div style={{ textAlign: 'center', marginTop: 24 }}>
           <Space direction="vertical" size={4}>
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              CLI: <code>$ agor user create</code>
-            </Typography.Text>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              New user? <code>agor user create-admin</code>
+            </Text>
           </Space>
         </div>
       </Card>

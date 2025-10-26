@@ -20,6 +20,8 @@
     "@agor/core": "workspace:*",
     "@ant-design/icons": "^6.1.0",
     "@ant-design/x": "^1.6.1",
+    "@tsparticles/react": "^3.0.0",
+    "@tsparticles/slim": "^3.9.1",
     "antd": "^5.27.4",
     "emoji-picker-react": "^4.14.0",
     "handlebars": "^4.7.8",
