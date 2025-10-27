@@ -1,6 +1,6 @@
 {
   "name": "agor-live",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Multiplayer canvas for orchestrating AI coding sessions",
   "type": "module",
   "bin": {
