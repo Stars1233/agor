@@ -10,8 +10,13 @@
   "files": [
     "bin/",
     "dist/",
-    "node_modules/@agor"
+    "node_modules/@agor",
+    "LICENSE",
+    "README.md"
   ],
+  "scripts": {
+    "prepublishOnly": "cp ../../README.md ."
+  },
   "imports": {
     "@agor/core": "./dist/core/index.js",
     "@agor/core/*": "./dist/core/*"
@@ -29,15 +34,15 @@
     "git",
     "workflow"
   ],
-  "author": "Agor Contributors",
-  "license": "BSL-1.1",
-  "homepage": "https://github.com/agorapp/agor#readme",
+  "author": "Maxime Beauchemin <maximebeauchemin@gmail.com>",
+  "license": "BUSL-1.1",
+  "homepage": "https://agor.live",
   "repository": {
     "type": "git",
-    "url": "https://github.com/agorapp/agor.git"
+    "url": "https://github.com/mistercrunch/agor.git"
   },
   "bugs": {
-    "url": "https://github.com/agorapp/agor/issues"
+    "url": "https://github.com/mistercrunch/agor/issues"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.25",
