@@ -11,16 +11,11 @@
   "remoteEnv": {
     "VITE_DAEMON_URL": "https://${CODESPACE_NAME}-3030.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
   },
-  "forwardPorts": [3030, 5173],
+  "forwardPorts": [3030],
   "portsAttributes": {
     "3030": {
-      "label": "Agor Daemon",
+      "label": "Agor",
       "onAutoForward": "notify",
-      "visibility": "public"
-    },
-    "5173": {
-      "label": "Agor UI",
-      "onAutoForward": "openBrowserOnce",
       "visibility": "public"
     }
   },
