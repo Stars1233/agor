@@ -20,10 +20,13 @@ import {
   executeToolCall,
   GeminiClient,
   GeminiEventType,
+  MCPServerConfig,
   type ResumedSessionData,
 } from '@google/gemini-cli-core';
 import type { Content, Part } from '@google/genai';
+import type { MCPServerRepository } from '../../db/repositories/mcp-servers';
 import type { MessagesRepository } from '../../db/repositories/messages';
+import type { SessionMCPServerRepository } from '../../db/repositories/session-mcp-servers';
 import type { SessionRepository } from '../../db/repositories/sessions';
 import type { WorktreeRepository } from '../../db/repositories/worktrees';
 import type { PermissionMode, SessionID, TaskID } from '../../types';
@@ -80,7 +83,9 @@ export class GeminiPromptService {
     _messagesRepo: MessagesRepository,
     private sessionsRepo: SessionRepository,
     _apiKey?: string,
-    private worktreesRepo?: WorktreeRepository
+    private worktreesRepo?: WorktreeRepository,
+    private mcpServerRepo?: MCPServerRepository,
+    private sessionMCPRepo?: SessionMCPServerRepository
   ) {}
 
   /**
@@ -506,6 +511,130 @@ export class GeminiPromptService {
       // CLAUDE.md doesn't exist - that's okay
     }
 
+    // Fetch and configure MCP servers for this session (hierarchical scoping)
+    const mcpServersConfig: Record<string, MCPServerConfig> = {};
+    if (this.sessionMCPRepo && this.mcpServerRepo) {
+      try {
+        const allServers: Array<{
+          // biome-ignore lint/suspicious/noExplicitAny: MCPServer type from database
+          server: any;
+          source: string;
+        }> = [];
+
+        // 1. Global servers (always included)
+        console.log('🔌 Fetching MCP servers with hierarchical scoping...');
+        const globalServers = await this.mcpServerRepo.findAll({
+          scope: 'global',
+          enabled: true,
+        });
+        console.log(`   📍 Global scope: ${globalServers?.length ?? 0} server(s)`);
+        for (const server of globalServers ?? []) {
+          allServers.push({ server, source: 'global' });
+        }
+
+        // 2. Repo-scoped servers (if session has a worktree)
+        let repoId: string | undefined;
+        if (session.worktree_id && this.worktreesRepo) {
+          const worktree = await this.worktreesRepo.findById(session.worktree_id);
+          repoId = worktree?.repo_id;
+        }
+        if (repoId) {
+          const repoServers = await this.mcpServerRepo.findAll({
+            scope: 'repo',
+            scopeId: repoId,
+            enabled: true,
+          });
+          console.log(`   📍 Repo scope: ${repoServers?.length ?? 0} server(s)`);
+          for (const server of repoServers ?? []) {
+            allServers.push({ server, source: 'repo' });
+          }
+        }
+
+        // 3. Session-specific servers (from join table)
+        const sessionServers = await this.sessionMCPRepo.listServers(sessionId, true); // enabledOnly
+        console.log(`   📍 Session scope: ${sessionServers.length} server(s)`);
+        for (const server of sessionServers) {
+          allServers.push({ server, source: 'session' });
+        }
+
+        // 4. Deduplicate by server ID (later scopes override earlier ones)
+        // This means: session > repo > global
+        const serverMap = new Map<
+          string,
+          {
+            // biome-ignore lint/suspicious/noExplicitAny: MCPServer type from database
+            server: any;
+            source: string;
+          }
+        >();
+        for (const item of allServers) {
+          serverMap.set(item.server.mcp_server_id, item);
+        }
+        const uniqueServers = Array.from(serverMap.values());
+
+        console.log(
+          `   ✅ Total: ${uniqueServers.length} unique MCP server(s) after deduplication`
+        );
+
+        // 5. Convert to Gemini SDK format
+        for (const { server, source } of uniqueServers) {
+          console.log(`   - ${server.name} (${server.transport}) [${source}]`);
+
+          // Convert Agor's MCP server format to Gemini SDK's MCPServerConfig
+          if (server.transport === 'stdio') {
+            mcpServersConfig[server.name] = new MCPServerConfig(
+              server.command,
+              server.args || [],
+              server.env || {},
+              workingDirectory // Use worktree path as cwd
+            );
+          } else if (server.transport === 'http') {
+            // HTTP transport: use httpUrl parameter
+            mcpServersConfig[server.name] = new MCPServerConfig(
+              undefined, // command
+              undefined, // args
+              server.env || {},
+              undefined, // cwd
+              undefined, // url (websocket)
+              server.url, // httpUrl
+              server.headers || {} // headers
+            );
+          } else if (server.transport === 'sse') {
+            // SSE transport: use url parameter (websocket/sse)
+            mcpServersConfig[server.name] = new MCPServerConfig(
+              undefined, // command
+              undefined, // args
+              server.env || {},
+              undefined, // cwd
+              server.url // url (websocket/sse)
+            );
+          }
+        }
+
+        if (Object.keys(mcpServersConfig).length > 0) {
+          console.log(
+            `   🔧 MCP config for Gemini SDK:`,
+            JSON.stringify(
+              Object.keys(mcpServersConfig).reduce(
+                (acc, key) => {
+                  acc[key] = {
+                    transport: mcpServersConfig[key].command ? 'stdio' : 'http/sse',
+                  };
+                  return acc;
+                },
+                {} as Record<string, { transport: string }>
+              ),
+              null,
+              2
+            )
+          );
+        }
+      } catch (error) {
+        console.warn('⚠️  Failed to fetch MCP servers for Gemini session:', error);
+        // Continue without MCP servers - non-fatal error
+      }
+    }
+
     // Create SDK config
     const config = new Config({
       sessionId, // Use Agor session ID
@@ -521,6 +650,7 @@ export class GeminiPromptService {
         respectGitIgnore: true,
         respectGeminiIgnore: true,
       },
+      mcpServers: Object.keys(mcpServersConfig).length > 0 ? mcpServersConfig : undefined,
       // output: { format: 'stream-json' }, // Streaming JSON events (omitting for now - may not be needed)
       // System prompt will be added via first message if provided
     });
@@ -539,6 +669,10 @@ export class GeminiPromptService {
     // Create client (config must be initialized and authenticated first!)
     const client = new GeminiClient(config);
     await client.initialize();
+
+    // CRITICAL: Set tools for the client (this triggers MCP tool discovery and registration)
+    await client.setTools();
+    console.log('🔧 Tools initialized for Gemini client');
 
     // Check if we have existing conversation history
     let hasExistingHistory = false;

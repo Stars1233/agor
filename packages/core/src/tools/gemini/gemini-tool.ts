@@ -11,7 +11,9 @@
  */
 
 import { execSync } from 'node:child_process';
+import type { MCPServerRepository } from '../../db/repositories/mcp-servers';
 import type { MessagesRepository } from '../../db/repositories/messages';
+import type { SessionMCPServerRepository } from '../../db/repositories/session-mcp-servers';
 import type { SessionRepository } from '../../db/repositories/sessions';
 import type { WorktreeRepository } from '../../db/repositories/worktrees';
 import { generateId } from '../../lib/ids';
@@ -40,14 +42,18 @@ export class GeminiTool implements ITool {
     apiKey?: string,
     private messagesService?: MessagesService,
     private tasksService?: TasksService,
-    worktreesRepo?: WorktreeRepository
+    worktreesRepo?: WorktreeRepository,
+    mcpServerRepo?: MCPServerRepository,
+    sessionMCPRepo?: SessionMCPServerRepository
   ) {
     if (messagesRepo && sessionsRepo) {
       this.promptService = new GeminiPromptService(
         messagesRepo,
         sessionsRepo,
         apiKey,
-        worktreesRepo
+        worktreesRepo,
+        mcpServerRepo,
+        sessionMCPRepo
       );
     }
   }

@@ -902,7 +902,9 @@ async function main() {
     geminiApiKey,
     app.service('messages'),
     app.service('tasks'),
-    worktreesRepo
+    worktreesRepo,
+    mcpServerRepo,
+    sessionMCPRepo
   );
 
   if (!geminiApiKey) {
