@@ -281,17 +281,16 @@ const SessionCanvas = ({
   const pendingResizeUpdatesRef = useRef<Record<string, { width: number; height: number }>>({});
 
   // Board objects hook
-  const { getBoardObjectNodes, addZoneNode, deleteObject, batchUpdateObjectPositions } =
-    useBoardObjects({
-      board,
-      client,
-      sessions,
-      worktrees,
-      boardObjects,
-      setNodes,
-      deletedObjectsRef,
-      eraserMode: activeTool === 'eraser',
-    });
+  const { getBoardObjectNodes, batchUpdateObjectPositions } = useBoardObjects({
+    board,
+    client,
+    sessions,
+    worktrees,
+    boardObjects,
+    setNodes,
+    deletedObjectsRef,
+    eraserMode: activeTool === 'eraser',
+  });
 
   // Extract zone labels - memoized to only change when labels actually change
   const zoneLabels = useMemo(() => {
@@ -312,7 +311,7 @@ const SessionCanvas = ({
 
       // Find the board_object for this worktree
       const boardObject = boardObjects.find(
-        (bo) => bo.worktree_id === worktreeId && bo.board_id === board.board_id
+        bo => bo.worktree_id === worktreeId && bo.board_id === board.board_id
       );
 
       if (!boardObject || !boardObject.zone_id) {
@@ -360,7 +359,7 @@ const SessionCanvas = ({
     return worktrees.map((worktree, index) => {
       // Find board object for this worktree (if positioned on this board)
       const boardObject = boardObjects.find(
-        (bo) => bo.worktree_id === worktree.worktree_id && bo.board_id === board?.board_id
+        bo => bo.worktree_id === worktree.worktree_id && bo.board_id === board?.board_id
       );
 
       // Use stored position from boardObject if available, otherwise auto-layout
@@ -377,7 +376,7 @@ const SessionCanvas = ({
           : undefined;
 
       // Get sessions for this worktree
-      const worktreeSessions = sessions.filter((s) => s.worktree_id === worktree.worktree_id);
+      const worktreeSessions = sessions.filter(s => s.worktree_id === worktree.worktree_id);
 
       return {
         id: worktree.worktree_id,
@@ -486,7 +485,7 @@ const SessionCanvas = ({
 
     // Filter to only spatial comments on this board (with position.absolute) and not resolved
     const spatialComments = comments.filter(
-      (c) => c.position?.absolute && c.board_id === board?.board_id && !c.resolved
+      c => c.position?.absolute && c.board_id === board?.board_id && !c.resolved
     );
 
     // Count replies for each thread root
@@ -503,7 +502,7 @@ const SessionCanvas = ({
     for (const comment of spatialComments) {
       if (comment.position?.absolute) {
         // Find user who created the comment
-        const user = users.find((u) => u.user_id === comment.created_by);
+        const user = users.find(u => u.user_id === comment.created_by);
 
         nodes.push({
           id: `comment-${comment.comment_id}`,
@@ -540,15 +539,15 @@ const SessionCanvas = ({
   useEffect(() => {
     if (isDraggingRef.current) return;
 
-    setNodes((currentNodes) => {
+    setNodes(currentNodes => {
       // Separate existing nodes by type
-      const existingZones = currentNodes.filter((n) => n.type === 'zone');
-      const existingCursors = currentNodes.filter((n) => n.type === 'cursor');
-      const existingComments = currentNodes.filter((n) => n.type === 'comment');
+      const existingZones = currentNodes.filter(n => n.type === 'zone');
+      const existingCursors = currentNodes.filter(n => n.type === 'cursor');
+      const existingComments = currentNodes.filter(n => n.type === 'comment');
 
       // Update worktree nodes with preserved state
-      const updatedWorktrees = initialNodes.map((newNode) => {
-        const existingNode = currentNodes.find((n) => n.id === newNode.id);
+      const updatedWorktrees = initialNodes.map(newNode => {
+        const existingNode = currentNodes.find(n => n.id === newNode.id);
         const localPosition = localPositionsRef.current[newNode.id];
         const incomingPosition = newNode.position;
         const positionChanged =
@@ -576,10 +575,10 @@ const SessionCanvas = ({
   // Helper: Partition nodes by type
   const partitionNodesByType = useCallback((nodes: Node[]) => {
     return {
-      zones: nodes.filter((n) => n.type === 'zone'),
-      worktrees: nodes.filter((n) => n.type === 'worktreeNode'),
-      comments: nodes.filter((n) => n.type === 'comment'),
-      cursors: nodes.filter((n) => n.type === 'cursor'),
+      zones: nodes.filter(n => n.type === 'zone'),
+      worktrees: nodes.filter(n => n.type === 'worktreeNode'),
+      comments: nodes.filter(n => n.type === 'comment'),
+      cursors: nodes.filter(n => n.type === 'cursor'),
     };
   }, []);
 
@@ -598,14 +597,14 @@ const SessionCanvas = ({
 
     const boardObjectNodes = getBoardObjectNodes();
 
-    setNodes((currentNodes) => {
+    setNodes(currentNodes => {
       const { worktrees, comments, cursors } = partitionNodesByType(currentNodes);
 
       // Update zones with preserved selection state
       const zones = boardObjectNodes
-        .filter((z) => !deletedObjectsRef.current.has(z.id))
-        .map((newZone) => {
-          const existingZone = currentNodes.find((n) => n.id === newZone.id);
+        .filter(z => !deletedObjectsRef.current.has(z.id))
+        .map(newZone => {
+          const existingZone = currentNodes.find(n => n.id === newZone.id);
           return { ...newZone, selected: existingZone?.selected };
         });
 
@@ -617,7 +616,7 @@ const SessionCanvas = ({
   useEffect(() => {
     if (isDraggingRef.current) return;
 
-    setNodes((currentNodes) => {
+    setNodes(currentNodes => {
       const { zones, worktrees, comments } = partitionNodesByType(currentNodes);
       return applyZOrder(zones, worktrees, comments, cursorNodes);
     });
@@ -627,7 +626,7 @@ const SessionCanvas = ({
   useEffect(() => {
     if (isDraggingRef.current) return;
 
-    setNodes((currentNodes) => {
+    setNodes(currentNodes => {
       const { zones, worktrees, cursors } = partitionNodesByType(currentNodes);
       return applyZOrder(zones, worktrees, commentNodes, cursors);
     });
@@ -646,7 +645,7 @@ const SessionCanvas = ({
       // biome-ignore lint/suspicious/noExplicitAny: React Flow change event types are not exported
       changes.forEach((change: any) => {
         if (change.type === 'dimensions' && change.dimensions) {
-          const node = nodes.find((n) => n.id === change.id);
+          const node = nodes.find(n => n.id === change.id);
           if (node?.type === 'zone') {
             // Check if dimensions actually changed (to avoid infinite loop from React Flow emitting unchanged dimensions)
             const currentWidth = node.style?.width;
@@ -774,7 +773,7 @@ const SessionCanvas = ({
           const currentNodes = nodes;
 
           for (const [nodeId, position] of Object.entries(updates)) {
-            const draggedNode = currentNodes.find((n) => n.id === nodeId);
+            const draggedNode = currentNodes.find(n => n.id === nodeId);
 
             if (draggedNode?.type === 'zone') {
               // Zone moved - update position via batchUpdateObjectPositions
@@ -793,7 +792,7 @@ const SessionCanvas = ({
 
               // Check if worktree was already pinned to a zone before this drag
               const existingBoardObject = boardObjects.find(
-                (bo) => bo.worktree_id === nodeId && bo.board_id === board.board_id
+                bo => bo.worktree_id === nodeId && bo.board_id === board.board_id
               );
               const wasPinned = !!existingBoardObject?.zone_id;
 
@@ -841,7 +840,7 @@ const SessionCanvas = ({
                     (async () => {
                       try {
                         // Find the worktree
-                        const worktree = worktrees.find((wt) => wt.worktree_id === nodeId);
+                        const worktree = worktrees.find(wt => wt.worktree_id === nodeId);
 
                         // Render template
                         const context = {
@@ -912,7 +911,7 @@ const SessionCanvas = ({
             for (const { worktree_id, position, zone_id } of worktreeUpdates) {
               // Find existing board_object or create new one
               const existingBoardObject = boardObjects.find(
-                (bo) => bo.worktree_id === worktree_id && bo.board_id === board.board_id
+                bo => bo.worktree_id === worktree_id && bo.board_id === board.board_id
               );
 
               if (existingBoardObject) {
@@ -1040,7 +1039,7 @@ const SessionCanvas = ({
         const objectId = `zone-${Date.now()}`;
 
         // Optimistic update
-        setNodes((nodes) => [
+        setNodes(nodes => [
           ...nodes,
           {
             id: objectId,
@@ -1092,7 +1091,7 @@ const SessionCanvas = ({
             } as any)
             .catch((error: unknown) => {
               console.error('Failed to add zone:', error);
-              setNodes((nodes) => nodes.filter((n) => n.id !== objectId));
+              setNodes(nodes => nodes.filter(n => n.id !== objectId));
             });
         }
       }
@@ -1202,10 +1201,11 @@ const SessionCanvas = ({
       // Worktree cards handle their own session clicks internally
       // (no canvas-level click handler needed for worktreeNode)
     },
-    [activeTool, deleteObject]
+    [activeTool]
   );
 
   // Keyboard shortcuts
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deleteObject is used inside handleKeyDown
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Ignore if typing in an input
@@ -1219,8 +1219,8 @@ const SessionCanvas = ({
       if (e.key === 'Escape') setActiveTool('select');
       if (e.key === 'Delete' || e.key === 'Backspace') {
         // Delete selected nodes
-        const selectedNodes = nodes.filter((n) => n.selected);
-        selectedNodes.forEach((n) => {
+        const selectedNodes = nodes.filter(n => n.selected);
+        selectedNodes.forEach(n => {
           if (n.type === 'zone') {
             deleteObject(n.id);
           }
@@ -1270,7 +1270,7 @@ const SessionCanvas = ({
         onNodeDragStop={handleNodeDragStop}
         onNodeClick={handleNodeClick}
         onPaneClick={handlePaneClick}
-        onInit={(instance) => {
+        onInit={instance => {
           reactFlowInstanceRef.current = instance;
         }}
         nodeTypes={nodeTypes}
@@ -1290,7 +1290,7 @@ const SessionCanvas = ({
         <Controls position="top-left" showInteractive={false}>
           {/* Custom toolbox buttons */}
           <ControlButton
-            onClick={(e) => {
+            onClick={e => {
               e.stopPropagation();
               setActiveTool('select');
             }}
@@ -1302,7 +1302,7 @@ const SessionCanvas = ({
             <SelectOutlined style={{ fontSize: '16px' }} />
           </ControlButton>
           <ControlButton
-            onClick={(e) => {
+            onClick={e => {
               e.stopPropagation();
               setActiveTool('zone');
             }}
@@ -1314,7 +1314,7 @@ const SessionCanvas = ({
             <BorderOutlined style={{ fontSize: '16px' }} />
           </ControlButton>
           <ControlButton
-            onClick={(e) => {
+            onClick={e => {
               e.stopPropagation();
               setActiveTool('comment');
             }}
@@ -1326,7 +1326,7 @@ const SessionCanvas = ({
             <CommentOutlined style={{ fontSize: '16px' }} />
           </ControlButton>
           <ControlButton
-            onClick={(e) => {
+            onClick={e => {
               e.stopPropagation();
               setActiveTool(activeTool === 'eraser' ? 'select' : 'eraser');
             }}
@@ -1341,7 +1341,7 @@ const SessionCanvas = ({
           </ControlButton>
         </Controls>
         <MiniMap
-          nodeColor={(node) => {
+          nodeColor={node => {
             // Handle cursor nodes (show as bright color)
             if (node.type === 'cursor') return token.colorWarning;
 
@@ -1387,8 +1387,8 @@ const SessionCanvas = ({
               <Input.TextArea
                 placeholder="Add a comment..."
                 value={commentInput}
-                onChange={(e) => setCommentInput(e.target.value)}
-                onPressEnter={(e) => {
+                onChange={e => setCommentInput(e.target.value)}
+                onPressEnter={e => {
                   if (!e.shiftKey) {
                     e.preventDefault();
                     handleCreateSpatialComment();
@@ -1438,13 +1438,13 @@ const SessionCanvas = ({
       {triggerModal &&
         (() => {
           // Pre-render the template for display in modal
-          const session = sessions.find((s) => s.session_id === triggerModal.sessionId);
+          const session = sessions.find(s => s.session_id === triggerModal.sessionId);
           let renderedPromptPreview = triggerModal.trigger.template;
 
           if (session) {
             try {
               // Lookup worktree data for this session
-              const worktree = worktrees.find((wt) => wt.worktree_id === session.worktree_id);
+              const worktree = worktrees.find(wt => wt.worktree_id === session.worktree_id);
 
               const context = {
                 session: {
@@ -1501,7 +1501,7 @@ const SessionCanvas = ({
                   const { sessionId, trigger } = triggerModal;
 
                   // Find the session to get its data for Handlebars context
-                  const session = sessions.find((s) => s.session_id === sessionId);
+                  const session = sessions.find(s => s.session_id === sessionId);
                   if (!session) {
                     console.error('❌ Session not found:', sessionId);
                     setTriggerModal(null);
@@ -1509,7 +1509,7 @@ const SessionCanvas = ({
                   }
 
                   // Lookup worktree data for this session
-                  const worktree = worktrees.find((wt) => wt.worktree_id === session.worktree_id);
+                  const worktree = worktrees.find(wt => wt.worktree_id === session.worktree_id);
 
                   // Build Handlebars context from session, board, and worktree data
                   const context = {
@@ -1610,7 +1610,7 @@ const SessionCanvas = ({
           open={true}
           onCancel={() => setWorktreeTriggerModal(null)}
           worktreeId={worktreeTriggerModal.worktreeId}
-          worktree={worktrees.find((wt) => wt.worktree_id === worktreeTriggerModal.worktreeId)}
+          worktree={worktrees.find(wt => wt.worktree_id === worktreeTriggerModal.worktreeId)}
           sessions={sessions}
           zoneName={worktreeTriggerModal.zoneName}
           trigger={worktreeTriggerModal.trigger}

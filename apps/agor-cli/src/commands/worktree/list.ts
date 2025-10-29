@@ -12,14 +12,6 @@ import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import Table from 'cli-table3';
 
-// Type for paginated responses
-interface Paginated<T> {
-  total: number;
-  limit: number;
-  skip: number;
-  data: T[];
-}
-
 export default class WorktreeList extends Command {
   static description = 'List git worktrees';
 

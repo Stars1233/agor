@@ -137,11 +137,7 @@ export class ClaudePromptService {
         agentSessionId?: string;
       }
   > {
-    const {
-      query: result,
-      resolvedModel,
-      getStderr,
-    } = await setupQuery(
+    const { query: result, getStderr } = await setupQuery(
       sessionId,
       prompt,
       {
@@ -226,7 +222,7 @@ export class ClaudePromptService {
         }
 
         // If we got an end event, break the outer loop
-        if (events.some((e) => e.type === 'end')) {
+        if (events.some(e => e.type === 'end')) {
           break;
         }
       }
@@ -274,7 +270,7 @@ export class ClaudePromptService {
    * @returns Complete assistant response with metadata
    */
   async promptSession(sessionId: SessionID, prompt: string): Promise<PromptResult> {
-    const { query: result, getStderr } = await setupQuery(
+    const { query: result } = await setupQuery(
       sessionId,
       prompt,
       {

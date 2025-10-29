@@ -262,10 +262,12 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
 
     // Remove timestamps for comparison - create new objects without timestamp
     if (oldState?.last_health_check) {
+      // biome-ignore lint/correctness/noUnusedVariables: extracting to remove from object
       const { timestamp, ...healthCheck } = oldState.last_health_check;
       oldState.last_health_check = healthCheck as typeof oldState.last_health_check;
     }
     if (newState?.last_health_check) {
+      // biome-ignore lint/correctness/noUnusedVariables: extracting to remove from object
       const { timestamp, ...healthCheck } = newState.last_health_check;
       newState.last_health_check = healthCheck as typeof newState.last_health_check;
     }
@@ -345,7 +347,7 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
           stdio: 'inherit', // Show output directly in daemon logs
         });
 
-        childProcess.on('exit', (code) => {
+        childProcess.on('exit', code => {
           if (code === 0) {
             console.log(`✅ Start command completed successfully for ${worktree.name}`);
             resolve();
@@ -428,7 +430,7 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
             stdio: 'inherit',
           });
 
-          stopProcess.on('exit', (code) => {
+          stopProcess.on('exit', code => {
             if (code === 0) {
               resolve();
             } else {
@@ -500,7 +502,7 @@ export class WorktreesService extends DrizzleService<Worktree, Partial<Worktree>
       await this.stopEnvironment(id, params);
 
       // Wait a bit for processes to clean up
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     // Start

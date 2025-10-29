@@ -5,11 +5,9 @@
  */
 
 import type { ActiveUser } from '@agor/core/types';
-import { Avatar, Tooltip, theme } from 'antd';
+import { Avatar, Tooltip } from 'antd';
 import type { CSSProperties } from 'react';
 import './Facepile.css';
-
-const { useToken } = theme;
 
 export interface FacepileProps {
   activeUsers: ActiveUser[];

@@ -26,7 +26,6 @@ if (import.meta.hot) {
 // Initialize Handlebars helpers
 initializeHandlebarsHelpers();
 
-// biome-ignore lint/style/noNonNullAssertion: root element is guaranteed to exist in index.html
 createRoot(document.getElementById('root')!).render(
   // Temporarily disable StrictMode to avoid double socket connections in dev
   // TODO: Make useAgorClient StrictMode-compatible by handling double-mount properly

@@ -28,6 +28,7 @@ export function Hero({
 
       <div className={styles.hero}>
         <div className={styles.heroContent}>
+          {/* biome-ignore lint/performance/noImgElement: Using img for static assets in docs */}
           <img src="/logo.png" alt="agor logo" className={styles.heroLogo} />
           <h1 className={styles.heroTitle}>{title}</h1>
           <p className={styles.heroSubtitle}>{subtitle}</p>
@@ -55,6 +56,7 @@ export function Hero({
 
         {imageSrc && (
           <div className={styles.heroImage}>
+            {/* biome-ignore lint/performance/noImgElement: Using img for static assets in docs */}
             <img src={imageSrc} alt={imageAlt} />
           </div>
         )}

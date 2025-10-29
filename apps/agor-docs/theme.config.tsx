@@ -7,6 +7,7 @@ const config: DocsThemeConfig = {
   logo: (
     <span style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
       {/* eslint-disable-next-line @next/next/no-img-element */}
+      {/* biome-ignore lint/performance/noImgElement: Using img for static assets in docs */}
       <img
         src={`${basePath}/logo.png`}
         alt="agor"

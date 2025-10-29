@@ -30,8 +30,7 @@ beforeAll(async () => {
   console.log(`Using token ${sessionToken.substring(0, 16)}... for tests`);
 });
 
-// biome-ignore lint/suspicious/noExplicitAny: Test utility accepts arbitrary tool arguments
-async function callMCPTool(name: string, args: any = {}) {
+async function callMCPTool(name: string, args: Record<string, unknown> = {}) {
   const resp = await fetch(`${DAEMON_URL}/mcp?sessionToken=${sessionToken}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -70,8 +69,7 @@ describeIntegration('MCP Tools - Session Tools', () => {
     const data = (await resp.json()) as { result: { tools: Array<{ name: string }> } };
     expect(data.result.tools).toHaveLength(14);
 
-    // biome-ignore lint/suspicious/noExplicitAny: JSON response type from MCP server
-    const toolNames = data.result.tools.map((t: any) => t.name);
+    const toolNames = data.result.tools.map(t => t.name);
     expect(toolNames).toContain('agor_sessions_list');
     expect(toolNames).toContain('agor_sessions_get');
     expect(toolNames).toContain('agor_sessions_get_current');

@@ -35,6 +35,7 @@ import { initializeDatabase } from './migrate';
  * ```
  */
 export const dbTest = test.extend<{ db: Database }>({
+  // biome-ignore lint/correctness/noEmptyPattern: Playwright test fixture pattern requires empty destructure
   db: async ({}, use) => {
     // Create fresh in-memory SQLite database
     const db = createDatabase({ url: ':memory:' });

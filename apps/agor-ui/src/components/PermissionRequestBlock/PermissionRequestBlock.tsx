@@ -41,7 +41,7 @@ export const PermissionRequestBlock: React.FC<PermissionRequestBlockProps> = ({
   const { token } = theme.useToken();
   const [scope, setScope] = useState<PermissionScope>(PermissionScope.ONCE);
 
-  const { tool_name, tool_input, status, approved_by, approved_at } = content;
+  const { tool_name, tool_input, status } = content;
 
   // Determine the state: active, approved, denied, or waiting
   const isApproved = status === PermissionStatus.APPROVED;
@@ -193,7 +193,7 @@ export const PermissionRequestBlock: React.FC<PermissionRequestBlockProps> = ({
             {/* Radio group for scope selection */}
             <Radio.Group
               value={scope}
-              onChange={(e) => setScope(e.target.value)}
+              onChange={e => setScope(e.target.value)}
               style={{ width: '100%' }}
             >
               <Space direction="vertical" size={token.sizeUnit / 2}>

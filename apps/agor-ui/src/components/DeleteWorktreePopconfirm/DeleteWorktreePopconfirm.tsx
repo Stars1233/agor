@@ -1,5 +1,5 @@
 import type { Worktree } from '@agor/core/types';
-import { Alert, Checkbox, Popconfirm, Typography, theme } from 'antd';
+import { Alert, Checkbox, Popconfirm, Typography } from 'antd';
 import { type ReactNode, useState } from 'react';
 
 interface DeleteWorktreePopconfirmProps {
@@ -15,7 +15,6 @@ export const DeleteWorktreePopconfirm: React.FC<DeleteWorktreePopconfirmProps> =
   onConfirm,
   children,
 }) => {
-  const { token } = theme.useToken();
   const [deleteFromFilesystem, setDeleteFromFilesystem] = useState(true);
 
   const handleConfirm = (e?: React.MouseEvent<HTMLElement>) => {
@@ -45,7 +44,7 @@ export const DeleteWorktreePopconfirm: React.FC<DeleteWorktreePopconfirmProps> =
           )}
           <Checkbox
             checked={deleteFromFilesystem}
-            onChange={(e) => setDeleteFromFilesystem(e.target.checked)}
+            onChange={e => setDeleteFromFilesystem(e.target.checked)}
             style={{ marginTop: 8 }}
           >
             Also delete worktree from filesystem

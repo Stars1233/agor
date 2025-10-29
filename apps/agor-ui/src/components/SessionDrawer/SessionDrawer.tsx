@@ -53,7 +53,6 @@ import {
 } from '../Pill';
 import { ToolIcon } from '../ToolIcon';
 
-const { Title } = Typography;
 const { TextArea } = Input;
 
 // Re-export PermissionMode from SDK for convenience
@@ -152,7 +151,7 @@ const SessionDrawer = ({
   const latestContextWindow = React.useMemo(() => {
     // Find most recent task with context window data
     const tasksWithContext = tasks
-      .filter((t) => t.context_window && t.context_window_limit)
+      .filter(t => t.context_window && t.context_window_limit)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
     if (tasksWithContext.length > 0) {
@@ -289,7 +288,7 @@ const SessionDrawer = ({
   const isRunning = session.status === TaskStatus.RUNNING;
 
   // Get repo from worktree (worktree is passed from parent)
-  const repo = worktree ? repos.find((r) => r.repo_id === worktree.repo_id) : null;
+  const repo = worktree ? repos.find(r => r.repo_id === worktree.repo_id) : null;
 
   return (
     <Drawer
@@ -401,9 +400,9 @@ const SessionDrawer = ({
             )}
             {/* MCP Servers */}
             {sessionMcpServerIds
-              .map((serverId) => mcpServers.find((s) => s.mcp_server_id === serverId))
+              .map(serverId => mcpServers.find(s => s.mcp_server_id === serverId))
               .filter(Boolean)
-              .map((server) => (
+              .map(server => (
                 <Tag key={server?.mcp_server_id} color="purple" icon={<ApiOutlined />}>
                   {server?.display_name || server?.name}
                 </Tag>
@@ -464,10 +463,10 @@ const SessionDrawer = ({
         <Space direction="vertical" style={{ width: '100%' }} size={8}>
           <TextArea
             value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
+            onChange={e => setInputValue(e.target.value)}
             placeholder="Send a prompt, fork, or create a subsession..."
             autoSize={{ minRows: 1, maxRows: 10 }}
-            onPressEnter={(e) => {
+            onPressEnter={e => {
               if (e.shiftKey) {
                 return;
               }

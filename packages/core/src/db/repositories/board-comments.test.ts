@@ -349,7 +349,9 @@ describe('BoardCommentsRepository.findAll', () => {
     const comments = await repo.findAll({ board_id: board1.board_id });
 
     expect(comments).toHaveLength(2);
-    comments.forEach((c) => expect(c.board_id).toBe(board1.board_id));
+    for (const c of comments) {
+      expect(c.board_id).toBe(board1.board_id);
+    }
   });
 
   dbTest('should filter by null session_id', async ({ db }) => {
@@ -362,7 +364,9 @@ describe('BoardCommentsRepository.findAll', () => {
     const comments = await repo.findAll({ session_id: null as any });
 
     expect(comments).toHaveLength(2);
-    comments.forEach((c) => expect(c.session_id).toBeUndefined());
+    for (const c of comments) {
+      expect(c.session_id).toBeUndefined();
+    }
   });
 
   dbTest('should filter by resolved status', async ({ db }) => {
@@ -391,7 +395,9 @@ describe('BoardCommentsRepository.findAll', () => {
     const aliceComments = await repo.findAll({ created_by: 'alice' as UUID });
 
     expect(aliceComments).toHaveLength(2);
-    aliceComments.forEach((c) => expect(c.created_by).toBe('alice'));
+    for (const c of aliceComments) {
+      expect(c.created_by).toBe('alice');
+    }
   });
 
   dbTest('should combine multiple filters', async ({ db }) => {
@@ -506,7 +512,7 @@ describe('BoardCommentsRepository.update', () => {
     const data = createCommentData({ board_id: board.board_id });
     const created = await repo.create(data);
 
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise(resolve => setTimeout(resolve, 10));
 
     const updated = await repo.update(data.comment_id!, { content: 'Updated' });
 
@@ -662,7 +668,9 @@ describe('BoardCommentsRepository.findByBoard', () => {
     const comments = await repo.findByBoard(board1.board_id);
 
     expect(comments).toHaveLength(2);
-    comments.forEach((c) => expect(c.board_id).toBe(board1.board_id));
+    for (const c of comments) {
+      expect(c.board_id).toBe(board1.board_id);
+    }
   });
 
   dbTest('should filter by resolved within board', async ({ db }) => {
@@ -731,7 +739,9 @@ describe('BoardCommentsRepository.findMentions', () => {
     const mentions = await repo.findMentions(userId);
 
     expect(mentions).toHaveLength(2);
-    mentions.forEach((c) => expect(c.mentions).toContain(userId));
+    for (const c of mentions) {
+      expect(c.mentions).toContain(userId);
+    }
   });
 
   dbTest('should filter mentions by board_id', async ({ db }) => {
