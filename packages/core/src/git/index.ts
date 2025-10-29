@@ -90,6 +90,34 @@ export function getReposDir(): string {
 }
 
 /**
+ * Convert SSH Git URL to HTTPS
+ *
+ * Examples:
+ * - git@github.com:apache/superset.git -> https://github.com/apache/superset.git
+ * - git@github.com:apache/superset -> https://github.com/apache/superset
+ *
+ * @param url - Git URL (SSH or HTTPS)
+ * @returns HTTPS URL
+ */
+export function normalizeGitUrl(url: string): string {
+  // Already HTTPS - return as-is
+  if (url.startsWith('https://') || url.startsWith('http://')) {
+    return url;
+  }
+
+  // Convert SSH format to HTTPS
+  // git@github.com:org/repo.git -> https://github.com/org/repo.git
+  const sshMatch = url.match(/^git@([^:]+):(.+)$/);
+  if (sshMatch) {
+    const [, host, path] = sshMatch;
+    return `https://${host}/${path}`;
+  }
+
+  // Unknown format - return as-is (will likely fail, but let git handle the error)
+  return url;
+}
+
+/**
  * Extract repo name from Git URL
  *
  * Examples:
@@ -110,11 +138,16 @@ export function extractRepoName(url: string): string {
  * If the repository already exists and is valid, returns existing repo info.
  * If directory exists but is not a valid repo, throws an error with suggestion to delete.
  *
+ * Automatically converts SSH URLs to HTTPS for environments without SSH keys.
+ *
  * @param options - Clone options
  * @returns Clone result with path and metadata
  */
 export async function cloneRepo(options: CloneOptions): Promise<CloneResult> {
-  const repoName = extractRepoName(options.url);
+  // Normalize URL (convert SSH to HTTPS if needed)
+  const normalizedUrl = normalizeGitUrl(options.url);
+
+  const repoName = extractRepoName(normalizedUrl);
   const reposDir = getReposDir();
   const targetPath = options.targetDir || join(reposDir, repoName);
 
@@ -157,8 +190,9 @@ export async function cloneRepo(options: CloneOptions): Promise<CloneResult> {
     });
   }
 
-  // Clone the repo
-  await git.clone(options.url, targetPath, options.bare ? ['--bare'] : []);
+  // Clone the repo using normalized URL
+  console.log(`Cloning ${normalizedUrl} to ${targetPath}...`);
+  await git.clone(normalizedUrl, targetPath, options.bare ? ['--bare'] : []);
 
   // Get default branch from remote HEAD
   const defaultBranch = await getDefaultBranch(targetPath);
@@ -254,7 +288,7 @@ export async function isClean(repoPath: string): Promise<boolean> {
 export async function getRemoteUrl(repoPath: string, remote: string = 'origin'): Promise<string> {
   const git = createGit(repoPath);
   const remotes = await git.getRemotes(true);
-  const remoteObj = remotes.find((r) => r.name === remote);
+  const remoteObj = remotes.find(r => r.name === remote);
   return remoteObj?.refs.fetch || '';
 }
 
@@ -438,9 +472,7 @@ export async function getRemoteBranches(
 ): Promise<string[]> {
   const git = createGit(repoPath);
   const branches = await git.branch(['-r']);
-  return branches.all
-    .filter((b) => b.startsWith(`${remote}/`))
-    .map((b) => b.replace(`${remote}/`, ''));
+  return branches.all.filter(b => b.startsWith(`${remote}/`)).map(b => b.replace(`${remote}/`, ''));
 }
 
 /**
