@@ -7,7 +7,13 @@
  * The CLI commands are compiled from apps/agor-cli and bundled during build.
  */
 
-import { execute } from '@oclif/core';
+// Check Node.js version requirement before loading any dependencies
+import { checkNodeVersion } from './version-check.js';
+
+checkNodeVersion();
+
+// Use dynamic import to ensure version check runs first
+const { execute } = await import('@oclif/core');
 
 // oclif will resolve commands relative to this file
 // Commands are at ../dist/cli/commands (configured in package.json)

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import chalk from 'chalk';
 import { existsSync, mkdirSync, symlinkSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -31,9 +32,9 @@ try {
 
   // Create symlink
   symlinkSync(coreTarget, coreSymlink, 'dir');
-  console.log('✓ Created @agor/core symlink for package resolution');
+  console.log(chalk.green('✓ Created @agor/core symlink for package resolution'));
 } catch (error) {
   // Don't fail the install if symlink creation fails
-  console.warn('⚠️  Could not create @agor/core symlink:', error.message);
-  console.warn('   The package may still work via the "imports" field');
+  console.warn(chalk.yellow('⚠️  Could not create @agor/core symlink:'), error.message);
+  console.warn(chalk.dim('   The package may still work via the "imports" field'));
 }

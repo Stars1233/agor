@@ -1,6 +1,6 @@
 {
   "name": "agor-live",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Multiplayer canvas for orchestrating AI coding sessions",
   "type": "module",
   "bin": {
@@ -22,7 +22,7 @@
     "@agor/core/*": "./dist/core/*"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "keywords": [
     "ai",

@@ -7,8 +7,14 @@
  * The daemon is compiled from apps/agor-daemon and bundled during build.
  */
 
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+// Check Node.js version requirement before loading any dependencies
+import { checkNodeVersion } from './version-check.js';
+
+checkNodeVersion();
+
+// Use dynamic imports to ensure version check runs first
+const path = await import('node:path');
+const { fileURLToPath } = await import('node:url');
 
 // Get directory of this file
 const dirname = path.dirname(fileURLToPath(import.meta.url));
