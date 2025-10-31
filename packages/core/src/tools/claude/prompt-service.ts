@@ -44,6 +44,9 @@ export class ClaudePromptService {
   /** Enable token-level streaming from Claude Agent SDK */
   private static readonly ENABLE_TOKEN_STREAMING = true;
 
+  /** Idle timeout for SDK event loop - throws error if no messages received for this duration */
+  private static readonly IDLE_TIMEOUT_MS = 300000; // 5 minutes
+
   /** Store active Query objects per session for interruption */
   // biome-ignore lint/suspicious/noExplicitAny: Query type from SDK is complex
   private activeQueries = new Map<SessionID, any>();
@@ -169,7 +172,7 @@ export class ClaudePromptService {
       sessionId,
       existingSdkSessionId,
       enableTokenStreaming: ClaudePromptService.ENABLE_TOKEN_STREAMING,
-      idleTimeoutMs: 120000, // 2 minutes - allows time for long operations (web search, file reads, etc.)
+      idleTimeoutMs: ClaudePromptService.IDLE_TIMEOUT_MS,
     });
 
     try {
@@ -183,16 +186,16 @@ export class ClaudePromptService {
           break;
         }
 
-        // Check for timeout
+        // Check for timeout - throw error to trigger proper cleanup
         if (processor.hasTimedOut()) {
           const state = processor.getState();
-          console.warn(
-            `⏱️  No assistant messages for ${Math.round((Date.now() - state.lastAssistantMessageTime) / 1000)}s - assuming conversation complete`
+          const idleSeconds = Math.round((Date.now() - state.lastActivityTime) / 1000);
+          const timeoutSeconds = Math.round(state.idleTimeoutMs / 1000);
+
+          throw new Error(
+            `Claude SDK idle timeout: No activity for ${idleSeconds}s (timeout: ${timeoutSeconds}s). ` +
+              `SDK may have hung or crashed. Last message type was #${state.messageCount}.`
           );
-          console.warn(
-            `   SDK may not have sent 'result' message - breaking loop as safety measure`
-          );
-          break;
         }
 
         // Process message through processor
@@ -302,7 +305,7 @@ export class ClaudePromptService {
       sessionId,
       existingSdkSessionId,
       enableTokenStreaming: false, // Non-streaming mode
-      idleTimeoutMs: 120000, // 2 minutes - allows time for long operations
+      idleTimeoutMs: ClaudePromptService.IDLE_TIMEOUT_MS,
     });
 
     // Collect response messages from async generator
