@@ -188,7 +188,14 @@ const WorktreeCard = ({
               overflowWrap: 'break-word',
             }}
           >
-            {session.title || session.description || session.agentic_tool}
+            {(() => {
+              const displayText = session.title || session.description || session.agentic_tool;
+              // Truncate description (first prompt) to 60 chars for compact tree view
+              if (!session.title && session.description && session.description.length > 60) {
+                return session.description.substring(0, 60) + '...';
+              }
+              return displayText;
+            })()}
           </Typography.Text>
         </Space>
 
