@@ -48,10 +48,19 @@ function getGitBinary(): string | undefined {
 function createGit(baseDir?: string) {
   const gitBinary = getGitBinary();
 
+  // NOTE: Git environment variables (GIT_TERMINAL_PROMPT, GIT_ASKPASS) are set
+  // globally at daemon startup in apps/agor-daemon/src/index.ts
+  // This prevents interactive credential prompts and makes git fail fast
+
   // Always disable strict host key checking for SSH operations
   // This prevents interactive prompts for unknown hosts in automated environments
+  //
+  // Also disable credential prompts to fail fast if auth is required but not available
+  // This prevents git operations from hanging indefinitely waiting for user input
   const config = [
     'core.sshCommand=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null',
+    'core.askpass=', // Disable askpass helper (prevents GUI password prompts)
+    'credential.helper=', // Disable credential helper (prevents interactive prompts)
   ];
 
   return simpleGit({
