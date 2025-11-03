@@ -96,7 +96,7 @@ export default class DaemonStart extends Command {
 
         // Wait for child to exit
         await new Promise<void>((resolve, reject) => {
-          child.on('exit', (code) => {
+          child.on('exit', code => {
             if (code === 0) {
               resolve();
             } else {
@@ -119,13 +119,22 @@ export default class DaemonStart extends Command {
         this.log(`  ${chalk.cyan('agor daemon logs')}`);
         this.log('');
 
-        // Wait a moment and check if it's actually running
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        const nowRunning = await isDaemonRunning(daemonUrl);
+        // Wait for daemon to fully boot (including migrations if fresh install)
+        // Try multiple times with exponential backoff
+        let isRunning = false;
+        const maxAttempts = 5;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          const waitTime = 1000 * (attempt + 1); // 1s, 2s, 3s, 4s, 5s
+          await new Promise(resolve => setTimeout(resolve, waitTime));
 
-        if (!nowRunning) {
+          isRunning = await isDaemonRunning(daemonUrl);
+          if (isRunning) break;
+        }
+
+        if (!isRunning) {
           this.log(chalk.yellow('⚠ Daemon started but not responding'));
           this.log('');
+          this.log('This may be normal if migrations are running on first startup.');
           this.log('Check logs for errors:');
           this.log(`  ${chalk.cyan('agor daemon logs')}`);
           this.log('');

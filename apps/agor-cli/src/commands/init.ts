@@ -298,7 +298,6 @@ export default class Init extends Command {
     // Prompt for auth/multiplayer setup (unless --force)
     if (!skipPrompts) {
       await this.promptAuthSetup(dbPath);
-      await this.promptApiKeys();
     } else {
       // With --force, enable auth by default (multiplayer mode) with default admin user
       await setConfigValue('daemon.requireAuth', true);
@@ -383,16 +382,13 @@ export default class Init extends Command {
       }
     } else {
       if (isDevMode) {
-        this.log('   - Start the daemon: cd apps/agor-daemon && pnpm dev');
+        this.log('   1. Start the daemon: cd apps/agor-daemon && pnpm dev');
+        this.log('   2. In another terminal, start the UI: cd apps/agor-ui && pnpm dev');
+        this.log('   3. Open the UI: http://localhost:5173');
       } else {
-        this.log('   - Start the daemon: agor daemon start');
+        this.log('   1. Start the daemon: agor daemon start');
+        this.log('   2. Open the UI: agor open');
       }
-    }
-    this.log('');
-    if (isDevMode) {
-      this.log('   - View sessions: pnpm agor session list');
-    } else {
-      this.log('   - View sessions: agor session list');
     }
     this.log('');
   }
