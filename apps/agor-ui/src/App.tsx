@@ -480,6 +480,10 @@ function AppContent() {
     sessionId: string,
     updates: Partial<import('@agor/core/types').Session>
   ) => {
+    console.debug(
+      `📝 handleUpdateSession called for ${sessionId.substring(0, 8)} with updates:`,
+      Object.keys(updates)
+    );
     const session = await updateSession(sessionId as import('@agor/core/types').SessionID, updates);
     if (session) {
       message.success('Session updated successfully!');
@@ -782,7 +786,8 @@ function AppContent() {
         await client.service(`sessions/${sessionId}/mcp-servers`).remove(serverId);
       }
 
-      message.success('MCP servers updated successfully!');
+      // Note: Don't show success message here - it's part of the session settings save
+      // The main "Session updated" message will appear from handleUpdateSession
     } catch (error) {
       message.error(
         `Failed to update MCP servers: ${error instanceof Error ? error.message : String(error)}`

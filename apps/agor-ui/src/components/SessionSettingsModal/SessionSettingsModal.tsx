@@ -4,7 +4,6 @@ import { Collapse, Form, Modal, Typography } from 'antd';
 import React from 'react';
 import { AdvancedSettingsForm } from '../AdvancedSettingsForm';
 import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
-import type { ModelConfig } from '../ModelSelector';
 import { SessionMetadataForm } from '../SessionMetadataForm';
 
 export interface SessionSettingsModalProps {
@@ -15,7 +14,6 @@ export interface SessionSettingsModalProps {
   sessionMcpServerIds: string[];
   onUpdate?: (sessionId: string, updates: Partial<Session>) => void;
   onUpdateSessionMcpServers?: (sessionId: string, mcpServerIds: string[]) => void;
-  onUpdateModelConfig?: (sessionId: string, modelConfig: ModelConfig) => void;
 }
 
 /**
@@ -35,7 +33,6 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
   sessionMcpServerIds,
   onUpdate,
   onUpdateSessionMcpServers,
-  onUpdateModelConfig,
 }) => {
   const [form] = Form.useForm();
 
@@ -126,16 +123,19 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
 
       // Apply session updates if any
       if (Object.keys(updates).length > 0 && onUpdate) {
+        console.debug(
+          `💾 SessionSettingsModal.handleOk: calling onUpdate with`,
+          Object.keys(updates)
+        );
         onUpdate(session.session_id, updates);
       }
 
-      // Backward compatibility: also call onUpdateModelConfig if provided
-      if (values.modelConfig && onUpdateModelConfig) {
-        onUpdateModelConfig(session.session_id, values.modelConfig);
-      }
+      // Note: model_config is already included in updates above, so no need for separate onUpdateModelConfig call
+      // (it would cause duplicate session updates)
 
       // Update MCP server attachments
       if (onUpdateSessionMcpServers) {
+        console.debug(`🔧 SessionSettingsModal.handleOk: calling onUpdateSessionMcpServers`);
         onUpdateSessionMcpServers(session.session_id, values.mcpServerIds || []);
       }
 

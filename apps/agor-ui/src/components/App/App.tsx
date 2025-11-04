@@ -316,15 +316,6 @@ export const App: React.FC<AppProps> = ({
     [client, user?.user_id]
   );
 
-  const handleUpdateModelConfig = (sessionId: string, modelConfig: ModelConfig) => {
-    onUpdateSession?.(sessionId, {
-      model_config: {
-        ...modelConfig,
-        updated_at: new Date().toISOString(),
-      },
-    });
-  };
-
   const selectedSession = sessions.find(s => s.session_id === selectedSessionId) || null;
   const selectedSessionWorktree = selectedSession
     ? worktrees.find(w => w.worktree_id === selectedSession.worktree_id)
@@ -566,7 +557,6 @@ export const App: React.FC<AppProps> = ({
           }
           onUpdate={onUpdateSession}
           onUpdateSessionMcpServers={onUpdateSessionMcpServers}
-          onUpdateModelConfig={handleUpdateModelConfig}
         />
       )}
       <WorktreeModal
