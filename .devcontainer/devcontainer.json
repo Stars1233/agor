@@ -6,6 +6,13 @@
     "context": "..",
     "cacheFrom": ["ghcr.io/mistercrunch/agor-playground:latest"]
   },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": true,
+      "dockerDashComposeVersion": "v2"
+    }
+  },
   "containerEnv": {
     "VITE_CODESPACES": "true",
     "CORS_ORIGIN": "*"
