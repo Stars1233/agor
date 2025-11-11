@@ -184,7 +184,7 @@ const SessionDrawer = ({
   const [queuedMessages, setQueuedMessages] = React.useState<Message[]>([]);
 
   // Fetch tasks for this session to calculate token totals
-  const currentUser = users?.find((u) => u.user_id === currentUserId) || null;
+  const currentUser = users?.find(u => u.user_id === currentUserId) || null;
   const { tasks } = useTasks(client, session?.session_id || null, currentUser);
 
   // Fetch queued messages for this session
@@ -624,6 +624,7 @@ const SessionDrawer = ({
           display: 'flex',
           flexDirection: 'column',
           height: '100%',
+          overflow: 'hidden',
         },
       }}
     >
@@ -700,38 +701,29 @@ const SessionDrawer = ({
       <Divider style={{ margin: `${token.sizeUnit * 2}px 0` }} />
 
       {/* Task-Centric Conversation View - Scrollable */}
-      <div
-        style={{
-          flex: 1,
-          minHeight: 0,
-          overflow: 'hidden',
-          display: 'flex',
-          flexDirection: 'column',
-        }}
-      >
-        <ConversationView
-          client={client}
-          sessionId={session.session_id}
-          agentic_tool={session.agentic_tool}
-          sessionModel={session.model_config?.model}
-          users={users}
-          currentUserId={currentUserId}
-          onScrollRef={setScrollToBottom}
-          onPermissionDecision={onPermissionDecision}
-          scheduledFromWorktree={session.scheduled_from_worktree}
-          scheduledRunAt={session.scheduled_run_at}
-        />
-      </div>
+      <ConversationView
+        client={client}
+        sessionId={session.session_id}
+        agentic_tool={session.agentic_tool}
+        sessionModel={session.model_config?.model}
+        users={users}
+        currentUserId={currentUserId}
+        onScrollRef={setScrollToBottom}
+        onPermissionDecision={onPermissionDecision}
+        scheduledFromWorktree={session.scheduled_from_worktree}
+        scheduledRunAt={session.scheduled_run_at}
+      />
 
       {/* Queued Messages Drawer - Above Footer */}
       {queuedMessages.length > 0 && (
         <div
           style={{
+            flexShrink: 0,
             background: token.colorBgElevated,
             borderTop: `1px solid ${token.colorBorderSecondary}`,
             borderTopLeftRadius: token.borderRadiusLG,
             borderTopRightRadius: token.borderRadiusLG,
-            padding: `${token.sizeUnit * 3}px ${token.sizeUnit * 6}px ${token.sizeUnit * 2}px`,
+            padding: `${token.sizeUnit * 3}px ${token.sizeUnit * 6}px`,
             marginLeft: -token.sizeUnit * 6 + token.sizeUnit * 2,
             marginRight: -token.sizeUnit * 6 + token.sizeUnit * 2,
             marginTop: token.sizeUnit * 2,
@@ -823,17 +815,34 @@ const SessionDrawer = ({
       {/* Input Box Footer */}
       <div
         style={{
-          position: 'sticky',
-          bottom: 0,
-          background: footerGradient || token.colorBgContainer,
+          flexShrink: 0,
+          background: token.colorBgContainer,
           borderTop: `1px solid ${token.colorBorder}`,
-          padding: `${token.sizeUnit * 2}px ${token.sizeUnit * 6}px`,
+          padding: `${token.sizeUnit * 2}px ${token.sizeUnit * 6}px ${token.sizeUnit * 3}px`,
           marginLeft: -token.sizeUnit * 6,
           marginRight: -token.sizeUnit * 6,
-          marginBottom: -token.sizeUnit * 6,
         }}
       >
-        <Space direction="vertical" style={{ width: '100%' }} size={8}>
+        {/* Context window gradient overlay */}
+        {footerGradient && (
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              background: footerGradient,
+              pointerEvents: 'none',
+              zIndex: 0,
+            }}
+          />
+        )}
+        <Space
+          direction="vertical"
+          style={{ width: '100%', position: 'relative', zIndex: 1 }}
+          size={8}
+        >
           <AutocompleteTextarea
             value={inputValue}
             onChange={setInputValue}
