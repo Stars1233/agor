@@ -18,7 +18,12 @@ import { mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { generateId } from '@agor/core';
-import { getBaseUrl, loadConfig, PAGINATION, resolveUserEnvironment } from '@agor/core/config';
+import {
+  getDaemonBaseUrl,
+  loadConfig,
+  PAGINATION,
+  resolveUserEnvironment,
+} from '@agor/core/config';
 import {
   ArtifactRepository,
   ArtifactTrustGrantRepository,
@@ -1285,7 +1290,7 @@ export class ArtifactsService extends DrizzleService<Artifact, Partial<Artifact>
     const { grants, artifact, userId } = input;
 
     if (grants.agor_api_url) {
-      out[GRANT_ENV_VAR_NAMES.agor_api_url] = await getBaseUrl();
+      out[GRANT_ENV_VAR_NAMES.agor_api_url] = await getDaemonBaseUrl();
     }
     if (grants.agor_user_email && userId) {
       try {

@@ -17,6 +17,7 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { generateId } from '@agor/core';
+import { getDaemonBaseUrl } from '@agor/core/config';
 import {
   ArtifactRepository,
   artifacts,
@@ -35,6 +36,14 @@ import type { Artifact, BoardID, BranchID, SessionID, UUID } from '@agor/core/ty
 import { afterEach, beforeEach, describe, expect, vi } from 'vitest';
 import { dbTest } from '../../../../packages/core/src/db/test-helpers';
 import { ArtifactsService } from './artifacts';
+
+vi.mock('@agor/core/config', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agor/core/config')>();
+  return {
+    ...actual,
+    getDaemonBaseUrl: vi.fn(async () => 'http://localhost:3030'),
+  };
+});
 
 /**
  * Build a fake Feathers app whose services all no-op on emit. The service
@@ -798,6 +807,28 @@ describe('ArtifactsService.getPayload trust + .env synthesis', () => {
     // .env is synthesized even though the user has no env var stored — value is empty.
     // `react` template is CRA-backed, so the prefix is `REACT_APP_`.
     expect(payload.files['/.env']).toMatch(/REACT_APP_OPENAI_KEY=/);
+  });
+
+  dbTest('injects the daemon origin for the artifact API grant', async ({ db }) => {
+    vi.mocked(getDaemonBaseUrl).mockResolvedValueOnce('http://[::1]:3030');
+    const service = new ArtifactsService(db, makeFakeApp());
+    const board = await seedBoard(db);
+    const artifactRepo = new ArtifactRepository(db);
+    const created = await artifactRepo.create({
+      artifact_id: generateId(),
+      board_id: board.board_id,
+      name: 'daemon-api-grant',
+      template: 'react',
+      files: { '/index.js': 'console.log("daemon")', '/package.json': '{}' },
+      agor_grants: { agor_api_url: true },
+      public: true,
+      created_by: 'user-owner',
+    });
+
+    const payload = await service.getPayload(created.artifact_id, 'user-owner' as never);
+
+    expect(payload.files['/.env']).toContain('REACT_APP_AGOR_API_URL="http://[::1]:3030"');
+    expect(getDaemonBaseUrl).toHaveBeenCalledOnce();
   });
 
   dbTest(
