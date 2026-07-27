@@ -991,7 +991,6 @@ export class TerminalsService {
       const daemonUrl = `http://localhost:${config.daemon?.port || 3030}`;
       const sessionToken = generateScopedServiceToken(
         this.app,
-        params,
         { terminal_user_id: userId },
         TERMINAL_EXECUTOR_TOKEN_TTL
       );
