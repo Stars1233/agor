@@ -1175,13 +1175,14 @@ async function resolveGatewaySlackToolTarget(
  * daemon-owned file. Branch-relative files are handled by the executor.
  */
 async function resolveGatewayUploadFilePath(
-  rawPath: string
+  rawPath: string,
+  tenantId?: string
 ): Promise<{ absolutePath: string; sourceName: string }> {
   const trimmed = rawPath.trim();
   if (!trimmed) throw new Error('path is required');
 
   if (path.isAbsolute(trimmed)) {
-    const uploadDir = getUploadDirectory(ctx.baseServiceParams.tenant?.tenant_id);
+    const uploadDir = getUploadDirectory(tenantId);
     const uploadRoot = await realpath(uploadDir).catch(() => path.resolve(uploadDir));
     const canonical = await canonicalizeExistingPrefix(trimmed);
     if (!isPathInsideRoot(uploadRoot, canonical)) {
@@ -1685,7 +1686,10 @@ export function registerGatewayChannelTools(server: McpServer, ctx: McpContext):
         });
       }
 
-      const { absolutePath, sourceName } = await resolveGatewayUploadFilePath(args.path);
+      const { absolutePath, sourceName } = await resolveGatewayUploadFilePath(
+        args.path,
+        ctx.baseServiceParams.tenant?.tenant_id
+      );
       const stats = await stat(absolutePath);
       if (!stats.isFile()) {
         throw new Error(`Not a file: ${args.path}`);
