@@ -17,8 +17,6 @@ import type {
   CardType,
   CardWithType,
   CloneRepositoryResult,
-  ContextFileDetail,
-  ContextFileListItem,
   CreateAgenticToolPreset,
   CreateSessionInput,
   Group,
@@ -202,7 +200,6 @@ export interface ServiceTypes {
   'card-types': CardType; // CardType CRUD
   artifacts: Artifact;
   'mcp-servers': MCPServer;
-  context: ContextFileListItem | ContextFileDetail; // GET /context returns list, GET /context/:path returns detail
   'kb/namespaces': KnowledgeNamespace;
   'kb/documents': KnowledgeDocument;
   'kb/versions': KnowledgeDocumentVersion;
@@ -645,7 +642,6 @@ export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
   service(path: 'card-types'): AgorService<CardType>;
   service(path: 'users'): UsersService;
   service(path: 'mcp-servers'): AgorService<MCPServer>;
-  service(path: 'context'): AgorService<ContextFileListItem | ContextFileDetail>;
   service(path: 'templates'): TemplatesService;
 
   // Generic fallback for custom routes and dynamic paths
