@@ -388,6 +388,9 @@ export const GitBranchRemovePayloadSchema = BasePayloadSchema.extend({
     /** Path to the branch to remove */
     branchPath: z.string(),
 
+    /** Tenant-aware root that must contain branchPath */
+    branchesRoot: z.string(),
+
     /** Force removal even if dirty */
     force: z.boolean().optional(),
 
@@ -662,8 +665,12 @@ export const GitRepoDeletePayloadSchema = BasePayloadSchema.extend({
   sessionToken: z.string(),
 
   params: z.object({
-    /** Repo being deleted; executor fetches/derives managed paths itself */
+    /** Repo being deleted; executor fetches the concrete managed paths itself. */
     repoId: z.string().uuid(),
+    /** Tenant-scoped root that is allowed to contain the managed repository. */
+    reposRoot: z.string().min(1),
+    /** Tenant-scoped root that is allowed to contain managed branches. */
+    branchesRoot: z.string().min(1),
   }),
 });
 
