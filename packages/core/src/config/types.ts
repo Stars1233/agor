@@ -979,6 +979,22 @@ export interface AgorMultiTenancySettings {
   trusted_header?: string;
 }
 
+/** Canonical upload storage and lifecycle settings. */
+export interface AgorUploadSettings {
+  /**
+   * Base local directory or S3 URI. Defaults to `~/.agor`.
+   * Agor manages the tenant and feature namespaces below this base.
+   * Credentials are resolved out-of-band and must not be embedded in this URI.
+   */
+  location?: string;
+
+  /** Maximum age from creation in days. Zero disables automatic expiry. */
+  max_age_days?: number;
+
+  /** Maximum bytes accepted for one file, expressed in MiB. */
+  max_file_size_mb?: number;
+}
+
 /**
  * Complete Agor configuration
  */
@@ -1015,6 +1031,9 @@ export interface AgorConfig {
 
   /** App-level multi-tenancy settings. Defaults to static/default tenant. */
   multi_tenancy?: AgorMultiTenancySettings;
+
+  /** Upload storage and lifecycle policy. */
+  uploads?: AgorUploadSettings;
 }
 
 /**
@@ -1031,4 +1050,5 @@ export type ConfigKey =
   | `paths.${keyof AgorPathSettings}`
   | `analytics.${keyof AgorAnalyticsSettings}`
   | `telemetry.${keyof AgorTelemetrySettings}`
-  | `multi_tenancy.${keyof AgorMultiTenancySettings}`;
+  | `multi_tenancy.${keyof AgorMultiTenancySettings}`
+  | `uploads.${keyof AgorUploadSettings}`;
