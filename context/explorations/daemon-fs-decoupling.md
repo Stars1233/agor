@@ -506,3 +506,11 @@ Same as §1.1, presented in the table format the prompt requested:
 ---
 
 _End of analysis._
+
+## 2026-08-03 closure update
+
+The production daemon no longer reaches filesystem/config loading through `@agor/git/pure`, the root `@agor/core` barrel, the shared config barrel's Node-only `.agor.yml` reader/writer, or the obsolete core environment-command spawner. Local executor subprocesses now always start in the operator-owned executor package directory; branch cwd exists only in the executor payload. Short-lived local commands expose no caller-supplied cwd seam.
+
+After rebasing across #2102, #2121, and #2122, registry count moved from 133 (A 73 / B 27 / C 33 / D 0) to 93 (A 66 / B 27 / C 0 / D 0). Because #2102 has landed, this branch also removes the unused `canonicalizeExistingPrefix` helper and `DAEMON-FS-CAP-082/083`. The Git operational capabilities 024–053 became stale once broad daemon reachability was closed and are removed rather than reclassified.
+
+Residual semantic coupling not proven by the checker: the daemon still computes tenant layout/path strings and reads branch/repo paths from tenant-owned rows for authorization and executor payload construction. Executors, not daemon subprocess launch cwd, resolve and use those paths. Any future in-daemon consumer of those strings would reopen the boundary even if it used an API absent from the checker's finite manifest.

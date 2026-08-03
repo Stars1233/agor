@@ -36,3 +36,9 @@ CODEOWNERS review for the checker, registry, and daemon-host adapters is a usefu
 - Workspace traversal uses checked-in package `source` exports and relative modules; it does not inspect external `node_modules` implementations.
 - Call identity uses the nearest named function/method plus an occurrence number. Refactors can require registry updates even when authority is unchanged.
 - The checker verifies declared syntactic capabilities, not path provenance, tenant scoping, authorization, cleanup correctness, TOCTOU safety, or command argument safety. Those require runtime design and negative tests at the owning boundary.
+
+## Closure status (2026-08-03)
+
+After rebasing across PRs #2102, #2121, and #2122, the daemon-reachable registry contains **93** exact capabilities (**66 A, 27 B, 0 C, 0 D**), down from the rebased baseline of **133** (**73 A, 27 B, 33 C, 0 D**). This closure removes incidental reachability of `.agor.yml` Node I/O, Git operational/layout I/O, a dead validation helper, the obsolete environment-command spawner, tenant-cwd checks in executor launching, and the now-unused path-capable branch canonicalization left behind after #2102.
+
+The checker still cannot see semantic path authority. In particular, daemon services resolve tenant layout strings and carry branch/repo cwd values from tenant-owned database records into typed executor payloads. That is intentional routing data, not daemon I/O: local executor processes launch from the executor package directory, and only executor commands consume workspace cwd. Review payload schemas and executor command handlers when changing this contract, because a string passed into an unmanifested dependency or remote launcher can become filesystem authority without a syntactic daemon capability.
