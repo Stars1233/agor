@@ -124,6 +124,32 @@ function emitTerminalReady(socket: AgorClient['io'], userId: string): void {
   });
 }
 
+// On attach/reconnect zellij leaves the UI (frame, status bar, panes) undrawn
+// until a SIGWINCH or keypress arrives — a same-size resize signals nothing, so
+// briefly change the row count and restore it to force a full repaint. Nudge up
+// when rows is at the lower bound (1 → 2 → 1) so the size always actually changes.
+export function forceZellijRepaint(
+  pty: Pick<IPty, 'resize'> | null,
+  cols: number,
+  rows: number,
+  scheduleRestore: (fn: () => void) => void = (fn) => setTimeout(fn, 50)
+): void {
+  if (!pty) return;
+  const nudged = rows > 1 ? rows - 1 : rows + 1;
+  try {
+    pty.resize(cols, nudged);
+  } catch {
+    return;
+  }
+  scheduleRestore(() => {
+    try {
+      pty.resize(cols, rows);
+    } catch {
+      // pty already gone — nothing to repaint
+    }
+  });
+}
+
 /** Longest a buffered chunk may wait before it is emitted. */
 const OUTPUT_FLUSH_INTERVAL_MS = 16;
 /** Flush early once the buffer reaches this size, regardless of the timer. */
@@ -437,11 +463,8 @@ export async function handleZellijAttach(
     });
 
     // Listen for redraw requests (when client reconnects)
-    // Trigger resize to force Zellij to redraw via SIGWINCH
     socket.on('terminal:redraw', (data: { userId: string }) => {
-      if (data.userId === userId && ptyProcess) {
-        ptyProcess.resize(currentPtyCols, currentPtyRows);
-      }
+      if (data.userId === userId) forceZellijRepaint(ptyProcess, currentPtyCols, currentPtyRows);
     });
 
     // Confirm zellij's attach is actually operational before announcing
@@ -470,6 +493,10 @@ export async function handleZellijAttach(
       }
       zellijAttached = true;
       emitTerminalReady(socket, userId);
+
+      // Reattaching to an existing session does not repaint on its own; nudge a
+      // resize so the frame and pane content draw without the user hitting Enter.
+      forceZellijRepaint(ptyProcess, currentPtyCols, currentPtyRows);
 
       // Create the initial tab now that the session is confirmed up. Keep a
       // bounded retry as belt-and-suspenders against a residual boot race:
