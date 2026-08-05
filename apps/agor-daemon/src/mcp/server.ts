@@ -366,12 +366,14 @@ function createMcpServer(ctx: McpContext, toolSearchEnabled: boolean): McpServer
  *
  * @param toolSearchEnabled - When true, tools/list returns only essential tools
  *   and agents discover others via agor_search_tools. Default: true.
+ * @param testOptions - Test-only bounds for focused transport lifecycle coverage.
  */
 export function setupMCPRoutes(
   app: Application,
   db: TenantScopeAwareDatabase,
   toolSearchEnabled = true,
-  config: Pick<AgorConfig, 'multi_tenancy'> = { multi_tenancy: undefined }
+  config: Pick<AgorConfig, 'multi_tenancy'> = { multi_tenancy: undefined },
+  testOptions: { statefulTransportMax?: number } = {}
 ): void {
   // Eagerly build the registry at startup so first request isn't slower
   if (toolSearchEnabled) {
@@ -400,7 +402,7 @@ export function setupMCPRoutes(
   // external orchestrators can hold an SSE session, but abandoned clients must
   // not grow this map forever if they never send DELETE /mcp.
   const STATEFUL_TRANSPORT_TTL_MS = 30 * 60 * 1000;
-  const STATEFUL_TRANSPORT_MAX = 100;
+  const STATEFUL_TRANSPORT_MAX = testOptions.statefulTransportMax ?? 100;
   const statefulTransports = new Map<string, StatefulTransportEntry>();
 
   const closeStatefulTransport = (mcpSessionId: string): void => {
@@ -417,7 +419,7 @@ export function setupMCPRoutes(
     clearTimeout(entry.ttlTimer);
     entry.lastUsedAt = Date.now();
     entry.ttlTimer = setTimeout(() => {
-      console.warn(`⚠️  MCP streamable HTTP session expired: ${mcpSessionId}`);
+      console.debug(`MCP streamable HTTP session expired: ${mcpSessionId}`);
       closeStatefulTransport(mcpSessionId);
     }, STATEFUL_TRANSPORT_TTL_MS);
     entry.ttlTimer.unref?.();
