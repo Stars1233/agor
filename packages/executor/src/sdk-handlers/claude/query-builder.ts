@@ -19,7 +19,7 @@ const { query } = Claude;
 type PermissionMode = Claude.PermissionMode;
 type Options = Claude.Options;
 
-import { getDaemonUrl, resolveUserEnvironment } from '../../config.js';
+import { getDaemonUrl } from '../../config.js';
 import type {
   BranchRepository,
   MCPOAuthAuthHeadersRepository,
@@ -38,30 +38,6 @@ import { getMcpServersForSession } from '../base/mcp-scoping.js';
 import { CLAUDE_CODE_DISALLOWED_TOOLS } from './constants.js';
 import { DEFAULT_CLAUDE_MODEL } from './models.js';
 import { createCanUseToolCallback } from './permissions/permission-hooks.js';
-
-function summarizeMcpConfigCounts(config: unknown): string {
-  if (!config || typeof config !== 'object') return 'none';
-
-  let total = 0;
-  let remote = 0;
-  let stdio = 0;
-  let withEnv = 0;
-
-  for (const server of Object.values(config as MCPServersConfig)) {
-    total += 1;
-    const type = server.type || 'stdio';
-    if (type === 'stdio') {
-      stdio += 1;
-    } else {
-      remote += 1;
-    }
-    if (server.env && Object.keys(server.env).length > 0) {
-      withEnv += 1;
-    }
-  }
-
-  return `total=${total} remote=${remote} stdio=${stdio} with_env=${withEnv}`;
-}
 
 export function formatListForLog(items: string[], maxItems = 5): string {
   if (items.length <= maxItems) {
@@ -104,16 +80,8 @@ function getClaudeCodePath(): string {
 /**
  * Log prompt start with context
  */
-function logPromptStart(
-  sessionId: SessionID,
-  _prompt: string,
-  _cwd: string,
-  agentSessionId?: string
-) {
+function logPromptStart(sessionId: SessionID) {
   console.log(`🤖 Prompting Claude for session ${shortId(sessionId)}...`);
-  if (agentSessionId) {
-    console.log(`   Resuming session: ${agentSessionId}`);
-  }
 }
 
 export interface QuerySetupDeps {
@@ -187,7 +155,6 @@ export async function setupQuery(
     taskId,
     tasksService: deps.tasksService,
   });
-  console.log(`[Query Builder] Resolved contextUserId: ${contextUserId || 'NOT SET'}`);
 
   // Determine model to use (session config or default)
   // `[1m]` is a first-class Claude Code model-selection suffix. Keep it on
@@ -204,7 +171,6 @@ export async function setupQuery(
       const branch = await deps.branchesRepo.findById(session.branch_id);
       if (branch) {
         cwd = branch.path;
-        console.log(`✅ Using branch path as cwd: ${cwd}`);
       } else {
         console.warn(
           `⚠️  Session ${sessionId} references non-existent branch ${session.branch_id}, using process.cwd(): ${cwd}`
@@ -218,7 +184,7 @@ export async function setupQuery(
     console.warn(`⚠️  Session ${sessionId} has no branch_id, using process.cwd(): ${cwd}`);
   }
 
-  logPromptStart(sessionId, prompt, cwd, resume ? session.sdk_session_id : undefined);
+  logPromptStart(sessionId);
 
   // Validate CWD exists before calling SDK
   try {
@@ -230,9 +196,6 @@ export async function setupQuery(
       const hasGit = files.includes('.git');
       const hasClaude = files.includes('.claude');
       const hasCLAUDEmd = files.includes('CLAUDE.md');
-      console.log(
-        `✅ Working directory validated: ${cwd} (${fileCount} files/dirs${hasGit ? ', has .git' : ', NO .git!'}${hasClaude ? ', has .claude/' : ''}${hasCLAUDEmd ? ', has CLAUDE.md' : ''})`
-      );
       if (fileCount === 0) {
         console.warn(`⚠️  Working directory is EMPTY - branch may be from bare repo!`);
       } else if (!hasGit) {
@@ -281,15 +244,9 @@ export async function setupQuery(
     additionalDirectories: ['/tmp', '/var/tmp'],
     // Enable token-level streaming (yields partial messages as tokens arrive)
     includePartialMessages: true,
-    // Enable debug logging to see what's happening
-    debug: true,
     // Capture stderr to get actual error messages (not just "exit code 1")
     stderr: (data: string) => {
       stderrBuffer += data;
-      // Log in real-time for debugging
-      if (data.trim()) {
-        console.error(`[Claude stderr] ${data.trim()}`);
-      }
     },
   };
 
@@ -298,7 +255,6 @@ export async function setupQuery(
   // See: https://platform.claude.com/docs/en/agent-sdk/typescript
   if (abortController) {
     queryOptions.abortController = abortController;
-    console.log(`🛑 AbortController attached to query for cancellation support`);
   }
 
   // Add permissionMode if provided, otherwise fall back to session's permission_config
@@ -307,9 +263,6 @@ export async function setupQuery(
   const effectivePermissionMode = permissionMode || session.permission_config?.mode;
   if (effectivePermissionMode) {
     queryOptions.permissionMode = effectivePermissionMode;
-    console.log(
-      `🔐 Permission mode: ${queryOptions.permissionMode}${permissionMode ? ' (from request)' : ' (from session config)'}`
-    );
   }
 
   // Configure effort level — controls reasoning depth via SDK's effort parameter
@@ -317,9 +270,6 @@ export async function setupQuery(
   const effort = session.model_config?.effort;
   if (effort) {
     queryOptions.effort = effort;
-    console.log(`🧠 Effort level: ${effort}`);
-  } else {
-    console.log(`🧠 Effort level: high (default)`);
   }
 
   // Configure Claude Code's server-side advisor tool model when a session-level
@@ -342,7 +292,6 @@ export async function setupQuery(
     const extraArgs = (queryOptions.extraArgs as Record<string, string | null> | undefined) ?? {};
     extraArgs.advisor = rawAdvisorModel;
     queryOptions.extraArgs = extraArgs;
-    console.log(`🧭 Advisor model: ${rawAdvisorModel} (via --advisor)`);
   }
 
   // Add canUseTool callback if permission service is available and taskId provided.
@@ -369,7 +318,6 @@ export async function setupQuery(
       mcpServerRepo: deps.mcpServerRepo,
       sessionMCPRepo: deps.sessionMCPRepo,
     });
-    console.log(`✅ canUseTool callback added (permission mode: ${effectivePermissionMode})`);
   }
 
   // Add optional apiKey if provided
@@ -378,28 +326,6 @@ export async function setupQuery(
   // If deps.apiKey is provided, use it directly (no need to check process.env)
   if (deps.apiKey) {
     queryOptions.apiKey = deps.apiKey;
-  }
-
-  // Resolve user environment variables
-  // In executor mode, environment is inherited from the executor process
-  const userEnv = resolveUserEnvironment();
-  const originalProcessEnv = { ...process.env };
-  let userEnvCount = 0;
-
-  if (contextUserId) {
-    try {
-      // Count how many user env vars we're using (from inherited environment)
-      const systemVarCount = Object.keys(originalProcessEnv).length;
-      const totalVarCount = Object.keys(userEnv.env).length;
-      userEnvCount = totalVarCount - systemVarCount;
-
-      if (userEnvCount > 0) {
-        console.log(`🔐 Using ${userEnvCount} environment vars for user ${shortId(contextUserId)}`);
-      }
-    } catch (err) {
-      console.error(`⚠️  Failed to resolve user environment:`, err);
-      // Continue without user env vars - non-fatal error
-    }
   }
 
   // Handle resume, fork, and spawn cases
@@ -419,8 +345,6 @@ export async function setupQuery(
       if (parentSession?.sdk_session_id) {
         queryOptions.resume = parentSession.sdk_session_id;
         queryOptions.forkSession = true; // SDK will create new session ID from parent's history
-        console.log(`🍴 Forking from parent session: ${shortId(parentSession.sdk_session_id)}`);
-        console.log(`   SDK will return new session ID for this fork`);
       } else {
         console.warn(
           `⚠️  Parent session ${shortId(forkedFromSessionId)} has no sdk_session_id - starting fresh`
@@ -430,10 +354,6 @@ export async function setupQuery(
     // CASE 1b: Spawn on first prompt (has parent_session_id but NOT forked_from_session_id)
     else if (parentSessionId && !forkedFromSessionId && !session.sdk_session_id) {
       // This is a SPAWN - start FRESH, do NOT resume from parent
-      console.log(
-        `🌱 Spawning fresh session (parent: ${shortId(parentSessionId)}) - NOT forking SDK session`
-      );
-      console.log(`   Child will start with clean context (spawns don't inherit parent history)`);
       // Don't set queryOptions.resume - let it start completely fresh
     }
     // CASE 2: Normal resume (session has its own sdk_session_id)
@@ -509,7 +429,6 @@ export async function setupQuery(
           // Don't set queryOptions.resume - start fresh
         } else {
           queryOptions.resume = session.sdk_session_id;
-          console.log(`   Resuming SDK session: ${shortId(session.sdk_session_id)}`);
         }
       }
     }
@@ -525,7 +444,6 @@ export async function setupQuery(
       // Get daemon URL from config
       const daemonUrl = await getDaemonUrl();
 
-      console.log(`🔌 Configuring Agor MCP server at ${daemonUrl}/mcp`);
       const mcpConfig = {
         agor: {
           type: 'http' as const,
@@ -560,20 +478,12 @@ export async function setupQuery(
         // Convert to SDK format
         const mcpConfig: MCPServersConfig = {};
         const allowedTools: string[] = [];
-        let remoteServerCount = 0;
-        let stdioServerCount = 0;
-        let serversWithHeaders = 0;
         const missingAuthServers: string[] = [];
         const unresolvedAuthServers: string[] = [];
 
         for (const { server } of serversWithSource) {
           // Infer transport if missing (backwards compatibility)
           const transport = server.transport || (server.url ? 'sse' : 'stdio');
-          if (transport === 'stdio') {
-            stdioServerCount += 1;
-          } else {
-            remoteServerCount += 1;
-          }
 
           // Build server config (convert 'transport' field to 'type' for Claude Code)
           const serverConfig: Record<string, unknown> = {
@@ -603,7 +513,6 @@ export async function setupQuery(
             const headers = mergeMCPRemoteHeaders({ custom: server.headers, auth: authHeaders });
             if (headers && transport !== 'stdio') {
               serverConfig.headers = headers;
-              serversWithHeaders += 1;
             }
             if (missingRequiredAuth) {
               // Auth-backed remote server but no usable token. Track one concise summary below.
@@ -635,12 +544,6 @@ export async function setupQuery(
           ...(queryOptions.mcpServers || {}),
           ...mcpConfig,
         };
-        // Log one safe summary line. Env/header values may contain secrets after template resolution.
-        console.log(
-          `   🔧 MCP servers configured: total=${serversWithSource.length} remote=${remoteServerCount} ` +
-            `stdio=${stdioServerCount} headers=${serversWithHeaders} missing_auth=${missingAuthServers.length} ` +
-            `auth_errors=${unresolvedAuthServers.length}`
-        );
         if (missingAuthServers.length > 0) {
           console.warn(
             `   ⚠️  ${missingAuthServers.length} MCP server(s) have configured auth but no valid token: ` +
@@ -655,7 +558,6 @@ export async function setupQuery(
         }
         if (allowedTools.length > 0) {
           queryOptions.allowedTools = allowedTools;
-          console.log(`   🔧 MCP tools allowlist: ${allowedTools.length} tool(s)`);
         }
       }
     } catch (error) {
@@ -663,12 +565,6 @@ export async function setupQuery(
       // Continue without MCP servers - non-fatal error
     }
   }
-
-  console.log('📤 Calling query() with:');
-  console.log(`   prompt: "${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}"`);
-  console.log(`   queryOptions keys: ${Object.keys(queryOptions).join(', ')}`);
-  // Log safe MCP counts only. Per-server names/details are intentionally omitted from this per-query log.
-  console.log(`   MCP servers: ${summarizeMcpConfigCounts(queryOptions.mcpServers)}`);
 
   // Wrap the string prompt in an AsyncIterable so the SDK treats this as a
   // streaming-input query.  When a plain string is passed, the SDK sets
@@ -700,11 +596,10 @@ export async function setupQuery(
   try {
     result = query({
       prompt: asUserMessageIterable(prompt),
-      // queryOptions uses Record<string,unknown> to accommodate undocumented fields (debug, apiKey)
-      // that are valid at runtime but not in the public Options type
+      // queryOptions uses Record<string,unknown> to accommodate apiKey, which is valid at
+      // runtime but not in the public Options type.
       options: queryOptions as unknown as Options,
     });
-    console.log(`✅ query() returned AsyncGenerator successfully`);
   } catch (syncError) {
     // This is rare - SDK usually returns AsyncGenerator that throws later
     console.error(`❌ CRITICAL: query() threw synchronous error (very unusual):`, syncError);

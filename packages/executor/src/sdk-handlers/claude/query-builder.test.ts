@@ -24,7 +24,6 @@ vi.mock('@agor/core/tools/mcp/jwt-auth', () => ({
 }));
 vi.mock('../../config.js', () => ({
   getDaemonUrl: vi.fn().mockResolvedValue('http://localhost:3030'),
-  resolveUserEnvironment: vi.fn().mockReturnValue({ env: {} }),
 }));
 vi.mock('../base/mcp-scoping.js', () => ({
   getMcpServersForSession: vi.fn().mockResolvedValue([]),
@@ -90,6 +89,44 @@ describe('setupQuery - Local Settings Support', () => {
     expect(callArgs.options.settingSources).toEqual(
       expect.arrayContaining(['user', 'project', 'local'])
     );
+  });
+
+  it('logs only the generic prompt start and passes resume and prompt data to the SDK', async () => {
+    const prompt = 'sk-ant-SECRET_QUERY_SENTINEL\r\nsecond line\nDATABASE_URL=do-not-log';
+    const deps = createMockDeps();
+    const now = new Date().toISOString();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      branch_id: 'test-branch' as BranchID,
+      mcp_token: 'test-token',
+      sdk_session_id: 'sdk-session-secret',
+      created_at: now,
+      last_updated: now,
+      permission_config: { mode: 'default' },
+      model_config: {
+        mode: 'alias',
+        model: 'claude-sonnet-4-6',
+        updated_at: now,
+        effort: 'high',
+        advisorModel: 'opus',
+      },
+    } as any);
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    try {
+      await setupQuery('test-session' as SessionID, prompt, deps);
+
+      expect(logSpy.mock.calls).toEqual([['🤖 Prompting Claude for session test-session...']]);
+
+      const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+      expect(callArgs.options).not.toHaveProperty('debug');
+      expect(callArgs.options.resume).toBe('sdk-session-secret');
+      const promptIterator = callArgs.prompt[Symbol.asyncIterator]();
+      const firstMessage = await promptIterator.next();
+      expect(firstMessage.value.message.content).toEqual([{ type: 'text', text: prompt }]);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   // Pin the literal disallow list so a stray edit to the constant
