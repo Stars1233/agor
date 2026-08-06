@@ -18,10 +18,15 @@ export interface AgenticToolModelSelectorProps {
   getPopupContainer?: (triggerNode: HTMLElement) => HTMLElement;
 }
 
+export interface AgenticToolReadiness {
+  tone: 'positive' | 'neutral' | 'info';
+  label: string;
+}
+
 export interface AgenticToolReadinessProps {
   client?: AgorClient | null;
   canLoadReadiness?: boolean;
-  children: (status: { tone: 'positive' | 'neutral' | 'info'; label: string }) => ReactNode;
+  children: (status: AgenticToolReadiness) => ReactNode;
 }
 
 export interface AgenticToolUIIntegration {
@@ -37,7 +42,10 @@ export interface AgenticToolUIIntegration {
   };
   modelLabel?: string;
   ModelSelector?: ComponentType<AgenticToolModelSelectorProps>;
-  ProviderSettings?: ComponentType<{ client: AgorClient }>;
+  ProviderSettings?: ComponentType<{
+    client: AgorClient;
+    copyText: (text: string) => Promise<boolean>;
+  }>;
   Readiness?: ComponentType<AgenticToolReadinessProps>;
   permissionModes?: readonly {
     mode: PermissionMode;

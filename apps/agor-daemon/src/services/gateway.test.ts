@@ -1,3 +1,4 @@
+import { materializeAgenticToolConfiguration } from '@agor/agentic-tools/config';
 import { getBaseUrl } from '@agor/core/config';
 import type { TenantScopeAwareDatabase } from '@agor/core/db';
 import {
@@ -15,6 +16,18 @@ import { SessionStatus } from '@agor/core/types';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ingestInboundAttachments } from '../utils/gateway-attachments.js';
 import { GatewayService, tenantIdFromGatewayChannel } from './gateway.js';
+
+vi.mock('@agor/agentic-tools/config', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agor/agentic-tools/config')>();
+  return {
+    ...actual,
+    materializeAgenticToolConfiguration: vi.fn(async () => ({
+      agentic_tool_preset_id: null,
+      permission_config: { mode: 'default' },
+      model_config: null,
+    })),
+  };
+});
 
 vi.mock('@agor/core/gateway', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@agor/core/gateway')>();
@@ -94,8 +107,10 @@ function makeGatewayHarness(args: {
   existingMapping?: ThreadSessionMap | null;
   connector?: Record<string, unknown>;
   db?: TenantScopeAwareDatabase;
+  user?: User;
 }) {
   const channel = args.channel ?? slackChannel;
+  const executionUser = args.user ?? user;
   let mapping = args.existingMapping ?? null;
   const promptCreate = vi.fn(async () => ({
     task_id: 'task-1',
@@ -107,11 +122,12 @@ function makeGatewayHarness(args: {
     branch_id: channel.target_branch_id,
     status: SessionStatus.IDLE,
   }));
+  const setMCPServers = vi.fn(async () => undefined);
   const app = {
     service: (name: string) => {
-      if (name === 'users') return { get: vi.fn(async () => user) };
+      if (name === 'users') return { get: vi.fn(async () => executionUser) };
       if (name === 'sessions') {
-        return { create: sessionsCreate, setMCPServers: vi.fn(async () => undefined) };
+        return { create: sessionsCreate, setMCPServers };
       }
       if (name === '/sessions/:id/prompt') return { create: promptCreate };
       throw new Error(`Unexpected service: ${name}`);
@@ -178,12 +194,14 @@ function makeGatewayHarness(args: {
     createUnscoped: create,
     promptCreate,
     sessionsCreate,
+    setMCPServers,
     channelRepo,
     threadMapRepo,
   };
 }
 
 afterEach(() => {
+  vi.mocked(materializeAgenticToolConfiguration).mockClear();
   vi.mocked(getBaseUrl).mockReset();
   vi.mocked(getBaseUrl).mockResolvedValue('https://agor.example.com');
   vi.mocked(getConnector).mockReset();
@@ -265,6 +283,12 @@ describe('GatewayService multi-tenant process state', () => {
 
     await runWithTenantContext('tenant-a', () => service.refreshChannelState());
     await runWithTenantContext('tenant-b', () => service.refreshChannelState());
+
+    const crossTenant = await runWithTenantContext('tenant-b', () =>
+      service.routeMessage({ session_id: 'sess-1', message: 'wrong tenant' })
+    );
+    expect(crossTenant).toEqual({ routed: false });
+    expect(sendMessage).not.toHaveBeenCalled();
 
     const result = await runWithTenantContext('tenant-a', () =>
       service.routeMessage({ session_id: 'sess-1', message: 'hello tenant A' })
@@ -694,6 +718,75 @@ describe('GatewayService Slack thread catch-up', () => {
     expect(promptCreate).not.toHaveBeenCalled();
     expect(sessionsCreate).not.toHaveBeenCalled();
     expect(threadMapRepo.updateLastMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('GatewayService MCP resolution', () => {
+  const userDefaultMcpId = '00000000-0000-7000-8000-000000000101';
+  const channelMcpId = '00000000-0000-7000-8000-000000000102';
+
+  it.each([
+    {
+      name: 'Claude inherits the execution user default when the channel omits MCPs',
+      agenticConfig: null,
+      channelMcpIds: undefined,
+      expectedMcpIds: [userDefaultMcpId],
+    },
+    {
+      name: 'Codex preset selection does not suppress the execution user default',
+      agenticConfig: { agent: 'codex', presetId: 'preset-codex' },
+      channelMcpIds: undefined,
+      expectedMcpIds: [userDefaultMcpId],
+    },
+    {
+      name: 'an explicit empty channel selection disables inherited MCPs',
+      agenticConfig: null,
+      channelMcpIds: [],
+      expectedMcpIds: [],
+    },
+    {
+      name: 'explicit channel MCPs override the execution user default',
+      agenticConfig: { agent: 'codex' },
+      channelMcpIds: [channelMcpId],
+      expectedMcpIds: [channelMcpId],
+    },
+  ])('$name', async ({ agenticConfig, channelMcpIds, expectedMcpIds }) => {
+    const channel = {
+      ...slackChannel,
+      agentic_config: agenticConfig,
+      mcp_server_ids: channelMcpIds,
+    } as unknown as GatewayChannel;
+    const executionUser = {
+      ...user,
+      default_mcp_server_ids: [userDefaultMcpId],
+    } as unknown as User;
+    const { service, setMCPServers } = makeGatewayHarness({
+      channel,
+      user: executionUser,
+      existingMapping: null,
+      connector: {
+        fetchThreadHistory: vi.fn(async () => ({ has_more: false, messages: [] })),
+        sendMessage: vi.fn(async () => '100.000001'),
+      },
+    });
+
+    await service.create({
+      channel_key: channel.channel_key,
+      thread_id: 'C123-100.000000',
+      text: 'start',
+      metadata: {
+        channel: 'C123',
+        channel_type: 'channel',
+        slack_has_mention: true,
+        slack_message_ts: '100.000000',
+      },
+    });
+
+    if (expectedMcpIds.length === 0) {
+      expect(setMCPServers).not.toHaveBeenCalled();
+    } else {
+      expect(setMCPServers).toHaveBeenCalledWith('sess-new', expectedMcpIds, 'gateway');
+    }
   });
 });
 
@@ -1315,6 +1408,17 @@ describe('GatewayService inbound create without ambient tenant DB scope', () => 
   // 'Missing tenant database scope for gateway agent resolution' on this path,
   // breaking all inbound Slack messages.
   it('processes a Slack listener message with tenant identity only', async () => {
+    const materializationScopes: unknown[] = [];
+    vi.mocked(materializeAgenticToolConfiguration).mockImplementationOnce(async (tenantDb) => {
+      const scope = getCurrentTenantDatabaseScope();
+      materializationScopes.push(scope);
+      expect(tenantDb).toBe(scope?.db);
+      return {
+        agentic_tool_preset_id: null,
+        permission_config: { mode: 'default' },
+        model_config: null,
+      };
+    });
     const fetchThreadHistory = vi.fn(async () => ({ has_more: false, messages: [] }));
     const { createUnscoped, promptCreate } = makeGatewayHarness({
       existingMapping: makeMapping(),
@@ -1337,7 +1441,42 @@ describe('GatewayService inbound create without ambient tenant DB scope', () => 
     );
 
     expect(getCurrentTenantDatabaseScope()).toBeUndefined();
+    expect(materializationScopes).toEqual([
+      expect.objectContaining({ kind: 'tenant', tenantId: 'tenant-channel' }),
+    ]);
     expect(result).toMatchObject({ success: true, sessionId: 'sess-1', created: false });
     expect(promptCreate).toHaveBeenCalled();
+  });
+
+  it('rejects materialization through a retained foreign tenant scope', async () => {
+    const db = { run: vi.fn() } as unknown as TenantScopeAwareDatabase;
+    const { createUnscoped } = makeGatewayHarness({
+      db,
+      existingMapping: makeMapping(),
+      connector: {
+        fetchThreadHistory: vi.fn(async () => ({ has_more: false, messages: [] })),
+        sendMessage: vi.fn(async () => undefined),
+      },
+    });
+
+    await expect(
+      runWithTenantDatabaseScope(db, 'tenant-a', () =>
+        runWithTenantContext('tenant-b', () =>
+          createUnscoped({
+            channel_key: 'slack-key',
+            thread_id: 'C123-100.000000',
+            text: 'please answer',
+            metadata: {
+              channel: 'C123',
+              channel_type: 'channel',
+              slack_has_mention: true,
+              slack_message_ts: '103.000000',
+              slack_thread_ts: '100.000000',
+            },
+          })
+        )
+      )
+    ).rejects.toThrow('Cannot enter tenant scope tenant-b from active tenant scope tenant-a');
+    expect(materializeAgenticToolConfiguration).not.toHaveBeenCalled();
   });
 });

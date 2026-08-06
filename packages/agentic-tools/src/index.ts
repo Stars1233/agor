@@ -91,12 +91,27 @@ export function getAgenticToolModelSelectionError(
   tool: AgenticToolName,
   input: { provider?: string; model?: string } | null | undefined
 ): string | undefined {
-  const policy = AGENTIC_TOOL_INTEGRATIONS[tool].modelSelection;
-  return policy && !policy.isComplete(input) ? policy.missingError : undefined;
+  const policy = AGENTIC_TOOL_INTEGRATIONS[tool].modelConfiguration;
+  if (!policy?.missingSelectionError) return undefined;
+  return isAgenticToolModelSelectionComplete(tool, input)
+    ? undefined
+    : policy.missingSelectionError;
 }
 
 export function agenticToolRequiresModelSelection(tool: AgenticToolName): boolean {
-  return Boolean(AGENTIC_TOOL_INTEGRATIONS[tool].modelSelection);
+  return Boolean(AGENTIC_TOOL_INTEGRATIONS[tool].modelConfiguration?.missingSelectionError);
+}
+
+export function getAgenticToolModelConfiguration(tool: AgenticToolName) {
+  return AGENTIC_TOOL_INTEGRATIONS[tool].modelConfiguration;
+}
+
+export function isAgenticToolModelSelectionComplete(
+  tool: AgenticToolName,
+  input: { provider?: string; model?: string } | null | undefined
+): boolean {
+  const predicate = AGENTIC_TOOL_INTEGRATIONS[tool].modelConfiguration?.isSelectionComplete;
+  return predicate ? predicate(input) : Boolean(input?.model?.trim());
 }
 
 export const TOOL_API_KEY_NAMES = Object.freeze(
