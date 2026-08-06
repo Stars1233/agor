@@ -7,7 +7,9 @@
  * - Application instance
  */
 
+import type { DistributedWorkIdentity } from '@agor/core/coordination';
 import type {
+  TaskDispatchClaimResult,
   TerminationClaimInput,
   TerminationClaimResult,
   TerminationSettlementInput,
@@ -33,6 +35,7 @@ import type {
   Session,
   SessionUpdate,
   Task,
+  TaskPendingDispatchStatus,
 } from '@agor/core/types';
 import type {
   ExecuteTaskData,
@@ -49,7 +52,10 @@ export type HookContext<T = unknown> = CoreHookContext<T>;
 /**
  * Application type for the daemon
  */
-export type Application = ExpressApplication;
+export type Application = ExpressApplication & {
+  get(name: 'distributedWorkIdentity'): DistributedWorkIdentity | undefined;
+  set(name: 'distributedWorkIdentity', value: DistributedWorkIdentity): ExpressApplication;
+};
 
 /**
  * Sessions service with custom methods (server-side implementation)
@@ -140,6 +146,12 @@ export interface SessionsServiceImpl
  * Tasks service with custom methods (server-side implementation)
  */
 export interface TasksServiceImpl extends Service<Task, Partial<Task>, FeathersParams> {
+  claimDispatchAndProjectSession(
+    taskId: string,
+    expectedStatus: TaskPendingDispatchStatus,
+    updates: Partial<Task>,
+    params?: FeathersParams
+  ): Promise<TaskDispatchClaimResult>;
   connectExecutor(data: { task_id: string }, params?: FeathersParams): Promise<Task>;
   reportTerminationComplete(
     data: import('@agor/core/types').ExecutorTerminationCompleteInput,

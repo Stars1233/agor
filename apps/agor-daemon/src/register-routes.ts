@@ -51,6 +51,7 @@ import type {
   AuthenticatedParams,
   HookContext,
   Message,
+  MessageID,
   MessageSource,
   Paginated,
   Params,
@@ -64,7 +65,14 @@ import type {
   User,
   UUID,
 } from '@agor/core/types';
-import { hasMinimumRole, MessageRole, ROLES, SessionStatus, TaskStatus } from '@agor/core/types';
+import {
+  hasMinimumRole,
+  isTaskPendingDispatch,
+  MessageRole,
+  ROLES,
+  SessionStatus,
+  TaskStatus,
+} from '@agor/core/types';
 import { NotFoundError } from '@agor/core/utils/errors';
 import type { NextFunction, Request, Response } from 'express';
 import { rateLimit } from 'express-rate-limit';
@@ -146,6 +154,7 @@ import {
 import { findActiveTasksForSession } from './utils/session-tasks.js';
 import { type SessionTurnLocks, withSessionTurnLock } from './utils/session-turn-lock.js';
 import { bindStopRouteRepositories } from './utils/stop-route-repositories.js';
+import { formatStructuredLog, structuredLogErrorCode } from './utils/structured-log.js';
 import { buildTaskLaunchState } from './utils/task-launch-state.js';
 import { normalizeMessageSource, runExistingTask } from './utils/task-runner.js';
 import {
@@ -975,6 +984,118 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   }
 
   /**
+   * Persist the first transcript row for a Task. Scheduled/idempotent prompts
+   * pass a stable message ID, so a replacement daemon can repair a kill after
+   * the dispatch claim without duplicating the prompt. Ordinary prompts retain
+   * the historical best-effort/random-ID behavior and executor fallback.
+   */
+  async function ensureInitialUserMessage(
+    task: Task,
+    params: RouteParams,
+    input: {
+      messageStartIndex: number;
+      startTimestamp: string;
+      messageSource?: MessageSource;
+      stableMessageId?: MessageID;
+    }
+  ): Promise<void> {
+    if (config.execution?.daemon_writes_user_message === false) return;
+
+    const messageRepo = new MessagesRepository(db);
+    if (input.stableMessageId) {
+      const existing = await messageRepo.findById(input.stableMessageId);
+      if (existing) {
+        if (existing.session_id !== task.session_id || existing.task_id !== task.task_id) {
+          throw new Conflict(
+            `Stable initial message identity ${input.stableMessageId} is already in use`
+          );
+        }
+        return;
+      }
+    }
+
+    const isCallback = task.metadata?.is_agor_callback === true;
+    const messageMetadata: Message['metadata'] = {};
+    if (isCallback) messageMetadata.is_agor_callback = true;
+    if (input.messageSource === 'gateway' || input.messageSource === 'agor') {
+      messageMetadata.source = input.messageSource;
+    }
+    const userMessage = buildInitialUserMessage({
+      messageId: input.stableMessageId,
+      sessionId: task.session_id,
+      taskId: task.task_id,
+      index: input.messageStartIndex,
+      timestamp: input.startTimestamp,
+      content: task.full_prompt,
+      type: isCallback ? 'system' : 'user',
+      metadata: Object.keys(messageMetadata).length > 0 ? messageMetadata : undefined,
+    });
+
+    try {
+      await app.service('messages').create(userMessage, params);
+    } catch (error) {
+      if (input.stableMessageId) {
+        const winner = await messageRepo.findById(input.stableMessageId);
+        if (winner?.session_id === task.session_id && winner.task_id === task.task_id) return;
+        throw error;
+      }
+      // Don't fail the spawn — the executor's createUserMessage fallback
+      // (with skip-if-exists) will write the row when it connects.
+      console.warn(
+        formatStructuredLog('[messages.initial]', {
+          event: 'write_failed',
+          task_id: task.task_id,
+          outcome: 'executor_retry',
+          error_code: structuredLogErrorCode(error),
+        })
+      );
+    }
+  }
+
+  /** Repair one stable initial transcript row from durable Task state. */
+  async function reconcileStableInitialUserMessage(
+    task: Task,
+    params: RouteParams,
+    stableMessageId: MessageID,
+    fallback: {
+      messageStartIndex?: number;
+      startTimestamp?: string;
+      messageSource?: MessageSource;
+    } = {}
+  ): Promise<void> {
+    const tenantId = getCurrentTenantId();
+    if (!tenantId) throw new Error('Missing active tenant context for message reconciliation');
+    const persistedStartIndex = task.message_range?.start_index;
+    const hasPersistedStartIndex =
+      typeof persistedStartIndex === 'number' && persistedStartIndex >= 0;
+    const fallbackStartIndex =
+      typeof fallback.messageStartIndex === 'number' && fallback.messageStartIndex >= 0
+        ? fallback.messageStartIndex
+        : undefined;
+    const messageStartIndex = hasPersistedStartIndex
+      ? persistedStartIndex
+      : (fallbackStartIndex ??
+        (await runWithTenantDatabaseScope(db, tenantId, () =>
+          sessionsRepository.countMessages(task.session_id)
+        )));
+    const startTimestamp =
+      (hasPersistedStartIndex ? task.message_range?.start_timestamp : undefined) ??
+      task.started_at ??
+      fallback.startTimestamp ??
+      new Date().toISOString();
+    const persistedSource = task.metadata?.source ?? fallback.messageSource;
+    const messageSource =
+      persistedSource === 'gateway' || persistedSource === 'agor' ? persistedSource : undefined;
+
+    await ensureInitialUserMessage(task, params, {
+      messageStartIndex,
+      startTimestamp,
+      messageSource,
+      stableMessageId,
+    });
+  }
+
+  /**
    * spawnTaskExecutor — sole transition point for `tasks.status` going from
    * `created` / `queued` → `dispatching`.
    *
@@ -1007,11 +1128,29 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       permissionMode?: import('@agor/core/types').PermissionMode;
       stream?: boolean;
       messageSource?: MessageSource;
+      stableInitialMessageId?: MessageID;
     },
     params: RouteParams
   ): Promise<Task> {
     const tenantId = getCurrentTenantId();
     if (!tenantId) throw new Error('Missing active tenant context for task executor startup');
+    const persistedMessageSource = task.metadata?.source ?? options.messageSource;
+    const runtimeMessageSource =
+      persistedMessageSource === 'gateway' || persistedMessageSource === 'agor'
+        ? persistedMessageSource
+        : undefined;
+
+    // A stable scheduled Task that has crossed the dispatch fence needs only
+    // deterministic projection repair. Do not make that reconciliation depend
+    // on mutable launch-time state (tool enablement, preset validity, or user
+    // defaults): no new executor launch will occur on this path.
+    if (options.stableInitialMessageId && !isTaskPendingDispatch(task)) {
+      await reconcileStableInitialUserMessage(task, params, options.stableInitialMessageId, {
+        messageSource: runtimeMessageSource,
+      });
+      return task;
+    }
+
     const {
       agenticToolEnabled,
       messageStartIndex,
@@ -1030,11 +1169,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       throw new Forbidden(`${loadedSession.agentic_tool} is disabled for this workspace`);
     }
     const session = await sessionsService.materializeAgenticToolPreset(loadedSession, params);
-    const persistedMessageSource = task.metadata?.source ?? options.messageSource;
-    const runtimeMessageSource =
-      persistedMessageSource === 'gateway' || persistedMessageSource === 'agor'
-        ? persistedMessageSource
-        : undefined;
     const startTimestamp = new Date().toISOString();
 
     // The daemon persists launch intent and writes required sentinel git fields
@@ -1048,10 +1182,14 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       config.execution?.executor_command_template ? 'templated' : 'local'
     );
 
-    // Patch task: queued/created → launch status, with real ranges. queue_position
-    // is cleared here so a draining task is no longer considered queued.
-    const updatedTask = (await app.service('tasks').patch(
+    if (!isTaskPendingDispatch(task)) return task;
+
+    // Atomically claim queued/created → launch status. Process-local session
+    // locks reduce contention, but this expected-state transition is the
+    // cross-daemon fence that prevents duplicate executor launches.
+    const dispatchClaim = await tasksService.claimDispatchAndProjectSession(
       task.task_id,
+      task.status,
       {
         ...launchState,
         ...(launchState.executor_mode
@@ -1070,49 +1208,60 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         },
       },
       { ...params, provider: undefined }
-    )) as Task;
+    );
+    if (dispatchClaim.outcome !== 'claimed') {
+      const workIdentity = app.get('distributedWorkIdentity');
+      console.info(
+        formatStructuredLog('[distributed-work.task-dispatch]', {
+          event: 'claim_lost',
+          instance_id: workIdentity?.instanceId,
+          boot_id: workIdentity?.bootId,
+          tenant_id: tenantId,
+          task_id: task.task_id,
+          session_id: task.session_id,
+          observed_status: dispatchClaim.task.status,
+        })
+      );
+      if (options.stableInitialMessageId) {
+        await reconcileStableInitialUserMessage(
+          dispatchClaim.task,
+          params,
+          options.stableInitialMessageId,
+          {
+            messageStartIndex,
+            startTimestamp,
+            messageSource: runtimeMessageSource,
+          }
+        );
+      }
+      return dispatchClaim.task;
+    }
+    const updatedTask = dispatchClaim.task;
 
     // Alt D — write the user-message row before spawning. Gated by kill switch.
     // The executor's createUserMessage has a skip-if-exists guard so a duplicate
     // write is harmless if the daemon path is enabled.
-    if (config.execution?.daemon_writes_user_message !== false) {
-      try {
-        const isCallback = task.metadata?.is_agor_callback === true;
-        const messageMetadata: Message['metadata'] = {};
-        if (isCallback) {
-          messageMetadata.is_agor_callback = true;
-        }
-        // Prefer task.metadata.source (set when the task was queued) over
-        // the request's messageSource — the latter applies only to the
-        // current draining tick, the former to where the prompt originated.
-        if (runtimeMessageSource) {
-          messageMetadata.source = runtimeMessageSource;
-        }
-
-        const userMessage = buildInitialUserMessage({
-          sessionId: task.session_id,
-          taskId: task.task_id,
-          index: messageStartIndex,
-          timestamp: startTimestamp,
-          content: task.full_prompt,
-          // Callback messages are typed `system` so the UI shows the special
-          // Agor-callback styling. Normal prompts stay `user`.
-          type: isCallback ? 'system' : 'user',
-          metadata: Object.keys(messageMetadata).length > 0 ? messageMetadata : undefined,
-        });
-        await app.service('messages').create(userMessage, params);
-      } catch (msgErr) {
-        // Don't fail the spawn — the executor's createUserMessage fallback
-        // (with skip-if-exists) will write the row when it connects.
-        console.warn(
-          `⚠️  [Daemon] Failed to write initial user-message row for task ${shortId(task.task_id)} (executor will retry):`,
-          msgErr
-        );
-      }
+    // Prefer task.metadata.source (set when the task was queued) over the
+    // request's messageSource — the latter applies only to this drain tick.
+    if (options.stableInitialMessageId) {
+      await reconcileStableInitialUserMessage(updatedTask, params, options.stableInitialMessageId, {
+        messageStartIndex,
+        startTimestamp,
+        messageSource: runtimeMessageSource,
+      });
+    } else {
+      await ensureInitialUserMessage(task, params, {
+        messageStartIndex,
+        startTimestamp,
+        messageSource: runtimeMessageSource,
+      });
     }
 
-    // Flip session to RUNNING and append to session.tasks. Done here so both
-    // callers (idle prompt and queue drain) get this for free.
+    // Re-apply the Session projection through Feathers so hooks/realtime see
+    // the transition. TaskRepository.claimDispatchAndProjectSession already
+    // committed the same projection atomically with the Task fence; this
+    // service patch is no longer correctness-critical on SQLite and is
+    // intentionally idempotent.
     //
     // The session-status flip used to fall out of `TasksService.create` when
     // the IDLE path created a task with `status: RUNNING` directly. Now the
@@ -1259,6 +1408,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
            * excluded/sanitized even for stale or untyped clients.
            */
           metadata?: PromptTaskMetadataInput;
+          /**
+           * Internal-only stable task identity for idempotent producers such
+           * as the scheduler. External callers may not set this field.
+           */
+          idempotencyTaskId?: UUID;
         },
         params: RouteParams
       ) {
@@ -1272,6 +1426,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         let id = params.route?.id;
         if (!id) throw new Error('Session ID required');
         if (!data.prompt) throw new Error('Prompt required');
+        if (data.idempotencyTaskId && params.provider) {
+          throw new Forbidden('idempotencyTaskId is internal-only');
+        }
 
         // Validate and normalize messageSource
         const messageSource = normalizeMessageSource(data.messageSource, params);
@@ -1283,18 +1440,55 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         let session = await sessionsService.get(id, params);
         id = session.session_id;
-        const activeAgenticTool = requireActiveAgenticTool(session.agentic_tool);
+        const taskRepo = new TaskRepository(db);
 
-        if (!(await isTenantAgenticToolEnabled(activeAgenticTool, db))) {
-          throw new Forbidden(`${activeAgenticTool} is disabled for this workspace`);
-        }
-        session = await sessionsService.materializeAgenticToolPreset(session, params);
-        if (
-          session.agentic_tool_preset_id &&
-          data.permissionMode !== undefined &&
-          data.permissionMode !== session.permission_config?.mode
-        ) {
-          throw new Forbidden('Preset-backed sessions cannot override permission mode per task');
+        const reconcileDurablyDispatchedTask = async (): Promise<Task | null> => {
+          if (!data.idempotencyTaskId) return null;
+          const prior = await taskRepo.findById(data.idempotencyTaskId);
+          if (!prior) return null;
+          if (prior.session_id !== id) {
+            throw new Conflict(`Task identity ${data.idempotencyTaskId} is already in use`);
+          }
+          const expectedCreator = params.user?.user_id ?? session.created_by;
+          if (prior.created_by !== expectedCreator || prior.full_prompt !== data.prompt) {
+            throw new Conflict(`Task identity ${data.idempotencyTaskId} is already in use`);
+          }
+          if (isTaskPendingDispatch(prior)) return null;
+
+          await reconcileStableInitialUserMessage(
+            prior,
+            params,
+            data.idempotencyTaskId as MessageID
+          );
+          return prior;
+        };
+
+        // Scheduled recovery is reconciliation, not a fresh launch admission,
+        // once its stable Task has crossed the durable dispatch fence. Return
+        // that Task before consulting mutable tool/preset/user configuration.
+        const durableTask = await reconcileDurablyDispatchedTask();
+        if (durableTask) return durableTask;
+
+        try {
+          const activeAgenticTool = requireActiveAgenticTool(session.agentic_tool);
+          if (!(await isTenantAgenticToolEnabled(activeAgenticTool, db))) {
+            throw new Forbidden(`${activeAgenticTool} is disabled for this workspace`);
+          }
+          session = await sessionsService.materializeAgenticToolPreset(session, params);
+          if (
+            session.agentic_tool_preset_id &&
+            data.permissionMode !== undefined &&
+            data.permissionMode !== session.permission_config?.mode
+          ) {
+            throw new Forbidden('Preset-backed sessions cannot override permission mode per task');
+          }
+        } catch (error) {
+          // Another daemon can cross the dispatch fence between the first
+          // stable-Task read and launch admission. Re-check before surfacing a
+          // mutable configuration failure; the winner no longer needs launch.
+          const concurrentlyDurableTask = await reconcileDurablyDispatchedTask();
+          if (concurrentlyDurableTask) return concurrentlyDurableTask;
+          throw error;
         }
 
         // Auto-unarchive on prompt
@@ -1324,7 +1518,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         // prompts on an idle session could both observe `status === 'idle'`
         // and both spawn executors. Inside the lock the session is re-read,
         // so the decision is made against the freshest possible state.
-        const taskRepo = new TaskRepository(db);
         if (!params.user?.user_id) {
           throw new NotAuthenticated('Authentication required to prompt a session');
         }
@@ -1346,6 +1539,48 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
               taskRepo,
               params
             );
+
+            // A scheduled occurrence owns a stable initial task ID persisted
+            // with its session. Reconciliation always targets that row rather
+            // than inferring idempotence from process-local locks or creating a
+            // second queued prompt after another daemon starts it.
+            if (data.idempotencyTaskId) {
+              const prior = await taskRepo.findById(data.idempotencyTaskId);
+              if (prior && prior.session_id !== id) {
+                throw new Conflict(`Task identity ${data.idempotencyTaskId} is already in use`);
+              }
+              const task = await taskRepo.createPending({
+                task_id: data.idempotencyTaskId,
+                session_id: id as SessionID,
+                full_prompt: data.prompt,
+                created_by: createdBy,
+                status: TaskStatus.CREATED,
+              });
+              if (!prior) {
+                // createPending is conflict-tolerant: another daemon can win
+                // between the pre-read and insert. In that case this is only a
+                // harmless same-ID realtime catch-up event, not a correctness
+                // dependency.
+                emitServiceEvent(app, {
+                  path: 'tasks',
+                  event: 'created',
+                  data: task,
+                  params,
+                  id: task.task_id,
+                });
+              }
+              return await spawnTaskExecutor(
+                task,
+                {
+                  permissionMode: data.permissionMode,
+                  stream: data.stream !== false,
+                  messageSource,
+                  stableInitialMessageId: data.idempotencyTaskId as MessageID,
+                },
+                params
+              );
+            }
+
             const queuedTasks = await taskRepo.findQueued(id as SessionID);
             const shouldQueue =
               !sessionCanStartTask(lockedSession.status, lockedSession.ready_for_prompt) ||

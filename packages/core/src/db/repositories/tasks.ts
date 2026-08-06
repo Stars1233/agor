@@ -10,11 +10,13 @@ import type {
   SdkFailure,
   SessionID,
   Task,
+  TaskID,
   TaskMetadata,
+  TaskPendingDispatchStatus,
   TerminationCause,
   UUID,
 } from '@agor/core/types';
-import { isTerminalTaskStatus, TaskStatus } from '@agor/core/types';
+import { isTerminalTaskStatus, SessionStatus, TaskStatus } from '@agor/core/types';
 import { and, eq, inArray, like, sql } from 'drizzle-orm';
 import { generateId, shortId } from '../../lib/ids';
 import type { Database } from '../client';
@@ -28,7 +30,7 @@ import {
   txAsDb,
   update,
 } from '../database-wrapper';
-import { type TaskInsert, type TaskRow, tasks } from '../schema';
+import { sessions, type TaskInsert, type TaskRow, tasks } from '../schema';
 import {
   AmbiguousIdError,
   type BaseRepository,
@@ -121,6 +123,11 @@ export interface TerminationSettlementInput {
 
 export interface TerminationSettlementResult {
   outcome: 'transitioned' | 'unverified' | 'condition_changed' | 'terminal';
+  task: Task;
+}
+
+export interface TaskDispatchClaimResult {
+  outcome: 'claimed' | 'already_claimed' | 'condition_changed';
   task: Task;
 }
 
@@ -924,13 +931,16 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
    * overwrites these on the way to RUNNING.
    */
   async createPending(input: {
+    /** Optional stable identity used by idempotent internal producers. */
+    task_id?: TaskID;
     session_id: SessionID;
     full_prompt: string;
     created_by: string;
-    status: typeof TaskStatus.CREATED | typeof TaskStatus.QUEUED;
+    status: TaskPendingDispatchStatus;
     metadata?: TaskMetadata;
   }): Promise<Task> {
     const taskBase: Partial<Task> = {
+      task_id: input.task_id,
       session_id: input.session_id,
       full_prompt: input.full_prompt,
       created_by: input.created_by,
@@ -951,8 +961,24 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
       tool_use_count: 0,
     };
 
-    if (input.status === TaskStatus.CREATED) {
+    if (input.status === TaskStatus.CREATED && !input.task_id) {
       return this.create(taskBase);
+    }
+
+    if (input.status === TaskStatus.CREATED) {
+      const insertData = this.taskToInsert(taskBase);
+      await insert(this.db, tasks).values(insertData).onConflictDoNothing().run();
+      const row = await select(this.db).from(tasks).where(eq(tasks.task_id, input.task_id!)).one();
+      if (!row) throw new RepositoryError('Failed to retrieve idempotent pending task');
+      const existing = this.rowToTask(row);
+      if (
+        existing.session_id !== input.session_id ||
+        existing.created_by !== input.created_by ||
+        existing.full_prompt !== input.full_prompt
+      ) {
+        throw new RepositoryError(`Task identity ${input.task_id} is already in use`);
+      }
+      return existing;
     }
 
     // QUEUED: serialize the read-then-insert in a transaction so concurrent
@@ -982,6 +1008,87 @@ export class TaskRepository implements BaseRepository<Task, Partial<Task>> {
         throw new RepositoryError('Failed to retrieve created queued task');
       }
       return this.rowToTask(row);
+    });
+  }
+
+  /**
+   * Atomically claim the CREATED/QUEUED -> DISPATCHING transition.
+   *
+   * The row lock and expected-state check are the fence. A second daemon that
+   * read the old state may do preparatory work, but it cannot write launch
+   * intent, transcript/session state, or spawn a second executor after losing
+   * this transition.
+   */
+  async claimDispatchAndProjectSession(
+    id: string,
+    expectedStatus: TaskPendingDispatchStatus,
+    updates: Partial<Task>
+  ): Promise<TaskDispatchClaimResult> {
+    return this.mutateLockedTask(id, async (txDb, currentRow, fullId) => {
+      const current = this.rowToTask(currentRow);
+      if (current.status !== expectedStatus) {
+        return {
+          outcome:
+            current.status === TaskStatus.DISPATCHING || current.status === TaskStatus.RUNNING
+              ? 'already_claimed'
+              : 'condition_changed',
+          task: current,
+        };
+      }
+      if (updates.status !== TaskStatus.DISPATCHING) {
+        throw new RepositoryError('Dispatch claim must transition to dispatching');
+      }
+
+      const merged: Task = {
+        ...deepMerge(current, updates),
+        task_id: current.task_id,
+        session_id: current.session_id,
+        created_by: current.created_by,
+        created_at: current.created_at,
+        // Queue ownership ends at the durable launch-intent transition.
+        queue_position: undefined,
+      };
+      const insertData = this.taskToInsert(merged);
+      await update(txDb, tasks)
+        .set({
+          status: insertData.status,
+          queue_position: insertData.queue_position,
+          started_at: insertData.started_at,
+          executor_connected_at: insertData.executor_connected_at,
+          completed_at: insertData.completed_at,
+          last_executor_heartbeat_at: insertData.last_executor_heartbeat_at,
+          data: insertData.data,
+        })
+        .where(eq(tasks.task_id, fullId))
+        .run();
+
+      // The launch-intent transition and its Session projection are one
+      // durable state change. PostgreSQL request scopes already provide an
+      // outer transaction, but standalone SQLite does not; keeping this write
+      // inside the task-claim transaction closes the kill point where a Task
+      // could be DISPATCHING while its Session remained IDLE and omitted the
+      // task from data.tasks.
+      await lockRowForUpdate(txDb, this.db, sessions, eq(sessions.session_id, current.session_id));
+      const sessionRow = await select(txDb)
+        .from(sessions)
+        .where(eq(sessions.session_id, current.session_id))
+        .one();
+      if (!sessionRow) {
+        throw new EntityNotFoundError('Session', current.session_id);
+      }
+      const sessionTasks = sessionRow.data.tasks.includes(current.task_id)
+        ? sessionRow.data.tasks
+        : [...sessionRow.data.tasks, current.task_id];
+      await update(txDb, sessions)
+        .set({
+          status: SessionStatus.RUNNING,
+          ready_for_prompt: false,
+          updated_at: new Date(),
+          data: { ...sessionRow.data, tasks: sessionTasks },
+        })
+        .where(eq(sessions.session_id, current.session_id))
+        .run();
+      return { outcome: 'claimed', task: merged };
     });
   }
 
