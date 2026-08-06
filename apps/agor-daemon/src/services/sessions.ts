@@ -5,6 +5,7 @@
  * Uses DrizzleService adapter with SessionRepository.
  */
 
+import { getAgenticToolModelSelectionError } from '@agor/agentic-tools';
 import {
   assertInlineAgenticConfigurationAllowed,
   isTenantAgenticToolEnabled,
@@ -132,7 +133,10 @@ export type SessionParams = QueryParams<{
     _agorSqlSessionAccessUserId?: UUID;
     /** Internal task-start reconciliation of a live preset. */
     _applyingAgenticToolPreset?: boolean;
-    /** Internal caller already resolved permission/model fallbacks and must not inherit user defaults. */
+    /**
+     * Internal caller already resolved permission/model fallbacks and must not inherit user defaults.
+     * Root-level service params are server-controlled; transport query/data cannot set this marker.
+     */
     _agenticConfigResolved?: boolean;
   };
 
@@ -222,6 +226,14 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
   ): void {
     if (agenticTool !== 'codex' || !modelConfig) return;
     const modelError = getCodexModelSelectionError(modelConfig);
+    if (modelError) throw new BadRequest(modelError);
+  }
+
+  private assertCompleteAgenticToolModelSelection(
+    agenticTool: AgenticToolName,
+    modelConfig: { provider?: string; model?: string } | null | undefined
+  ): void {
+    const modelError = getAgenticToolModelSelectionError(agenticTool, modelConfig);
     if (modelError) throw new BadRequest(modelError);
   }
 
@@ -321,6 +333,9 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
       };
     } else {
       await assertInlineAgenticConfigurationAllowed(this.db, agenticTool);
+      if (!params?._agenticConfigResolved) {
+        this.assertCompleteAgenticToolModelSelection(agenticTool, modelConfig);
+      }
       if (modelConfig != null && !isResolvedModelConfig(modelConfig)) {
         throw new BadRequest('model_config must be resolved before session creation');
       }
@@ -330,10 +345,7 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
         model_config: modelConfig,
       };
     }
-    this.assertSupportedModelConfig(
-      (createData.agentic_tool ?? agenticTool) as Session['agentic_tool'],
-      createData.model_config
-    );
+    this.assertSupportedModelConfig(agenticTool, createData.model_config);
     const created = await super.create(createData, params);
     if (Array.isArray(created)) {
       throw new Error('Single-session creation returned multiple sessions');
@@ -624,7 +636,7 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
         tasks: [],
         // Don't copy sdk_session_id - fork will get its own via forkSession:true
       },
-      params
+      { ...params, _agenticConfigResolved: true }
     );
 
     // Cast forkedSession to Session to handle return type
@@ -815,7 +827,7 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
         callback_config: callbackConfig,
         // Don't copy sdk_session_id - spawn will get its own via forkSession:true
       },
-      params
+      { ...params, _agenticConfigResolved: true }
     );
 
     // Cast spawnedSession to Session to handle return type (create returns Session | Session[])
@@ -1312,10 +1324,17 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
         data.agentic_tool !== undefined ||
         data.agentic_tool_preset_id !== undefined
       ) {
-        this.assertSupportedModelConfig(
-          data.agentic_tool ?? current.agentic_tool,
-          data.model_config === undefined ? current.model_config : data.model_config
-        );
+        const effectiveTool = requireActiveAgenticTool(data.agentic_tool ?? current.agentic_tool);
+        const effectiveModelConfig =
+          data.model_config === undefined ? current.model_config : data.model_config;
+        const effectivePresetId =
+          data.agentic_tool_preset_id === undefined
+            ? current.agentic_tool_preset_id
+            : data.agentic_tool_preset_id;
+        if (!effectivePresetId) {
+          this.assertCompleteAgenticToolModelSelection(effectiveTool, effectiveModelConfig);
+        }
+        this.assertSupportedModelConfig(effectiveTool, effectiveModelConfig);
       }
     }
     const result = (

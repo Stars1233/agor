@@ -44,6 +44,58 @@ class MissingCredentialError extends Error {
   override readonly name = 'MissingCredentialError';
 }
 
+async function appendTaskFailureMessage(
+  client: AgorClient,
+  sessionId: SessionID,
+  taskId: TaskID,
+  failure: Error
+): Promise<void> {
+  try {
+    const existingMessages = await client.service('messages').find({
+      query: { session_id: sessionId, $limit: 0 },
+    });
+    const messageCount =
+      typeof existingMessages === 'object' && 'total' in existingMessages
+        ? existingMessages.total
+        : Array.isArray(existingMessages)
+          ? existingMessages.length
+          : 0;
+
+    await client.service('messages').create({
+      message_id: generateId() as MessageID,
+      session_id: sessionId,
+      task_id: taskId,
+      type: 'system',
+      role: MessageRole.SYSTEM,
+      index: messageCount,
+      timestamp: new Date().toISOString(),
+      content: failure.message,
+      content_preview: failure.message.substring(0, 200),
+      metadata: {
+        is_task_failure: true,
+        ...(failure instanceof MissingCredentialError
+          ? { is_missing_credential_failure: true }
+          : {}),
+      },
+    });
+  } catch (error) {
+    console.error('[executor] Failed to create task failure message:', error);
+  }
+}
+
+export async function settleTaskFailure(
+  client: AgorClient,
+  sessionId: SessionID,
+  taskId: TaskID,
+  failure: Error,
+  patch: Partial<Task>
+): Promise<void> {
+  // Terminal task hooks may drain the next queued turn, so reserve the current
+  // transcript index before publishing terminality. Message failure stays best-effort.
+  await appendTaskFailureMessage(client, sessionId, taskId, failure);
+  await client.service('tasks').patch(taskId, patch);
+}
+
 /**
  * Tool interface that all SDK wrappers must implement
  */
@@ -640,39 +692,7 @@ export async function executeToolTask(params: {
       };
     }
 
-    // Update task status to failed with git SHA
-    await client.service('tasks').patch(taskId, patchData);
-
-    // Emit a system error message so the user sees what went wrong in the conversation
-    try {
-      const existingMessages = await client.service('messages').find({
-        query: { session_id: sessionId, $limit: 0 },
-      });
-      const messageCount =
-        typeof existingMessages === 'object' && 'total' in existingMessages
-          ? existingMessages.total
-          : Array.isArray(existingMessages)
-            ? existingMessages.length
-            : 0;
-
-      await client.service('messages').create({
-        message_id: generateId() as MessageID,
-        session_id: sessionId,
-        task_id: taskId,
-        type: 'system',
-        role: MessageRole.SYSTEM,
-        index: messageCount,
-        timestamp: new Date().toISOString(),
-        content: err.message,
-        content_preview: err.message.substring(0, 200),
-        metadata: {
-          is_task_failure: true,
-          ...(err instanceof MissingCredentialError ? { is_missing_credential_failure: true } : {}),
-        },
-      });
-    } catch (msgErr) {
-      console.error(`[${toolName}] Failed to create error message:`, msgErr);
-    }
+    await settleTaskFailure(client, sessionId, taskId, err, patchData);
 
     throw err;
   } finally {

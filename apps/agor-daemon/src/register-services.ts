@@ -5,6 +5,9 @@
  * Extracted from index.ts for maintainability.
  */
 
+import { homedir } from 'node:os';
+import { OPENCODE_DAEMON_CONTRIBUTION } from '@agor/agentic-tool-opencode/daemon';
+
 import {
   type AgorConfig,
   PublicBaseUrlNotConfiguredError,
@@ -55,12 +58,19 @@ import type {
   TasksServiceImpl,
 } from './declarations.js';
 import {
+  containExecutorProcess,
   getTrackedExecutor,
   markExecutorProcessExited,
+  retainExecutorContainmentFence,
   trackExecutorProcess,
 } from './executor-tracking.js';
 import { shouldRegisterLocalHostOperations } from './host/availability.js';
 import { createLocalDaemonHostOperations } from './host/local/local-daemon-host-operations.js';
+import { registerOpenCodeServices } from './integrations/opencode/index.js';
+import {
+  inOpenCodeNativeStateMutationSlot,
+  type OpenCodeNativeStateMutationFence,
+} from './integrations/opencode/native-state-coordinator.js';
 import { runInOAuthTenantScope } from './oauth-auth-helpers.js';
 import {
   cacheOAuth21Token,
@@ -141,7 +151,7 @@ import {
   shouldExposeMCPServerSecrets,
   shouldExposeMCPServerSecretsForSessionToken,
 } from './utils/mcp-header-secrets.js';
-import { spawnExecutor } from './utils/spawn-executor.js';
+import { type SpawnExecutorOptions, spawnExecutor } from './utils/spawn-executor.js';
 import { classifyExecutorExit } from './utils/task-launch-state.js';
 
 /**
@@ -580,6 +590,8 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   app.use('/check-auth', createCheckAuthService(db));
   app.service('/check-auth').hooks({ before: { create: [ctx.requireAuth] } });
 
+  registerOpenCodeServices(ctx);
+
   // Imports a pasted Codex CLI auth.json for the authenticated user — writes
   // it 0600 into the Unix identity that runs Codex and flips their auth
   // method to subscription. Token material never leaves the daemon.
@@ -767,6 +779,16 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
 // Execute Handler (spawns executor processes)
 // ============================================================================
 
+function createDeferredSignal() {
+  let resolve!: () => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function createExecuteHandler(
   ctx: RegisterServicesContext,
   sessionsService: SessionsServiceImpl,
@@ -788,12 +810,23 @@ function createExecuteHandler(
   ) => {
     const tenantId = getCurrentTenantId();
     const session = await prepareSessionForExecutorStart(db, sessionsService, sessionId, params);
+    const userId = (params as AuthenticatedParams).user?.user_id as UserID | undefined;
     if (
       session.agentic_tool_preset_id &&
       data.permissionMode !== undefined &&
       data.permissionMode !== session.permission_config?.mode
     ) {
       throw new Error('Preset-backed sessions cannot override permission mode per task');
+    }
+    if (session.agentic_tool === 'opencode') {
+      if (!tenantId) throw new Error('Missing active tenant context for OpenCode execution');
+      OPENCODE_DAEMON_CONTRIBUTION.admitExecutor({
+        tenantId,
+        config,
+        modelConfig: session.model_config ?? undefined,
+        sessionOwnerId: session.created_by,
+        prompterUserId: userId,
+      });
     }
 
     // Generate session token for executor authentication
@@ -834,8 +867,12 @@ function createExecuteHandler(
     }
 
     // Determine Unix user for executor
-    const { resolveUnixUserForImpersonation, validateResolvedUnixUser, UnixUserNotFoundError } =
-      await import('@agor/core/unix');
+    const {
+      getHomedirFromUsername,
+      resolveUnixUserForImpersonation,
+      validateResolvedUnixUser,
+      UnixUserNotFoundError,
+    } = await import('@agor/core/unix');
 
     const unixUserMode = (config.execution?.unix_user_mode ?? 'simple') as UnixUserMode;
     const configExecutorUser = config.execution?.executor_unix_user;
@@ -848,6 +885,7 @@ function createExecuteHandler(
     });
 
     const executorUnixUser = impersonationResult.unixUser;
+    const executorHomeDir = executorUnixUser ? getHomedirFromUsername(executorUnixUser) : homedir();
     const effectivePermissionMode =
       data.permissionMode || session.permission_config?.mode || undefined;
     const permissionModeForPayload =
@@ -867,8 +905,6 @@ function createExecuteHandler(
 
     // Resolve user environment variables
     const { createUserProcessEnvironment } = await import('@agor/core/config');
-    const userId = (params as AuthenticatedParams).user?.user_id as UserID | undefined;
-
     // Resolve gateway-level env vars
     const gatewaySource = (session.custom_context as Record<string, unknown> | undefined)
       ?.gateway_source as { channel_id?: string } | undefined;
@@ -935,7 +971,7 @@ function createExecuteHandler(
           '',
           'This is a one-time setup — once configured, this message will not appear again.',
         ].join('\n');
-        await runWithTenantDatabaseScope(db, tenantId, (tenantDb) =>
+        await runWithTenantDatabaseScope(db, tenantId, (_tenantDb) =>
           appendSystemMessage({
             app,
             db,
@@ -951,11 +987,23 @@ function createExecuteHandler(
 
     executorEnv.DAEMON_URL = daemonUrl;
 
+    const openCodeLaunch = (() => {
+      if (session.agentic_tool !== 'opencode') return undefined;
+      if (!tenantId) throw new Error('Missing active tenant context for OpenCode execution');
+      if (!executorHomeDir) throw new Error('Missing executor home for OpenCode execution');
+      return OPENCODE_DAEMON_CONTRIBUTION.getExecutorLaunch({
+        tenantId,
+        session,
+        homeDir: executorHomeDir,
+      });
+    })();
+
     // Build executor payload
     const executorPayload = {
       command: 'prompt' as const,
       sessionToken,
       daemonUrl,
+      ...(openCodeLaunch?.executorPayload ?? {}),
       env: executorEnv,
       params: {
         sessionId,
@@ -976,8 +1024,15 @@ function createExecuteHandler(
 
     const logPrefix = `[Executor ${shortId(sessionId)}]`;
 
+    type NativeStateSpawn = {
+      fence: OpenCodeNativeStateMutationFence;
+      ready: ReturnType<typeof createDeferredSignal>;
+      finished: ReturnType<typeof createDeferredSignal>;
+      markSpawned(): void;
+    };
+
     let localExecutorPid: number | undefined;
-    spawnExecutor(executorPayload, {
+    const executorOptions = (nativeState?: NativeStateSpawn): SpawnExecutorOptions => ({
       asUser: executorUnixUser || undefined,
       preparedEnv: executorEnv,
       logPrefix,
@@ -992,6 +1047,7 @@ function createExecuteHandler(
         unix_user: impersonationResult.reportedUnixUser || undefined,
       },
       onSpawn: (child, spawnContext) => {
+        nativeState?.markSpawned();
         if (spawnContext.mode === 'local' && child.pid) {
           localExecutorPid = child.pid;
           trackExecutorProcess({
@@ -1002,6 +1058,25 @@ function createExecuteHandler(
           });
           console.log(`${logPrefix} PID: ${child.pid}`);
         }
+        if (!nativeState) return;
+        if (spawnContext.mode !== 'local' || !child.pid) {
+          const error = new Error('OpenCode execution requires a locally tracked executor process');
+          nativeState.ready.reject(error);
+          return Promise.reject(error);
+        }
+        const handle = {
+          retainContainmentFence: (key: string) =>
+            retainExecutorContainmentFence(key, sessionId, taskId),
+          verifyAbsence: async () =>
+            (await containExecutorProcess(sessionId, taskId)).status === 'verified_absent',
+        };
+        return nativeState.fence.attach(handle).then(
+          () => nativeState.ready.resolve(),
+          (error) => {
+            nativeState.ready.reject(error);
+            throw error;
+          }
+        );
       },
       onExit: async (code, spawnContext) => {
         console.log(`${logPrefix} Exited with code ${code}`);
@@ -1032,6 +1107,7 @@ function createExecuteHandler(
             console.log(
               `${logPrefix} Launcher exit is passive; awaiting remote executor lifecycle`
             );
+            nativeState?.finished.resolve();
             return;
           }
         }
@@ -1061,6 +1137,7 @@ function createExecuteHandler(
           });
           if (termination.status === 'condition_changed') {
             console.log(`${logPrefix} Connected executor won the launcher-exit race`);
+            nativeState?.finished.resolve();
             return;
           }
         } catch (error) {
@@ -1068,8 +1145,35 @@ function createExecuteHandler(
         }
 
         appWithExecutor.sessionTokenService?.revokeToken(sessionToken);
+        nativeState?.finished.resolve();
       },
     });
+
+    if (openCodeLaunch) {
+      const ready = createDeferredSignal();
+      const finished = createDeferredSignal();
+      let spawned = false;
+      const slot = inOpenCodeNativeStateMutationSlot(openCodeLaunch.namespaceKey, async (fence) => {
+        try {
+          spawnExecutor(
+            executorPayload,
+            executorOptions({ fence, ready, finished, markSpawned: () => (spawned = true) })
+          );
+          await ready.promise;
+          await finished.promise;
+        } catch (error) {
+          if (!spawned) await fence.releaseWithoutWriter();
+          throw error;
+        }
+      });
+      void slot.catch((error) => {
+        ready.reject(error);
+        console.error(`${logPrefix} Native-state writer failed:`, error);
+      });
+      await ready.promise;
+    } else {
+      spawnExecutor(executorPayload, executorOptions());
+    }
 
     return {
       success: true,
