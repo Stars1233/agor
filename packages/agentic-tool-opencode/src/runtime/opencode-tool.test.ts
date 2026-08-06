@@ -53,13 +53,8 @@ vi.mock('@opencode-ai/sdk', () => ({
     createMockClient(config),
 }));
 
-// Mock getDaemonUrl
-vi.mock('../../config.js', () => ({
-  getDaemonUrl: vi.fn().mockResolvedValue('http://localhost:3030'),
-}));
-
 // Mock MCP scoping
-vi.mock('../base/mcp-scoping.js', () => ({
+vi.mock('@agor/core/mcp', () => ({
   getMcpServersForSession: vi.fn().mockResolvedValue([]),
 }));
 
@@ -78,6 +73,7 @@ const mockMCPServerRepo = {
 
 describe('OpenCodeTool', () => {
   beforeEach(() => {
+    process.env.DAEMON_URL = 'http://localhost:3030';
     clientCreateCount = 0;
     createdClients.length = 0;
     mockMcpAddCalls.length = 0;
@@ -401,7 +397,7 @@ describe('OpenCodeTool', () => {
 
     it('should inject user-defined MCP servers via getMcpServersForSession', async () => {
       // Import the mock to control its return value
-      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const { getMcpServersForSession } = await import('@agor/core/mcp');
       const mockGetMcp = vi.mocked(getMcpServersForSession);
 
       // Set up mock to return user-defined servers
@@ -472,7 +468,7 @@ describe('OpenCodeTool', () => {
     });
 
     it('should sanitize MCP server names to lowercase alphanumeric', async () => {
-      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const { getMcpServersForSession } = await import('@agor/core/mcp');
       const mockGetMcp = vi.mocked(getMcpServersForSession);
 
       mockGetMcp.mockResolvedValueOnce([
@@ -533,7 +529,7 @@ describe('OpenCodeTool', () => {
       await (tool as any).ensureMcpServers('session-no-repos', client, 'token');
 
       // Only Agor MCP should be injected (if token provided), no user MCP calls
-      const { getMcpServersForSession } = await import('../base/mcp-scoping.js');
+      const { getMcpServersForSession } = await import('@agor/core/mcp');
       expect(getMcpServersForSession).not.toHaveBeenCalled();
     });
 
