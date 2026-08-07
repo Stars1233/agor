@@ -370,7 +370,13 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
           executionOwnerId: data.created_by as import('@agor/core/types').UserID | undefined,
         });
       } catch (error) {
-        if (!isInvalidModelConfigError(error) || configurationReference) throw error;
+        const shouldUseCatalogFallback =
+          isInvalidModelConfigError(error) &&
+          (!configurationReference ||
+            isAgenticToolDefaultConfigurationReference(configurationReference));
+        if (!shouldUseCatalogFallback) {
+          throw error;
+        }
         const modelFallback = await this.resolveDirectCreateModelFallback(
           agenticTool,
           data as CreateSessionInput,
