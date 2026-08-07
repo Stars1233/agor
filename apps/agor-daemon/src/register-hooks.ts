@@ -129,6 +129,7 @@ import {
   loadSession,
   loadSessionBranch,
   resolveSessionContext,
+  scopeFindToAccessibleBoards,
   scopeFindToAccessibleBoardsSql,
   scopeFindToAccessibleBranchesSql,
   scopeFindToAccessibleSessionsSql,
@@ -1073,6 +1074,11 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   safeService('cards')?.hooks({
     before: {
       all: [requireAuth],
+      find: [
+        ...(branchRbacEnabled
+          ? [scopeFindToAccessibleBoards(new BoardRepository(db), superadminOpts)]
+          : []),
+      ],
       create: [requireMinimumRole(ROLES.MEMBER, 'create cards'), injectCreatedBy()],
       patch: [requireMinimumRole(ROLES.MEMBER, 'update cards')],
       remove: [requireMinimumRole(ROLES.MEMBER, 'delete cards')],
