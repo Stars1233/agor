@@ -135,7 +135,8 @@ export interface TaskMetadata {
    * paths race.
    */
   callback_dispatches?: Array<{
-    event: 'session_completion';
+    /** `session_completion` is retained for callbacks recorded before task-level callbacks existed. */
+    event: 'task_completion' | 'session_completion';
     target_session_id: SessionID;
     queued_task_id?: TaskID;
     dispatched_at: string;
@@ -160,6 +161,17 @@ export interface TaskMetadata {
    * process-local message identity.
    */
   initial_message_id?: MessageID;
+
+  /**
+   * Immutable one-shot completion callback requested for this exact task.
+   * The MCP prompt tool derives both identities from trusted request context;
+   * callers cannot nominate an arbitrary destination.
+   */
+  completion_callback?: {
+    target_session_id: SessionID;
+    requested_from_session_id: SessionID;
+    requested_by_user_id: string;
+  };
 }
 
 /**

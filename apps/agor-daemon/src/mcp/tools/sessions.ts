@@ -696,11 +696,38 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
             'MCP server IDs for subsession mode. Overrides parent inheritance. Omit to inherit from parent. Pass empty array for no MCPs.'
           ),
         modelConfig: modelConfigInputSchema,
+        callback: z
+          .boolean()
+          .optional()
+          .describe(
+            'Send a one-shot completion report for the exact prompted task back to the current calling Agor session.'
+          ),
       }),
     },
     async (args) => {
       const mode = args.mode;
       const sessionId = await resolveSessionId(ctx, args.sessionId);
+      if (args.callback && !ctx.sessionId) return sessionContextRequiredResult();
+      if (args.callback) {
+        await runWithMcpTenantDatabaseScope(ctx, (db) =>
+          ensureCanPromptTargetSession(
+            ctx.sessionId!,
+            ctx.userId,
+            ctx.app,
+            new BranchRepository(db)
+          )
+        );
+      }
+      const callbackParams = args.callback
+        ? {
+            ...ctx.baseServiceParams,
+            _taskCompletionCallback: {
+              target_session_id: ctx.sessionId!,
+              requested_from_session_id: ctx.sessionId!,
+              requested_by_user_id: ctx.userId,
+            },
+          }
+        : ctx.baseServiceParams;
 
       if (mode === 'continue') {
         // The prompt route returns the Task entity directly. Whether it ran
@@ -710,7 +737,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
           .service('/sessions/:id/prompt')
           .create(
             { prompt: args.prompt, stream: true },
-            { ...ctx.baseServiceParams, route: { id: sessionId } }
+            { ...callbackParams, route: { id: sessionId } }
           );
 
         if (task.status === 'queued') {
@@ -784,7 +811,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
             permissionMode: updatedSession.permission_config?.mode,
             stream: true,
           },
-          { ...ctx.baseServiceParams, route: { id: forkedSession.session_id } }
+          { ...callbackParams, route: { id: forkedSession.session_id } }
         );
 
         const note =
@@ -818,7 +845,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
             permissionMode: childSession.permission_config?.mode,
             stream: true,
           },
-          { ...ctx.baseServiceParams, route: { id: childSession.session_id } }
+          { ...callbackParams, route: { id: childSession.session_id } }
         );
 
         return textResult({
@@ -972,7 +999,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
           .enum(['once', 'persistent'])
           .optional()
           .describe(
-            'Callback firing mode: "once" (default) fires on first completion then auto-disables, "persistent" fires on every completion'
+            'Callback firing mode: "persistent" (default) fires on every completion until unlinked, "once" fires on the first completion then auto-disables'
           ),
         parentSessionId: z
           .string()
@@ -1029,10 +1056,10 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
       if (wantsCallback && !effectiveCallbackSessionId) return sessionContextRequiredResult();
 
       // Validate user has prompt permission on the callback target session's branch
-      if (wantsCallback && args.callbackSessionId) {
+      if (wantsCallback && effectiveCallbackSessionId) {
         await runWithMcpTenantDatabaseScope(ctx, (db) =>
           ensureCanPromptTargetSession(
-            args.callbackSessionId!,
+            effectiveCallbackSessionId,
             ctx.userId,
             ctx.app,
             new BranchRepository(db)
@@ -1055,7 +1082,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
         callbackConfig.include_original_prompt = args.includeOriginalPrompt;
       }
       if (wantsCallback) {
-        callbackConfig.callback_mode = args.callbackMode ?? 'once';
+        callbackConfig.callback_mode = args.callbackMode ?? 'persistent';
       }
 
       // Determine the parent session to link to in the genealogy.
