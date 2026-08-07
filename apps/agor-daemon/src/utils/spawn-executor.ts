@@ -105,6 +105,7 @@ export interface ExecutorTemplateVariables {
   session_id?: string;
   branch_id?: string;
   log_level?: string;
+  executor_type?: string;
   /**
    * Trusted runtime tenant identity. This is populated from the ambient tenant
    * context, shell-escaped during substitution, and is not caller-overridable
@@ -235,6 +236,7 @@ export function substituteTemplateVariables(
     session_id: variables.session_id,
     branch_id: variables.branch_id,
     log_level: variables.log_level,
+    executor_type: variables.executor_type,
     tenant_id: variables.tenant_id,
   };
 
@@ -351,6 +353,7 @@ export function spawnExecutor(
         task_id: generateTaskId(),
         unix_user: asUser,
         log_level: resolveExecutorLogLevel(options.env ?? (process.env as Record<string, string>)),
+        executor_type: 'executor',
         ...templateVariables,
         tenant_id: tenantId,
       },
@@ -1030,6 +1033,7 @@ export async function runExecutorCommand(
         task_id: generateTaskId(),
         unix_user: asUser,
         log_level: resolveExecutorLogLevel(options.env ?? (process.env as Record<string, string>)),
+        executor_type: 'executor',
         ...templateVariables,
         tenant_id: tenantId,
       },

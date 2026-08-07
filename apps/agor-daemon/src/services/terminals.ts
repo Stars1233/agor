@@ -622,6 +622,7 @@ export class TerminalsService {
             // insulated/strict, the caller's unix_username in delegated (no
             // sudo), and unset in simple.
             unix_user: impersonationResult.reportedUnixUser || undefined,
+            executor_type: 'shell',
           },
           // Clean up map when executor exits (handles crashes too)
           onExit: () => this.handleExecutorExit(userId),
