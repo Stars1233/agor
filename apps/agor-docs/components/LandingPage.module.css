@@ -1342,6 +1342,7 @@
 .showcaseTrack {
   display: flex;
   width: 400%;
+  transform: var(--showcase-transform);
   transition: transform 0.55s cubic-bezier(0.65, 0, 0.35, 1);
 }
 
