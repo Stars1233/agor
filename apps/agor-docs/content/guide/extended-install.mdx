@@ -27,6 +27,133 @@ Homebrew is a convenience path for macOS/Linux users; npm remains the canonical 
 
 ---
 
+## Agentic tools
+
+Agor keeps its base installation small by installing only the agentic tools you choose. Each tool is
+an isolated, version-aligned package with the exact same version as Agor. Those packages pin the vendor SDK and the matching runtime expected
+by that SDK, so Agor never guesses whether an unrelated executable from your shell is compatible.
+
+The normal setup remains:
+
+```bash
+npm install -g agor-live@latest
+agor init
+```
+
+During `agor init`, select any agentic tools you want installed. The choice is explicit: the original
+npm installation never downloads optional runtimes, and initialization shows the selection before
+running npm. You can skip everything and add tools later:
+
+```bash
+agor install claude
+agor install claude codex
+agor install gemini
+```
+
+`agor install` uses your configured npm registry, proxy, authentication, and integrity verification,
+but installs into Agor's private runtime directory rather than changing global npm state. Installation
+is staged and swapped into place only after the exact Agor package version is verified. It does not
+replace Claude, Codex, or other tools you may already use from your terminal.
+
+Inspect the managed integrations at any time:
+
+```bash
+agor agentic-tools
+agor doctor
+```
+
+An absent integration does not prevent Agor from starting. Selecting that tool for a session produces
+an actionable error with the corresponding `agor install` command.
+
+| Agentic tool | Install command | Managed package |
+| --- | --- | --- |
+| Claude Code | `agor install claude` | `@agor/claude` |
+| Codex | `agor install codex` | `@agor/codex` |
+| Gemini | `agor install gemini` | `@agor/gemini` |
+| GitHub Copilot | `agor install copilot` | `@agor/copilot` |
+| OpenCode | `agor install opencode` | `@agor/opencode` |
+| Cursor | `agor install cursor` | `@agor/cursor` |
+
+For automated images and CI, run the same noninteractive commands after installing Agor:
+
+```bash
+npm install -g agor-live@latest
+agor install claude codex
+```
+
+Set `AGOR_AGENTIC_TOOLS_DIR` when integrations must live in an administrator-provisioned shared
+read-only location. Executors receive the resolved absolute directory across Agor's supported Unix
+identity modes; every executing user must be able to traverse and read that directory.
+
+Run `agor install` as the user the daemon runs as. Integrations install under that user's home
+directory, so installing them with `sudo` places them in root's home where the daemon cannot see
+them — `agor doctor` then reports them as missing. Set `AGOR_AGENTIC_TOOLS_DIR` explicitly when the
+daemon and its executors run as different users.
+
+### Upgrading
+
+Managed integrations are installed per Agor version, so upgrading Agor leaves the previous version's
+integrations behind and the new version starts with none. Reinstall the tools you use, naming them
+explicitly, and confirm the result:
+
+```bash
+npm install -g agor-live@latest
+agor install claude codex
+agor doctor
+```
+
+Naming the tools is the form to script against. It depends on nothing Agor recorded previously, so
+it behaves identically on a fresh machine, after skipping several versions, and in an
+immutable-infrastructure image built from scratch.
+
+On a machine that already had integrations installed, `--restore` reinstalls whatever the previous
+version had, as a convenience for interactive upgrades:
+
+```bash
+agor install --restore
+```
+
+On a machine with nothing installed it reports that there is nothing to restore and exits
+successfully, so it is safe to leave in an unattended script — but a fresh or rebuilt host has no
+previous version to read, so provisioning must still name its tools.
+
+Integrations from older versions are kept until you remove them. Reclaim that space with `--prune`,
+which deletes managed directories belonging to every version except the one you are running:
+
+```bash
+agor install --prune
+```
+
+Microsoft Teams gateway support remains optional and separate from agentic tools:
+
+```bash
+npm install -g agor-live@latest botbuilder@^4.23.3
+```
+
+Credentials are configured in **Settings → Agentic Tools** after the runtime is installed; Teams
+credentials are configured with the gateway channel.
+
+---
+
+## npm reports `EMFILE` after a cache cleanup
+
+A cold npm cache makes npm fetch, cache, and extract many packages concurrently. On systems with a
+low open-file limit this can fail with `EMFILE`, `ENFILE`, or `TAR_ENTRY_ERROR`, even when the same
+install succeeds with a warm cache. Check the current limit with `ulimit -n`.
+
+Prefer raising the limit for the install. If that is unavailable, reducing npm's network concurrency
+also reduces concurrent cache writes:
+
+```bash
+npm_config_maxsockets=8 npm install -g agor-live@latest
+```
+
+Re-running the same npm command is safe; npm reuses the cache entries completed by the first attempt.
+If the error persists, collect `node -v`, `npm -v`, `ulimit -Sn`, `ulimit -Hn`, `npm cache path`,
+`df -h`, and `df -i` when reporting it.
+
+---
+
 ## Optional: Zellij (for the web terminal)
 
 Agor has a built-in web terminal that uses [Zellij](https://zellij.dev/) for persistent, multiplexed terminal sessions. The terminal is **optional**. Agor runs fine without it; if you don't have Zellij, terminal buttons in the UI will show a friendly message instead.

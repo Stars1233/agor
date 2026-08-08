@@ -1,11 +1,15 @@
 /**
  * @agor/core/sdk - Centralized AI SDK re-exports
  *
- * All AI SDK dependencies are managed in @agor/core to:
+ * Shared, always-bundled AI SDK dependencies are managed in @agor/core to:
  * - Ensure version consistency across the monorepo
  * - Centralize peer dependency management (zod, OpenTelemetry, etc.)
  * - Enable re-use across packages (executor, daemon, CLI, UI)
  * - Simplify dependency management
+ *
+ * Optional integrations such as Gemini and Cursor are owned and loaded by
+ * their executor or daemon integration module so they do not inflate every
+ * agor-live installation.
  *
  * Usage:
  *   import { Claude } from '@agor/core/sdk';
@@ -31,10 +35,6 @@ export type {
 } from '@anthropic-ai/claude-agent-sdk';
 // Claude Agent SDK - namespace export
 export * as Claude from '@anthropic-ai/claude-agent-sdk';
-// Gemini CLI SDK
-export * as Gemini from '@google/gemini-cli-core';
-// Google GenAI SDK
-export * as GenAI from '@google/genai';
 // Codex SDK - direct type exports for convenience
 export type { CodexOptions, Thread, ThreadItem } from '@openai/codex-sdk';
 // Codex SDK - namespace export
