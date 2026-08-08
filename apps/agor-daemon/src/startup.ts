@@ -7,9 +7,10 @@
 
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import type { AgorConfig } from '@agor/core/config';
 import {
+  type AgorConfig,
   getAgorHome,
+  resolveDeploymentAgenticToolPolicy,
   resolveDispatchConnectTimeoutMs,
   resolveExecutorHeartbeatConfig,
   resolveMultiTenancyConfig,
@@ -531,19 +532,16 @@ export function runPostStartJob(name: string, job: () => Promise<void> | void): 
 // ---------------------------------------------------------------------------
 
 async function ensureMasterSecret(config: AgorConfig): Promise<void> {
-  // AGOR_MASTER_SECRET: env > existing config value > generate-and-persist >
-  // fail-fast. See setup/persisted-secret.ts and the doc §1.5 (H3).
+  // AGOR_MASTER_SECRET: env > existing config value > fail-fast.
   //
   // Same fail-fast reasoning as the JWT path: a fresh master secret on every
   // restart corrupts every stored encrypted API key.
-  const { randomBytes } = await import('node:crypto');
   const { resolvePersistedSecret } = await import('./setup/persisted-secret.js');
   const resolution = await resolvePersistedSecret({
     name: 'AGOR_MASTER_SECRET (API key encryption)',
     envVar: 'AGOR_MASTER_SECRET',
     existing: config.daemon?.masterSecret,
     configKey: 'daemon.masterSecret',
-    generate: () => randomBytes(32).toString('hex'),
   });
   // Side effect: downstream code (encrypted-creds resolver, etc.) reads this
   // off process.env, not off a parameter. Keep that contract.
@@ -554,10 +552,6 @@ async function ensureMasterSecret(config: AgorConfig): Promise<void> {
       break;
     case 'config':
       console.log('🔐 Using saved AGOR_MASTER_SECRET from config');
-      break;
-    case 'generated':
-      console.log('🔐 Generated and saved AGOR_MASTER_SECRET for API key encryption');
-      console.log('   Secret stored in ~/.agor/config.yaml');
       break;
   }
 }
@@ -734,6 +728,7 @@ export async function startup(ctx: StartupContext): Promise<void> {
   {
     const multiTenancy = resolveMultiTenancyConfig(config);
     schedulerService = new SchedulerService(db, app, {
+      deploymentPolicy: resolveDeploymentAgenticToolPolicy(config),
       tickInterval: 30000, // 30 seconds
       gracePeriod: 120000, // 2 minutes
       unixUserMode: config.execution?.unix_user_mode ?? 'simple',

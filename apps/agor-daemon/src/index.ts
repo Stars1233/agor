@@ -22,7 +22,6 @@ import {
   configureOpenSourceTelemetryLogger,
   loadOpenSourceTelemetryAgorVersion,
   openSourceTelemetryLogger,
-  pruneDefaultOpenSourceTelemetryDestination,
 } from '@agor/core/telemetry';
 import { patchConsole } from '@agor/core/utils/logger';
 import { UI_MOUNT_PATH } from '@agor/core/utils/url';
@@ -34,10 +33,10 @@ import {
   loadConfig,
   loadConfigFromFile,
   renderGitConfigParametersForLog,
+  resolveEffectiveConfig,
   resolveGitConfigParameters,
   resolveMultiTenancyConfig,
   resolveSecurity,
-  saveConfig,
 } from '@agor/core/config';
 import { generateId, getDatabaseUrl } from '@agor/core/db';
 import {
@@ -59,6 +58,7 @@ import { createRequireAuthHook } from './auth/require-auth.js';
 import { registerHooks } from './register-hooks.js';
 import { registerRoutes } from './register-routes.js';
 import { registerServices } from './register-services.js';
+import { assertConfiguredAgenticToolsAligned } from './setup/agentic-tool-alignment.js';
 import { loadBuildInfo } from './setup/build-info.js';
 import { createDynamicCompressionMiddleware } from './setup/compression.js';
 import { buildCorsConfig, isSandpackOrigin } from './setup/cors.js';
@@ -163,6 +163,15 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
       ? await loadConfigFromFile(options.configPath)
       : await loadConfig();
 
+  // Deployment environment overrides are resolved in memory. Container and
+  // Kubernetes entrypoints must never materialize them back into config.yaml.
+  config = resolveEffectiveConfig(config);
+
+  // Deployment package availability is instance-global. Validate it before
+  // database or tenant initialization so no tenant can expand the daemon's
+  // installed-code surface and a broken upgrade never starts listening.
+  await assertConfiguredAgenticToolsAligned(config);
+
   const multiTenancy = resolveMultiTenancyConfig(config);
   console.log(
     `🏢 Multi-tenancy: mode=${multiTenancy.mode} tenant=${multiTenancy.mode === 'static' ? multiTenancy.static_tenant_id : 'auth-resolved'}`
@@ -189,15 +198,12 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // plugins are optional dynamic imports and must never prevent daemon startup.
   await configureAnalyticsLogger(config);
   const envTelemetryConfig = ensureOpenSourceTelemetryEnvEnabledConfig(config);
-  if (envTelemetryConfig.changed) {
-    config = envTelemetryConfig.config;
-    await saveConfig(pruneDefaultOpenSourceTelemetryDestination(config));
-  }
+  if (envTelemetryConfig.changed) config = envTelemetryConfig.config;
   configureOpenSourceTelemetryLogger(config);
   if (config.telemetry?.enabled === undefined) {
     console.warn(
       'ℹ  Community telemetry is not configured; no telemetry will be sent. ' +
-        'Run `agor telemetry on` to enable or `agor telemetry off` to dismiss.'
+        'Set AGOR_TELEMETRY=1/0 or edit telemetry.enabled in operator-managed config.yaml.'
     );
   }
 
@@ -250,7 +256,7 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // --------------------------------------------------------------------------
   const envPort = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : undefined;
   const DAEMON_PORT = envPort ?? config.daemon?.port ?? 3030;
-  const DAEMON_HOST = config.daemon?.host ?? 'localhost';
+  const DAEMON_HOST = process.env.DAEMON_HOST ?? config.daemon?.host ?? 'localhost';
 
   const envUiPort = process.env.UI_PORT ? Number.parseInt(process.env.UI_PORT, 10) : undefined;
   const UI_PORT = envUiPort || config.ui?.port || 5173;
@@ -539,20 +545,17 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // --------------------------------------------------------------------------
   app.configure(rest());
 
-  // JWT secret: env > existing config value > generate-and-persist >
-  // fail-fast with operator-actionable remediation. See setup/persisted-secret.ts
+  // JWT secret: env > existing config value > fail-fast with operator-actionable remediation.
   // and context/explorations/daemon-fs-decoupling.md §1.5 (H3).
   //
   // Failing-fast is critical: a fresh JWT secret on every restart invalidates
   // every issued token, which silently breaks every active session.
-  const crypto = await import('node:crypto');
   const { resolvePersistedSecret } = await import('./setup/persisted-secret.js');
   const jwtResolution = await resolvePersistedSecret({
     name: 'JWT secret',
     envVar: 'AGOR_JWT_SECRET',
     existing: config.daemon?.jwtSecret,
     configKey: 'daemon.jwtSecret',
-    generate: () => crypto.randomBytes(32).toString('hex'),
   });
   const jwtSecret = jwtResolution.value;
   // SECURITY: never log any prefix/substring of the secret. Length only.
@@ -562,11 +565,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
       break;
     case 'config':
       console.log(`🔑 Loaded JWT secret from config (length=${jwtSecret.length})`);
-      break;
-    case 'generated':
-      console.log(
-        `🔑 Generated and saved persistent JWT secret to config (length=${jwtSecret.length})`
-      );
       break;
   }
 
@@ -653,17 +651,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
       });
     }
     startOpenSourceTelemetryUsageSummaryInterval(db, { tenantId: multiTenancy.static_tenant_id });
-    config.telemetry = {
-      ...config.telemetry,
-      last_reported_version: TELEMETRY_AGOR_VERSION,
-      ...(daemonActive.shouldEmit ? { last_daemon_active_day: daemonActive.day } : {}),
-    };
-    saveConfig(pruneDefaultOpenSourceTelemetryDestination(config)).catch((error) => {
-      console.warn(
-        '[telemetry] failed to persist daemon telemetry state:',
-        error instanceof Error ? error.message : String(error)
-      );
-    });
   }
 
   // --------------------------------------------------------------------------

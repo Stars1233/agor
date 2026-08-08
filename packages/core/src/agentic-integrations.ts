@@ -35,6 +35,13 @@ export const AGENTIC_TOOL_INTEGRATIONS = {
 
 export type InstallableAgenticTool = keyof typeof AGENTIC_TOOL_INTEGRATIONS;
 
+export function resolveManagedAgenticToolVersion(
+  fallback?: string,
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  return env.AGOR_VERSION ?? env.AGOR_INTEGRATION_VERSION ?? fallback;
+}
+
 export function isInstallableAgenticTool(value: string): value is InstallableAgenticTool {
   return Object.hasOwn(AGENTIC_TOOL_INTEGRATIONS, value);
 }
@@ -63,6 +70,14 @@ export type ManagedAgenticToolIntegration<T = unknown> = {
   AGOR_INTEGRATION_VERSION?: string;
   sdk?: T;
   sdkV2?: unknown;
+};
+
+export type ManagedAgenticToolAlignment = {
+  tool: InstallableAgenticTool;
+  displayName: string;
+  expectedVersion: string;
+  status: 'ready' | 'missing-or-invalid';
+  detail?: string;
 };
 
 async function findInstalledPackageDirectory(
@@ -122,13 +137,46 @@ export async function resolveManagedAgenticToolIntegration<T>(
   return import(pathToFileURL(integrationEntry).href) as Promise<ManagedAgenticToolIntegration<T>>;
 }
 
+/** Inspect the deployment-configured integrations without mutating disk. */
+export async function inspectManagedAgenticToolAlignment(
+  tools: readonly InstallableAgenticTool[],
+  agorVersion: string
+): Promise<ManagedAgenticToolAlignment[]> {
+  return Promise.all(
+    tools.map(async (tool) => {
+      const definition = AGENTIC_TOOL_INTEGRATIONS[tool];
+      try {
+        const integration = await resolveManagedAgenticToolIntegration(tool, agorVersion);
+        if (integration.AGOR_INTEGRATION_VERSION !== agorVersion || !integration.sdk) {
+          throw new Error(
+            `integration reports ${integration.AGOR_INTEGRATION_VERSION ?? 'no version'}`
+          );
+        }
+        return {
+          tool,
+          displayName: definition.displayName,
+          expectedVersion: agorVersion,
+          status: 'ready' as const,
+        };
+      } catch (error) {
+        return {
+          tool,
+          displayName: definition.displayName,
+          expectedVersion: agorVersion,
+          status: 'missing-or-invalid' as const,
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+    })
+  );
+}
+
 /**
  * Load an SDK from Agor's isolated, version-aligned integration tree.
  * Source checkouts use workspace dependencies unless managed mode is explicitly enabled.
  */
 export async function loadManagedAgenticToolSdk<T>(tool: InstallableAgenticTool): Promise<T> {
   const definition = AGENTIC_TOOL_INTEGRATIONS[tool];
-  const installSlug = tool === 'claude-code' ? 'claude' : tool;
   if (process.env.AGOR_MANAGED_AGENTIC_TOOLS !== '1') {
     return import(definition.vendorPackage) as Promise<T>;
   }
@@ -140,12 +188,12 @@ export async function loadManagedAgenticToolSdk<T>(tool: InstallableAgenticTool)
     integration = await resolveManagedAgenticToolIntegration<T>(tool, agorVersion);
   } catch {
     throw new Error(
-      `${definition.displayName} support is not installed for Agor ${agorVersion}. Run: agor install ${installSlug}`
+      `${definition.displayName} support is not installed for Agor ${agorVersion}. Add ${tool} to config.yaml agentic_tools.installed, then run: agor install`
     );
   }
   if (integration.AGOR_INTEGRATION_VERSION !== agorVersion || !integration.sdk) {
     throw new Error(
-      `${definition.displayName} support does not match Agor ${agorVersion}. Run: agor install ${installSlug}`
+      `${definition.displayName} support does not match Agor ${agorVersion}. Run: agor install`
     );
   }
   return integration.sdk;
