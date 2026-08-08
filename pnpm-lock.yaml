@@ -88,6 +88,9 @@ importers:
       lint-staged:
         specifier: ^17.2.0
         version: 17.3.0
+      postgres:
+        specifier: ^3.4.9
+        version: 3.4.9
       prettier:
         specifier: ^3.9.6
         version: 3.9.6
