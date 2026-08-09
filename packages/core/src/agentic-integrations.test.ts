@@ -4,7 +4,10 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   getAgenticToolInstallDir,
+  getAgenticToolSelectionManifestPath,
+  InvalidAgenticToolSelectionManifestError,
   loadManagedAgenticToolSdk,
+  resolveAgenticToolSelectionPolicy,
   resolveManagedAgenticToolPackageDirectory,
 } from './agentic-integrations.js';
 
@@ -111,7 +114,9 @@ describe('managed agentic tool loading', () => {
       await rm(vendorDirectory, { recursive: true });
       await symlink(outside, vendorDirectory, 'dir');
 
-      await expect(loadManagedAgenticToolSdk('claude-code')).rejects.toThrow('run: agor install');
+      await expect(loadManagedAgenticToolSdk('claude-code')).rejects.toThrow(
+        'Run: agor install --sync'
+      );
     }
   );
 
@@ -141,6 +146,45 @@ describe('managed agentic tool loading', () => {
     process.env.AGOR_MANAGED_AGENTIC_TOOLS = '1';
     process.env.AGOR_VERSION = '1.2.5';
 
-    await expect(loadManagedAgenticToolSdk('claude-code')).rejects.toThrow('run: agor install');
+    await expect(loadManagedAgenticToolSdk('claude-code')).rejects.toThrow(
+      'Run: agor install --sync'
+    );
+  });
+});
+
+describe('agentic tool selection policy', () => {
+  it('treats an explicit empty YAML list as declarative', async () => {
+    await expect(
+      resolveAgenticToolSelectionPolicy({ agentic_tools: { installed: [] } })
+    ).resolves.toEqual({ mode: 'declarative', selected: [], source: 'config.yaml' });
+  });
+
+  it('distinguishes a missing local manifest from an invalid one', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agor-agentic-policy-'));
+    temporaryDirectories.push(root);
+    process.env.AGOR_AGENTIC_TOOLS_DIR = root;
+    await expect(resolveAgenticToolSelectionPolicy({})).resolves.toEqual({
+      mode: 'local-managed',
+      selected: [],
+      source: 'missing-manifest',
+    });
+
+    await writeFile(getAgenticToolSelectionManifestPath(), '{not-json');
+    await expect(resolveAgenticToolSelectionPolicy({})).rejects.toBeInstanceOf(
+      InvalidAgenticToolSelectionManifestError
+    );
+  });
+
+  it('rejects unsupported schemas and unknown tools', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agor-agentic-policy-'));
+    temporaryDirectories.push(root);
+    process.env.AGOR_AGENTIC_TOOLS_DIR = root;
+    await writeFile(
+      getAgenticToolSelectionManifestPath(),
+      JSON.stringify({ schemaVersion: 2, installed: ['unknown'] })
+    );
+    await expect(resolveAgenticToolSelectionPolicy({})).rejects.toThrow(
+      'unsupported schema or tool selection'
+    );
   });
 });
