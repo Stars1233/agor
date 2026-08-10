@@ -22,6 +22,8 @@ describe('realtime routing boundary', () => {
       'cursor-left',
       'presence-updated',
       'repo:cloneError',
+      'oauth:completed',
+      'oauth:disconnected',
     ]);
     const target = { emit: vi.fn() };
     emitHaNativeSocketEvent(target, 'cursor-left', {

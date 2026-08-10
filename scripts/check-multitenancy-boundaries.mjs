@@ -38,10 +38,9 @@ const checks = [
     // tenant-aware realtime facade instead of adding more raw emits/rooms.
     baseline: {
       'apps/agor-daemon/src/register-hooks.ts': 1,
-      // Remaining direct OAuth emits are narrowed to server-resolved
-      // tenant+user rooms (or an initiating socket); two global fallbacks were
-      // removed by the HA realtime containment work.
-      'apps/agor-daemon/src/register-services.ts': 9,
+      // OAuth HA hints use the audited native-event inventory; authorization
+      // URLs and standalone socket hints are explicitly local-only.
+      'apps/agor-daemon/src/register-services.ts': 5,
       // HA fork/spawn now use the tenant-aware Feathers event helper instead
       // of raw global Socket.IO broadcasts.
       'apps/agor-daemon/src/register-routes.ts': 6,
@@ -62,7 +61,7 @@ const checks = [
       // Raw Socket.IO presence/user rooms are deliberately centralized here.
       // Every join/leave/broadcast is tenant-namespaced, including logout
       // cleanup, and cross-tenant negative tests cover same user/board IDs.
-      'apps/agor-daemon/src/setup/socketio.ts': 20,
+      'apps/agor-daemon/src/setup/socketio.ts': 15,
     },
   },
 

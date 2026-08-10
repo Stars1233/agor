@@ -44,18 +44,24 @@ describe('buildTenantInsertOrder', () => {
     }
   });
 
-  it('deletes but never exports transient bearer-token authority', () => {
+  it('deletes but never exports transient authorities or deployment-bound OAuth grants', () => {
     const nonPortable = nonPortableTenantTableNames();
-    expect(nonPortable).toEqual(['executor_session_token_authorities']);
-    expect(buildTenantDeletionManifest().map((entry) => entry.name)).toContain(nonPortable[0]);
-    expect(buildTenantInsertOrder().map((entry) => entry.name)).not.toContain(nonPortable[0]);
+    expect(nonPortable).toEqual([
+      'executor_session_token_authorities',
+      'mcp_oauth_pending_flows',
+      'user_mcp_oauth_tokens',
+    ]);
+    for (const table of nonPortable) {
+      expect(buildTenantDeletionManifest().map((entry) => entry.name)).toContain(table);
+      expect(buildTenantInsertOrder().map((entry) => entry.name)).not.toContain(table);
+    }
   });
 });
 
 describe('tenantPortabilityForeignKeys', () => {
   it('freezes the exact schema-derived movable FK set', () => {
     const foreignKeys = tenantPortabilityForeignKeys();
-    expect(foreignKeys).toHaveLength(94);
+    expect(foreignKeys).toHaveLength(92);
     expect(Object.isFrozen(foreignKeys)).toBe(true);
     const structuralKeys = foreignKeys.map((foreignKey) =>
       [
@@ -71,6 +77,12 @@ describe('tenantPortabilityForeignKeys', () => {
       expect(Object.isFrozen(foreignKey.childColumns)).toBe(true);
       expect(Object.isFrozen(foreignKey.parentColumns)).toBe(true);
     }
+  });
+
+  it('does not classify deployment-bound MCP OAuth grant relations as movable', () => {
+    expect(tenantPortabilityForeignKeys()).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ childTable: 'user_mcp_oauth_tokens' })])
+    );
   });
 
   it('moves inbound event relations with their channel, Session, and Task', () => {
