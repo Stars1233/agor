@@ -30,6 +30,10 @@ import { getDaemonUrl } from '../../config.js';
 import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
 import type { ResolvedConfigSlice } from '../../payload-types.js';
 import type { StreamingCallbacks } from '../../sdk-handlers/base/types.js';
+import {
+  collectWithheldMcpServers,
+  reportWithheldMcpServers,
+} from '../../sdk-handlers/base/withheld-mcp-report.js';
 import type { AgorClient } from '../../services/feathers-client.js';
 import {
   captureGitStateAtTaskEnd,
@@ -189,6 +193,7 @@ async function resolveCursorApiKey(client: AgorClient, taskId: TaskID): Promise<
 
 async function buildCursorMcpServers(args: {
   sessionId: SessionID;
+  taskId: TaskID;
   mcpToken?: string;
   repos: ReturnType<typeof createFeathersBackedRepositories>;
   forUserId?: string;
@@ -208,11 +213,24 @@ async function buildCursorMcpServers(args: {
     };
   }
 
-  const serversWithSource = await getMcpServersForSession(args.sessionId, {
-    sessionMCPRepo: args.repos.sessionMCP,
-    mcpServerRepo: args.repos.mcpServers,
-    mcpOAuthAuthHeadersRepo: args.repos.mcpOAuthAuthHeaders,
-    forUserId: args.forUserId,
+  const reporter = collectWithheldMcpServers();
+  const serversWithSource = await getMcpServersForSession(
+    args.sessionId,
+    {
+      sessionMCPRepo: args.repos.sessionMCP,
+      mcpServerRepo: args.repos.mcpServers,
+      mcpOAuthAuthHeadersRepo: args.repos.mcpOAuthAuthHeaders,
+      forUserId: args.forUserId,
+      onServerWithheld: reporter.onServerWithheld,
+    },
+    // Cursor's MCP config carries no per-tool filter, so a server with gated
+    // tools cannot be honoured and is withheld whole.
+    { toolFiltering: 'none' }
+  );
+  await reportWithheldMcpServers(args.repos.messages, {
+    sessionId: args.sessionId,
+    taskId: args.taskId,
+    withheld: reporter.withheld,
   });
 
   for (const { server } of serversWithSource) {
@@ -478,6 +496,7 @@ export async function executeCursorTask(params: {
     const model = toCursorModel(configuredModel);
     const mcpServers = await buildCursorMcpServers({
       sessionId,
+      taskId,
       mcpToken: session.mcp_token,
       repos,
       forUserId: session.created_by,
