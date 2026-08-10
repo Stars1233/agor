@@ -67,6 +67,7 @@ import { buildCorsConfig, isSandpackOrigin } from './setup/cors.js';
 import { initializeDatabase } from './setup/database.js';
 import { initializeDistributedWorkIdentity } from './setup/distributed-work-identity.js';
 import { warnDeprecatedConfig } from './setup/first-run-admin.js';
+import { resolveMasterSecretIntoEnv } from './setup/master-secret.js';
 import { securityHeaders } from './setup/security-headers.js';
 import { configureChannels, createSocketIOConfig } from './setup/socketio.js';
 import { setBundledUiFallbackHeaders, setBundledUiStaticHeaders } from './setup/static-assets.js';
@@ -585,6 +586,19 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
       break;
   }
 
+  // AGOR_MASTER_SECRET: resolve BEFORE Phase 1 (registerServices). Several
+  // services — notably MCPOAuthPendingFlowAuthority on the PostgreSQL path —
+  // are constructed eagerly during registration and read the secret off
+  // process.env in their constructor. Resolving it here (rather than later in
+  // startup()) is what lets deployments that keep the secret in config.yaml
+  // (daemon.masterSecret), not an env var, boot on Postgres.
+  const masterSecretSource = await resolveMasterSecretIntoEnv(config);
+  console.log(
+    masterSecretSource === 'env'
+      ? '🔐 API key encryption enabled (AGOR_MASTER_SECRET set)'
+      : '🔐 Using saved AGOR_MASTER_SECRET from config'
+  );
+
   // HA is unavailable without Redis. Establish both adapter clients before
   // constructing Socket.IO or accepting any HTTP traffic.
   await realtimeRuntime?.connect();
@@ -616,6 +630,13 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     tenantId: multiTenancy.mode === 'static' ? multiTenancy.static_tenant_id : undefined,
     requireTenantScope: multiTenancy.mode === 'required_from_auth',
     skipFirstRunAdminBootstrap: config.external_launch?.enabled === true,
+    // The URL may come from DATABASE_URL, but operators still need to size the
+    // per-replica pool from config.yaml. Keep this deliberately limited to max:
+    // the public idleTimeout setting is documented in milliseconds while the
+    // postgres.js client boundary uses seconds, and `min` is not implemented.
+    pool: config.database?.postgresql?.pool?.max
+      ? { max: config.database.postgresql.pool.max }
+      : undefined,
   });
   configureUploadStagingStoreFromConfig(config, undefined, db);
 
