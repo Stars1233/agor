@@ -827,7 +827,7 @@ describe('CodexPromptService - forked sessions', () => {
       threadId: 'forked-thread-id',
     });
     expect(mockResumeThreadOptions.at(-1)).toMatchObject({
-      modelReasoningEffort: 'xhigh',
+      modelReasoningEffort: 'max',
     });
   });
 });

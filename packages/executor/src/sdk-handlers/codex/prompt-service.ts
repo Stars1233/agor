@@ -37,12 +37,7 @@ import type { CodexOptions, Thread, ThreadItem } from '@agor/core/sdk';
 import { renderAgorSystemPrompt } from '@agor/core/templates/session-context';
 import { mergeMCPRemoteHeaders } from '@agor/core/tools/mcp/http-headers';
 import { resolveMCPAuthHeaders } from '@agor/core/tools/mcp/jwt-auth';
-import type {
-  CodexSandboxMode,
-  ContextUsageSnapshot,
-  EffortLevel,
-  MCPServer,
-} from '@agor/core/types';
+import type { CodexSandboxMode, ContextUsageSnapshot, MCPServer } from '@agor/core/types';
 import { getDefaultPermissionMode, isGatewaySession } from '@agor/core/types';
 import { mapToCodexPermissionConfig } from '@agor/core/utils/permission-mode-mapper';
 import type * as CodexSdk from '@openai/codex-sdk';
@@ -65,19 +60,11 @@ import type { TasksService } from '../base/index.js';
 import { forkCodexThreadViaAppServer } from './app-server-client.js';
 import { extractCodexContextSnapshotFromEvent, extractCodexTokenUsage } from './usage.js';
 
-/**
- * Map Agor's effort level (`low`/`medium`/`high`/`xhigh`/`max`) to Codex SDK's
- * `ModelReasoningEffort` (`minimal`/`low`/`medium`/`high`/`xhigh`).
- *
- * Agor has no equivalent for `minimal`. Codex has no `max` — both Agor `max`
- * and Agor `xhigh` map to Codex `xhigh` (the Codex ceiling).
- */
-function toCodexReasoningEffort(
-  effort: EffortLevel | undefined
-): 'low' | 'medium' | 'high' | 'xhigh' | undefined {
-  if (!effort) return undefined;
-  return effort === 'max' || effort === 'xhigh' ? 'xhigh' : effort;
-}
+type CodexSdkReasoningEffort = NonNullable<
+  NonNullable<
+    Parameters<InstanceType<typeof CodexSdk.Codex>['startThread']>[0]
+  >['modelReasoningEffort']
+>;
 
 /**
  * Codex CLI config payload, sourced from the SDK's public `CodexOptions`
@@ -1136,7 +1123,7 @@ export class CodexPromptService {
     // model + modelReasoningEffort are passed through from session.model_config
     // so the UI's per-session model picker actually controls what Codex runs.
     const sessionModel = session.model_config?.model;
-    const sessionEffort = toCodexReasoningEffort(session.model_config?.effort);
+    const sessionEffort = session.model_config?.effort;
     const threadOptions = {
       workingDirectory: branch.path,
       skipGitRepoCheck: false,
@@ -1144,7 +1131,8 @@ export class CodexPromptService {
       approvalPolicy,
       networkAccessEnabled: networkAccess,
       ...(sessionModel ? { model: sessionModel } : {}),
-      ...(sessionEffort ? { modelReasoningEffort: sessionEffort } : {}),
+      // Codex CLI accepts `max`; the SDK's ModelReasoningEffort type currently lags it.
+      ...(sessionEffort ? { modelReasoningEffort: sessionEffort as CodexSdkReasoningEffort } : {}),
     };
 
     // Check if MCP servers were added after session creation
