@@ -30,12 +30,14 @@ import {
   isPostgresDatabaseHandle,
   type MCPOAuthPendingFlowRecord,
   MCPServerRepository,
+  mcpServers,
   runWithoutTenantDatabaseScope,
   runWithTenantDatabaseScope,
   SessionMCPServerRepository,
-  type SessionMCPServerRow,
+  SessionRepository,
   select,
   sessionMcpServers,
+  sessions,
   shortId,
   type TenantScopeAwareDatabase,
   UserMCPOAuthTokenRepository,
@@ -189,6 +191,10 @@ import {
   shouldExposeMCPServerSecrets,
   shouldExposeMCPServerSecretsForSessionToken,
 } from './utils/mcp-header-secrets.js';
+import {
+  isSessionMcpServerLinkVisibleToCaller,
+  loadMcpServerForCaller,
+} from './utils/mcp-server-authorization.js';
 import { type SpawnExecutorOptions, spawnExecutor } from './utils/spawn-executor.js';
 import { classifyExecutorExit } from './utils/task-launch-state.js';
 
@@ -672,7 +678,6 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   app.service('/cursor-models').hooks({ before: { find: [ctx.requireAuth] } });
 
   const branchRepository = new BranchRepository(db);
-  const { UsersRepository, SessionRepository } = await import('@agor/core/db');
   const usersRepository = new UsersRepository(db);
   const sessionsRepository = new SessionRepository(db);
   app.use('/file', createFileService(branchRepository, db, app));
@@ -754,17 +759,44 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
           )
         );
       }
-      let query = select(db).from(sessionMcpServers);
+      let query = select(db, {
+        session_id: sessionMcpServers.session_id,
+        mcp_server_id: sessionMcpServers.mcp_server_id,
+        enabled: sessionMcpServers.enabled,
+        added_at: sessionMcpServers.added_at,
+        owner_user_id: mcpServers.owner_user_id,
+        session_created_by: sessions.created_by,
+      })
+        .from(sessionMcpServers)
+        .innerJoin(mcpServers, eq(sessionMcpServers.mcp_server_id, mcpServers.mcp_server_id))
+        .innerJoin(sessions, eq(sessionMcpServers.session_id, sessions.session_id));
       if (conditions.length > 0) {
         query = query.where(and(...conditions)) as typeof query;
       }
-      const rows = await query.all();
-      return rows.map((row: SessionMCPServerRow) => ({
-        session_id: row.session_id,
-        mcp_server_id: row.mcp_server_id,
-        enabled: Boolean(row.enabled),
-        added_at: new Date(row.added_at),
-      }));
+      const rows = (await query.all()) as Array<{
+        session_id: string;
+        mcp_server_id: string;
+        enabled: boolean;
+        added_at: Date | number | string;
+        owner_user_id: string | null;
+        session_created_by: string;
+      }>;
+      return rows
+        .filter((row) =>
+          isSessionMcpServerLinkVisibleToCaller(
+            {
+              owner_user_id: row.owner_user_id,
+              session_created_by: row.session_created_by,
+            },
+            params as unknown as AuthenticatedParams
+          )
+        )
+        .map((row) => ({
+          session_id: row.session_id,
+          mcp_server_id: row.mcp_server_id,
+          enabled: Boolean(row.enabled),
+          added_at: new Date(row.added_at),
+        }));
     },
   });
 
@@ -1254,6 +1286,7 @@ async function registerMCPServices(
   sessionsService: SessionsServiceImpl
 ): Promise<{ oauthCallbackHandler: (req: express.Request, res: express.Response) => void }> {
   const { db, app } = ctx;
+  const sessionsRepository = new SessionRepository(db);
   const durableOAuthFlows = isPostgresDatabaseHandle(db)
     ? new MCPOAuthPendingFlowAuthority(db)
     : null;
@@ -2229,9 +2262,12 @@ async function registerMCPServices(
         compatibility_mode?: 'strict' | 'legacy';
         dcr_mode?: MCPOAuthDCRMode;
       },
-      params?: { connection?: { id?: string } }
+      params?: AuthenticatedParams & { connection?: { id?: string } }
     ) {
       try {
+        if (data.mcp_server_id) {
+          await loadMcpServerForCaller(db, data.mcp_server_id, params);
+        }
         console.log('[OAuth Test] Probing configured MCP server');
 
         let probeResponse: Response;
@@ -2603,8 +2639,7 @@ async function registerMCPServices(
         const savedServerId = data.mcp_server_id;
         const savedServer = savedServerId
           ? await runInOAuthTenantScope(db, tenantId, () => {
-              const mcpServerRepo = new MCPServerRepository(db);
-              return mcpServerRepo.findById(savedServerId);
+              return loadMcpServerForCaller(db, savedServerId, params);
             })
           : null;
 
@@ -2874,6 +2909,7 @@ async function registerMCPServices(
   // OAuth disconnect
   app.use('/mcp-servers/oauth-disconnect', {
     async create(data: { mcp_server_id: string }, params?: AuthenticatedParams) {
+      await loadMcpServerForCaller(db, data.mcp_server_id, params);
       const tenantId = tenantIdFromParams(params);
       const currentUser =
         tenantId && params?.user?.user_id
@@ -2921,7 +2957,12 @@ async function registerMCPServices(
         const now = new Date();
         const authenticatedServerIds = new Set<MCPServerID>();
         const serverRepo = new MCPServerRepository(db);
+        const visibleServers = await serverRepo.findAll(
+          hasMinimumRole(params?.user?.role, ROLES.ADMIN) ? undefined : { usableByUserId: userId }
+        );
+        const visibleServerIds = new Set(visibleServers.map((server) => server.mcp_server_id));
         for (const token of tokens) {
+          if (!visibleServerIds.has(token.mcp_server_id)) continue;
           if (token.oauth_token_expires_at && token.oauth_token_expires_at <= now) continue;
           if (token.refresh_status === 'ambiguous') continue;
           if (isPostgresDatabaseHandle(db)) {
@@ -3074,16 +3115,23 @@ async function registerMCPServices(
         const { attachedServers, globalServers } = await runInOAuthTenantScope(
           db,
           tenantId,
-          async () => ({
-            attachedServers: await new SessionMCPServerRepository(db).listServers(
-              executorSessionId as SessionID,
-              true
-            ),
-            globalServers: await new MCPServerRepository(db).findAll({
-              scope: 'global',
-              enabled: true,
-            }),
-          })
+          async () => {
+            const executorSession = await sessionsRepository.findById(executorSessionId);
+            if (!executorSession) {
+              throw new Forbidden('oauth-auth-headers requires a resolvable executor session');
+            }
+            return {
+              attachedServers: await new SessionMCPServerRepository(db).listServers(
+                executorSessionId as SessionID,
+                true
+              ),
+              globalServers: await new MCPServerRepository(db).findAll({
+                scope: 'global',
+                enabled: true,
+                usableByUserId: executorSession.created_by,
+              }),
+            };
+          }
         );
         const allowedServerIds = new Set([
           ...globalServers.map((server) => server.mcp_server_id),
@@ -3264,9 +3312,8 @@ async function registerMCPServices(
 
       try {
         const server = await runInOAuthTenantScope(db, tenantId, () =>
-          new MCPServerRepository(db).findById(serverId)
+          loadMcpServerForCaller(db, serverId, params)
         );
-        if (!server) return { success: false, error: 'server_not_found' };
         if (server.auth?.type !== 'oauth') return { success: false, error: 'not_oauth_server' };
 
         const mode = server.auth.oauth_mode ?? 'per_user';
@@ -3448,10 +3495,7 @@ async function registerMCPServices(
             name: 'inline-test',
           };
           if (data.mcp_server_id) {
-            const server = await runInOAuthTenantScope(db, tenantId, () =>
-              mcpServerRepo.findById(data.mcp_server_id!)
-            );
-            if (!server) return { success: false, error: 'MCP server not found' };
+            const server = await loadMcpServerForCaller(db, data.mcp_server_id, params);
             if (params?.provider && params.user) {
               const userId = params.user.user_id;
               const userRole = params.user.role?.toLowerCase();
@@ -3479,10 +3523,7 @@ async function registerMCPServices(
             serverId = data.mcp_server_id;
           }
         } else if (data.mcp_server_id) {
-          const server = await runInOAuthTenantScope(db, tenantId, () =>
-            mcpServerRepo.findById(data.mcp_server_id!)
-          );
-          if (!server) return { success: false, error: 'MCP server not found' };
+          const server = await loadMcpServerForCaller(db, data.mcp_server_id, params);
           if (params?.provider && params.user) {
             const userId = params.user.user_id;
             const userRole = params.user.role?.toLowerCase();

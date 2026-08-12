@@ -80,7 +80,7 @@ describe('register-services OAuth callback URL regression', () => {
       codeOnly.indexOf("app.service('mcp-servers/oauth-start').hooks")
     );
     expect(oauthStartBody).toMatch(
-      /runInOAuthTenantScope\s*\([\s\S]*findById\s*\(\s*savedServerId/
+      /runInOAuthTenantScope\s*\([\s\S]*loadMcpServerForCaller\s*\(\s*db,\s*savedServerId/
     );
     expect(oauthStartBody).toMatch(/effectiveMcpUrl\s*=\s*savedServer\?\.url\s*\?\?/);
     expect(oauthStartBody).toMatch(/clientId:\s*savedServer\s*\?\s*clientIdFromConfig/);
