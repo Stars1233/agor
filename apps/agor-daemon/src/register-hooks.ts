@@ -28,6 +28,7 @@ import {
   getCurrentTenantDatabaseScope,
   getCurrentTenantId,
   isPostgresDatabaseHandle,
+  requireCurrentTenantId,
   runWithTenantDatabaseScope,
   ScheduleRepository,
   type SessionRepository,
@@ -480,6 +481,11 @@ export const TENANT_OWNED_SERVICE_PATHS = [
 // units of work at the call site instead of holding an HTTP-long transaction.
 export const TENANT_IDENTITY_ONLY_SERVICE_PATHS = [
   'check-auth',
+  // File browsing delegates to the executor after bounded repository reads.
+  // Keep request-wide tenant identity while each service opens only a short
+  // database unit of work before crossing the executor boundary.
+  'file',
+  'files',
   // Global catalog: no tenant column to scope, no writes to stamp.
   'mcp-catalog',
   'codex-auth/device',
@@ -596,6 +602,23 @@ export async function protectServerManagedTaskWrites(context: HookContext): Prom
   }
 
   return context;
+}
+
+/** Run an identity-only service's database-reading before hooks in one short unit of work. */
+export function createTenantScopedBeforeHookChain(
+  db: TenantScopeAwareDatabase,
+  ...hooks: Array<(context: HookContext) => HookContext | Promise<HookContext>>
+) {
+  return async (context: HookContext): Promise<HookContext> => {
+    const tenantId = requireCurrentTenantId(
+      `Missing active tenant context for ${context.path} authorization`
+    );
+    return runWithTenantDatabaseScope(db, tenantId, async () => {
+      let current = context;
+      for (const hook of hooks) current = await hook(current);
+      return current;
+    });
+  };
 }
 
 export function authorizeUsersGet(context: HookContext): HookContext {
@@ -2182,7 +2205,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         // case rather than throwing.
         ...(branchRbacEnabled
           ? [
-              async (context: HookContext) => {
+              createTenantScopedBeforeHookChain(db, async (context: HookContext) => {
                 if (!context.params.provider) return context;
                 if (context.params.user?._isServiceAccount) return context;
                 const query = context.params.query as { sessionId?: string } | undefined;
@@ -2194,7 +2217,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 await loadBranchFromSession(branchRepository)(context);
                 await ensureCanView(superadminOpts)(context);
                 return context;
-              },
+              }),
             ]
           : []),
       ],
@@ -2209,7 +2232,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         requireAuth,
         requireMinimumRole(ROLES.MEMBER, 'read files'),
         ...(branchRbacEnabled
-          ? [loadBranch(branchRepository, 'branch_id'), ensureCanView(superadminOpts)]
+          ? [
+              createTenantScopedBeforeHookChain(
+                db,
+                loadBranch(branchRepository, 'branch_id'),
+                ensureCanView(superadminOpts)
+              ),
+            ]
           : []),
       ],
     },
