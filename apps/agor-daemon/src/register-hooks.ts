@@ -156,6 +156,7 @@ import {
   redactMCPServerSecrets,
   shouldExposeMCPServerSecrets,
 } from './utils/mcp-header-secrets.js';
+import { createMcpServerWriteAuthorizationHook } from './utils/mcp-server-authorization.js';
 import { realignRepoOriginAfterPatchHook } from './utils/realign-repo-origin.js';
 import {
   type RealtimeAccessBranchRepository,
@@ -1822,6 +1823,14 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     return context;
   };
 
+  // Writes are decided by `mcp_member_policy` plus ownership, not by role
+  // alone — see `authorizeMcpServerWrite`. Reads are narrowed to the servers
+  // the caller may use, because a private server is another user's
+  // configuration and credential, not shared tenant configuration.
+  const authorizeMcpServerWriteHook = createMcpServerWriteAuthorizationHook(db) as unknown as (
+    context: HookContext
+  ) => Promise<HookContext>;
+
   const scopeMcpServerFindToUsable = async (context: HookContext): Promise<HookContext> => {
     if (!context.params.provider) return context;
     const user = context.params.user;
@@ -1859,10 +1868,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     before: {
       all: [typedValidateQuery(mcpServerQueryValidator), requireAuth],
       find: [scopeMcpServerFindToUsable],
-      create: [requireMinimumRole(ROLES.ADMIN, 'create MCP servers')],
-      update: [requireMinimumRole(ROLES.ADMIN, 'update MCP servers')],
-      patch: [requireMinimumRole(ROLES.ADMIN, 'update MCP servers')],
-      remove: [requireMinimumRole(ROLES.ADMIN, 'delete MCP servers')],
+      create: [authorizeMcpServerWriteHook],
+      update: [authorizeMcpServerWriteHook],
+      patch: [authorizeMcpServerWriteHook],
+      remove: [authorizeMcpServerWriteHook],
     },
     after: {
       find: [injectPerUserOAuthTokens, redactMCPServerSecretFields],
