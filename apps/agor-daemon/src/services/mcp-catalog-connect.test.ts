@@ -23,6 +23,7 @@ const CURATED: MCPCatalogEntry = {
   title: 'Linear',
   benefit: 'Read and update your Linear issues.',
   starter_prompt: 'List the issues assigned to me this cycle.',
+  permission_disclosure: 'Reads and writes issues in the Linear workspaces you authorise.',
   transport: 'streamable-http',
   remote_url: 'https://mcp.linear.app/mcp',
   has_remote: true,
@@ -94,6 +95,7 @@ const request = {
   catalog_key: LINEAR,
   branch_id: 'branch-1',
   agentic_tool: 'claude-code' as const,
+  acknowledged_disclosure: CURATED.permission_disclosure as string,
 };
 
 describe('mcp-catalog/connect', () => {
@@ -118,6 +120,45 @@ describe('mcp-catalog/connect', () => {
     // create hook stamps both.
     expect(created.mcpServers[0]).not.toHaveProperty('owner_user_id');
     expect(result.starter_prompt).toBe('List the issues assigned to me this cycle.');
+  });
+
+  it('names the server after its publisher, not the protocol word in its path', async () => {
+    // The name is the `<name>` in every `mcp__<name>__<tool>` the model reads.
+    // Taking the last path segment made it the literal word "mcp" for 38 of the
+    // 50 curated entries, so two installs in one session were indistinguishable.
+    const entry = {
+      ...CURATED,
+      name: 'com.deepwiki/mcp',
+      title: undefined,
+    } as unknown as MCPCatalogEntry;
+    const { app, created } = buildApp(entry);
+
+    await createMCPCatalogConnectService(app).create(
+      { ...request, catalog_key: 'com.deepwiki/mcp' },
+      params
+    );
+
+    expect(created.mcpServers[0]).toMatchObject({
+      name: 'deepwiki',
+      display_name: 'Deepwiki',
+    });
+  });
+
+  it('names a refused entry the way the drawer does', async () => {
+    const entry = {
+      ...CURATED,
+      name: 'io.sentry/mcp',
+      title: undefined,
+      probed_auth_type: 'oauth',
+    } as unknown as MCPCatalogEntry;
+    const { app } = buildApp(entry);
+
+    await expect(
+      createMCPCatalogConnectService(app).create(
+        { ...request, catalog_key: 'io.sentry/mcp' },
+        params
+      )
+    ).rejects.toThrow(/^Sentry requires authentication/);
   });
 
   it('lands on a session with the server attached', async () => {
@@ -318,6 +359,39 @@ describe('mcp-catalog/connect', () => {
       expect.anything(),
       expect.objectContaining({ mcpCatalogInstall: { entry_name: LINEAR } })
     );
+  });
+
+  it('refuses a connect that never showed what the server can access', async () => {
+    const { app, created } = buildApp(CURATED);
+
+    await expect(
+      createMCPCatalogConnectService(app).create(
+        { ...request, acknowledged_disclosure: '' },
+        params
+      )
+    ).rejects.toThrow(/acknowledged_disclosure is required/);
+    expect(created.mcpServers).toHaveLength(0);
+  });
+
+  it('refuses an entry that states nothing about what it can access', async () => {
+    const { app, created } = buildApp({ ...CURATED, permission_disclosure: undefined });
+
+    await expect(createMCPCatalogConnectService(app).create(request, params)).rejects.toThrow(
+      /states nothing about what it can access/
+    );
+    expect(created.mcpServers).toHaveLength(0);
+  });
+
+  it('refuses a disclosure that no longer matches the catalog row', async () => {
+    const { app, created } = buildApp(CURATED);
+
+    await expect(
+      createMCPCatalogConnectService(app).create(
+        { ...request, acknowledged_disclosure: 'Reads nothing at all.' },
+        params
+      )
+    ).rejects.toThrow(/has changed since it was shown/);
+    expect(created.mcpServers).toHaveLength(0);
   });
 
   it('refuses an uncurated entry', async () => {

@@ -56,12 +56,14 @@ const CURATED = {
   curated: true,
   verified: false,
   probed_auth_type: 'none',
+  permission_disclosure: 'Reads public GitHub repository content only.',
 } as unknown as MCPCatalogEntry;
 
 const CONNECT_REQUEST = {
   catalog_key: DEEPWIKI,
   branch_id: 'branch-1',
   agentic_tool: 'claude-code' as const,
+  acknowledged_disclosure: 'Reads public GitHub repository content only.',
 };
 
 /**
@@ -136,7 +138,8 @@ describe('marketplace install, as it lands in the database', () => {
 
     const [server] = await installedServers();
     expect(server).toMatchObject({
-      name: 'mcp',
+      // The publisher, not the protocol word `com.deepwiki/mcp` ends with.
+      name: 'deepwiki',
       scope: 'session',
       catalog_entry_name: DEEPWIKI,
       owner_user_id: user.user_id,

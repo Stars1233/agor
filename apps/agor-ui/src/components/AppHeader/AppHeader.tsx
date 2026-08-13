@@ -99,6 +99,16 @@ const RecentBoardPills: React.FC<{
   );
 };
 
+/**
+ * True when a click on an `href`-bearing Button should be handled by the
+ * router. Modified clicks and middle clicks keep the browser's native
+ * open-in-new-tab behaviour, which the `href` exists to preserve.
+ */
+function isPlainLeftClick(event: React.MouseEvent): boolean {
+  if (event.defaultPrevented) return false;
+  return event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+}
+
 const AppHeaderInner: React.FC<AppHeaderProps> = ({
   user,
   presenceClient = null,
@@ -285,6 +295,9 @@ const AppHeaderInner: React.FC<AppHeaderProps> = ({
           boardById={boardById}
           onSettingsClick={onSettingsClick}
         />
+        {/* No Marketplace entry: the surface exists and answers at
+            /marketplace, but is not advertised while the feature is
+            incomplete. */}
         <Tooltip title="Knowledge Base">
           <Button
             type="text"
@@ -292,18 +305,10 @@ const AppHeaderInner: React.FC<AppHeaderProps> = ({
             href={knowledgeHref}
             aria-label="Knowledge Base"
             onClick={(event) => {
-              if (event.defaultPrevented) return;
-              if (
-                event.button !== 0 ||
-                event.metaKey ||
-                event.ctrlKey ||
-                event.shiftKey ||
-                event.altKey
-              ) {
-                return;
+              if (isPlainLeftClick(event)) {
+                event.preventDefault();
+                navigate('/knowledge');
               }
-              event.preventDefault();
-              navigate('/knowledge');
             }}
             style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
           />
