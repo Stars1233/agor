@@ -50,6 +50,7 @@ import type {
   OAuthFlowContext,
   OAuthTokenResponse,
 } from '@agor/core/tools/mcp/oauth-mcp-transport';
+import { OAuthDCRFailure } from '@agor/core/tools/mcp/oauth-mcp-transport';
 import type {
   AuthenticatedParams,
   BranchID,
@@ -58,6 +59,7 @@ import type {
   MCPOAuthAttemptID,
   MCPOAuthDCRMode,
   MCPOAuthPendingFlowStatus,
+  MCPOAuthStartFailure,
   MCPServer,
   MCPServerID,
   MessageSource,
@@ -1462,6 +1464,11 @@ async function registerMCPServices(
     '(3) /.well-known/oauth-authorization-server at MCP origin (RFC 8414), ' +
     '(4) /.well-known/openid-configuration at MCP origin (OIDC).';
 
+  async function resolveMCPOAuthRedirectUri(): Promise<string> {
+    const baseUrl = await requirePublicBaseUrl();
+    return new URL('/mcp-servers/oauth-callback', baseUrl).toString();
+  }
+
   type StartTwoPhaseOAuthOptions = {
     mcpUrl: string;
     wwwAuthenticate: string;
@@ -1525,8 +1532,7 @@ async function registerMCPServices(
     const { startMCPOAuthFlow } = await import('@agor/core/tools/mcp/oauth-mcp-transport');
 
     // Strict public base URL — see oauth-start endpoint for the rationale.
-    const baseUrl = await requirePublicBaseUrl();
-    const redirectUri = new URL('/mcp-servers/oauth-callback', baseUrl).toString();
+    const redirectUri = await resolveMCPOAuthRedirectUri();
 
     const hasRfc9728 = !!opts.resourceMetadataUrl;
     const hasAsDirect = !!opts.prefetchedAuthServerMetadata;
@@ -2649,7 +2655,7 @@ async function registerMCPServices(
   // OAuth start endpoint
   app.use('/mcp-servers/oauth-start', {
     async create(
-      data: { mcp_url: string; mcp_server_id?: string; client_id?: string },
+      data: { mcp_url?: string; mcp_server_id?: string; client_id?: string },
       params?: AuthenticatedParams
     ) {
       try {
@@ -2682,13 +2688,19 @@ async function registerMCPServices(
             success: false,
             error:
               'OAuth requires an enabled, saved MCP server in the current tenant. Save changes, then restart OAuth.',
-          };
+          } satisfies MCPOAuthStartFailure;
         }
 
         // Once an ID is supplied, its tenant-scoped row is authoritative for
         // the provider URL and client configuration. The duplicate payload
         // fields remain accepted only for older callers.
         const effectiveMcpUrl = savedServer?.url ?? data.mcp_url;
+        if (!effectiveMcpUrl) {
+          return {
+            success: false,
+            error: 'OAuth requires a saved MCP server URL. Save changes, then restart OAuth.',
+          } satisfies MCPOAuthStartFailure;
+        }
 
         // PostgreSQL is the shared authority, so reject transient or stale
         // server input before the first outbound probe. Doing this only in the
@@ -2704,7 +2716,7 @@ async function registerMCPServices(
             success: false,
             error:
               'PostgreSQL OAuth requires an enabled, saved MCP server matching this request. Save changes, then restart OAuth.',
-          };
+          } satisfies MCPOAuthStartFailure;
         }
 
         if (savedServer?.auth?.type === 'oauth') {
@@ -2751,7 +2763,7 @@ async function registerMCPServices(
           return {
             success: false,
             error: 'Server did not return 401 — OAuth 2.1 authentication may not be required',
-          };
+          } satisfies MCPOAuthStartFailure;
         }
 
         const wwwAuthenticate = probeResponse.headers.get('www-authenticate') || '';
@@ -2766,7 +2778,7 @@ async function registerMCPServices(
           return {
             success: false,
             error: `Server returned 401 but does not advertise OAuth metadata. ${DISCOVERY_CASCADE_TRIED} None succeeded.`,
-          };
+          } satisfies MCPOAuthStartFailure;
         }
 
         const connection = params?.connection as { id?: string } | undefined;
@@ -2797,7 +2809,10 @@ async function registerMCPServices(
         } catch (err) {
           if (err instanceof PublicBaseUrlNotConfiguredError) {
             console.error('[OAuth Start]', err.message);
-            return { success: false, error: err.message };
+            return {
+              success: false,
+              error: err.message,
+            } satisfies MCPOAuthStartFailure;
           }
           throw err;
         }
@@ -2814,7 +2829,16 @@ async function registerMCPServices(
         console.error(
           `[OAuth Start] Failed category=${error instanceof Error ? error.name : 'unknown'}`
         );
-        return { success: false, error: error instanceof Error ? error.message : String(error) };
+        const diagnostic = error instanceof OAuthDCRFailure ? error.diagnostic : undefined;
+        const redirectUri = diagnostic
+          ? await resolveMCPOAuthRedirectUri().catch(() => null)
+          : null;
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          ...(diagnostic ? { diagnostic } : {}),
+          ...(redirectUri ? { redirect_uri: redirectUri } : {}),
+        } satisfies MCPOAuthStartFailure;
       }
     },
   });
