@@ -21,13 +21,23 @@ import {
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
 import { BadRequest, Forbidden } from '@agor/core/feathers';
-import type { AuthenticatedParams, Branch, BranchID, UserID } from '@agor/core/types';
+import type {
+  AuthenticatedParams,
+  Branch,
+  BranchID,
+  TerminalAllocatedEvent,
+  UserID,
+} from '@agor/core/types';
 import {
   resolveUnixUserForImpersonation,
   type UnixUserMode,
   UnixUserNotFoundError,
   validateResolvedUnixUser,
 } from '@agor/core/unix';
+import {
+  TERMINAL_REQUEST_JOIN_CHANNEL,
+  type TerminalRequestConnection,
+} from '../terminal-socket-connection.js';
 import { REMOVED_AGENTIC_TOOL_RUNTIME_MESSAGE } from '../utils/agentic-tool-runtime.js';
 import { hasBranchPermission } from '../utils/branch-authorization.js';
 import { generateScopedServiceToken, spawnExecutorFireAndForget } from '../utils/spawn-executor.js';
@@ -97,6 +107,14 @@ export function terminalChannelName(tenantId: string, userId: string, terminalId
   return `tenant/${tenantId}/user/${userId}/terminal/${terminalId}`;
 }
 
+function terminalRequestAllocation(terminal: TerminalAttachment): TerminalAllocatedEvent {
+  return {
+    userId: terminal.userId,
+    terminalId: terminal.terminalId,
+    branchId: terminal.branchId,
+  };
+}
+
 export class TerminalsService {
   private readonly terminals = new Map<string, OwnedTerminal>();
   private readonly terminalByScope = new Map<string, string>();
@@ -146,8 +164,14 @@ export class TerminalsService {
     if (data.ensureCliSessionId !== undefined) {
       throw new BadRequest(REMOVED_AGENTIC_TOOL_RUNTIME_MESSAGE);
     }
-    if (params?.provider && params.provider !== 'socketio') {
+    if (params?.provider !== 'socketio') {
       throw new BadRequest('Web terminals must be created over the owning Socket.IO connection.');
+    }
+    const joinRequestingSocket = (params.connection as TerminalRequestConnection | undefined)?.[
+      TERMINAL_REQUEST_JOIN_CHANNEL
+    ];
+    if (!joinRequestingSocket) {
+      throw new BadRequest('The owning Socket.IO connection cannot subscribe to this terminal.');
     }
     const userId = params?.user?.user_id as UserID | undefined;
     if (!userId) throw new Forbidden('Authentication required to open terminals');
@@ -192,7 +216,14 @@ export class TerminalsService {
     }
     const existingId = this.terminalByScope.get(scopeKey);
     const existing = existingId ? this.terminals.get(existingId) : undefined;
-    if (existing) return { ...existing, isNew: false };
+    if (existing) {
+      const joined = await joinRequestingSocket(
+        existing.channel,
+        terminalRequestAllocation(existing)
+      );
+      if (!joined) throw new BadRequest('The owning Socket.IO connection disconnected.');
+      return { ...existing, isNew: false };
+    }
 
     let release!: () => void;
     const reservation = new Promise<void>((resolve) => {
@@ -200,7 +231,15 @@ export class TerminalsService {
     });
     this.starting.set(scopeKey, reservation);
     try {
-      return await this.spawnTerminal({ tenantId, userId, branch, data, config, scopeKey });
+      return await this.spawnTerminal({
+        tenantId,
+        userId,
+        branch,
+        data,
+        config,
+        scopeKey,
+        joinRequestingSocket,
+      });
     } finally {
       if (this.starting.get(scopeKey) === reservation) this.starting.delete(scopeKey);
       release();
@@ -214,8 +253,9 @@ export class TerminalsService {
     data: CreateTerminalData;
     config: AgorConfig;
     scopeKey: string;
+    joinRequestingSocket: (channel: string, allocation: TerminalAllocatedEvent) => Promise<boolean>;
   }): Promise<TerminalAttachment> {
-    const { tenantId, userId, branch, data, config, scopeKey } = args;
+    const { tenantId, userId, branch, data, config, scopeKey, joinRequestingSocket } = args;
     const unixUserMode = config.execution?.unix_user_mode ?? 'simple';
     const user = await this.withTenantDatabase((tenantDb) =>
       new UsersRepository(tenantDb).findById(userId)
@@ -271,33 +311,46 @@ export class TerminalsService {
 
     this.terminals.set(terminalId, terminal);
     this.terminalByScope.set(scopeKey, terminalId);
-    spawnExecutorFireAndForget(
-      {
-        command: 'zellij.attach',
-        sessionToken: token,
-        daemonUrl,
-        params: {
-          userId,
-          terminalId,
-          channel,
-          sessionName,
-          cwd: branch.path,
-          cols: data.cols || 160,
-          rows: data.rows || 40,
+    try {
+      // The browser and executor use different Socket.IO connections. Join the
+      // authenticated requester before the executor can emit ready/error/exit,
+      // otherwise a fast optional-runtime failure can be lost permanently.
+      const joined = await joinRequestingSocket(channel, terminalRequestAllocation(terminal));
+      if (!joined) throw new BadRequest('The owning Socket.IO connection disconnected.');
+
+      spawnExecutorFireAndForget(
+        {
+          command: 'zellij.attach',
+          sessionToken: token,
+          daemonUrl,
+          params: {
+            userId,
+            terminalId,
+            channel,
+            sessionName,
+            cwd: branch.path,
+            cols: data.cols || 160,
+            rows: data.rows || 40,
+          },
         },
-      },
-      {
-        logPrefix: `[TerminalsService.executor ${shortId(userId)}/${shortId(terminalId)}]`,
-        asUser: impersonation.unixUser || undefined,
-        env: executorEnv,
-        templateVariables: {
-          unix_user: impersonation.reportedUnixUser || undefined,
-          executor_type: 'shell',
-        },
-        onExit: () => this.handleExecutorExit(terminalId, userId),
-      }
-    );
-    return terminal;
+        {
+          logPrefix: `[TerminalsService.executor ${shortId(userId)}/${shortId(terminalId)}]`,
+          asUser: impersonation.unixUser || undefined,
+          env: executorEnv,
+          templateVariables: {
+            unix_user: impersonation.reportedUnixUser || undefined,
+            executor_type: 'shell',
+          },
+          onExit: () => this.handleExecutorExit(terminalId, userId),
+        }
+      );
+      return terminal;
+    } catch (error) {
+      // No executor owns this attachment when the subscription/start boundary
+      // fails, so remove the reservation without broadcasting shutdown.
+      this.deleteTerminal(terminal);
+      throw error;
+    }
   }
 
   async remove(id: string, params?: AuthenticatedParams): Promise<{ closed: boolean }> {
