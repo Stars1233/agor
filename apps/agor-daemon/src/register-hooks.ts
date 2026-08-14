@@ -138,6 +138,7 @@ import {
 } from './utils/authorization.js';
 import {
   cacheBranchAccess,
+  ensureBranchOwnerOrAdmin,
   ensureBranchPermission,
   ensureCanCreateSession,
   ensureCanModifySchedule,
@@ -159,6 +160,7 @@ import {
   setSessionUnixUsername,
   validateSessionUnixUsername,
 } from './utils/branch-authorization.js';
+import { captureBranchRemovalRealtimeVisibility as captureBranchRemovalVisibility } from './utils/branch-removal-realtime.js';
 import { emitServiceEvent } from './utils/emit-service-event.js';
 import { injectCreatedBy } from './utils/inject-created-by.js';
 import {
@@ -907,6 +909,26 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     return context;
   };
 
+  const captureBranchRemovalRealtimeVisibility = async (
+    context: HookContext
+  ): Promise<HookContext> => {
+    const loadedBranch = (context.params as AuthenticatedParams & { branch?: Branch }).branch;
+    const branch =
+      loadedBranch ??
+      (typeof context.id === 'string' ? await branchRepository.findById(context.id) : null);
+    if (!branch) {
+      throw new NotFound(`Branch not found: ${String(context.id)}`);
+    }
+
+    await captureBranchRemovalVisibility({
+      params: context.params,
+      branchRepository,
+      branchId: branch.branch_id,
+      realtimeAccessCache,
+    });
+    return context;
+  };
+
   safeService('agentic-tool-settings')?.hooks({
     before: {
       patch: [requireMinimumRole(ROLES.ADMIN, 'manage workspace agentic tools')],
@@ -1633,12 +1655,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
       remove: [
         requireMinimumRole(ROLES.MEMBER, 'delete branches'),
+        loadBranch(branchRepository),
         ...(branchRbacEnabled
           ? [
-              loadBranch(branchRepository),
               ensureBranchPermission('all', 'delete branches', superadminOpts), // Require 'all' permission to delete
             ]
-          : []),
+          : [ensureBranchOwnerOrAdmin('delete branches')]),
+        captureBranchRemovalRealtimeVisibility,
       ],
     },
     after: {
