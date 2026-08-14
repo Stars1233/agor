@@ -190,6 +190,7 @@ import { appendSystemMessage } from './utils/append-system-message.js';
 import { requireMinimumRole } from './utils/authorization.js';
 import { emitServiceEvent } from './utils/emit-service-event.js';
 import { escapeHtml } from './utils/html.js';
+import { persistDiscoveredMCPCapabilities } from './utils/mcp-discovered-capabilities.js';
 import {
   shouldExposeMCPServerSecrets,
   shouldExposeMCPServerSecretsForSessionToken,
@@ -3497,7 +3498,6 @@ async function registerMCPServices(
           '@agor/core/tools/mcp/http-headers'
         );
         const tenantId = tenantIdFromParams(params);
-        const mcpServerRepo = new MCPServerRepository(db);
 
         const validateUrl = (url: string): { valid: boolean; error?: string } => {
           try {
@@ -3879,7 +3879,7 @@ async function registerMCPServices(
           ])) as PromptsResult;
 
           if (serverId) {
-            await mcpServerRepo.update(serverId, {
+            await persistDiscoveredMCPCapabilities(db, tenantId, serverId as MCPServerID, {
               tools: toolsResult.tools.map((t) => ({
                 name: t.name,
                 description: t.description || '',
