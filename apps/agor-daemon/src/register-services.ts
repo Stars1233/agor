@@ -11,6 +11,7 @@ import { OPENCODE_DAEMON_CONTRIBUTION } from '@agor/agentic-tool-opencode/daemon
 import {
   type AgorConfig,
   isDeploymentAgenticToolAvailable,
+  MESSAGE_PAGINATION,
   PublicBaseUrlNotConfiguredError,
   type ResolvedDeploymentConfig,
   requirePublicBaseUrl,
@@ -325,6 +326,35 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   });
   app.use('/leaderboard', createLeaderboardService(db));
   const messagesService = createMessagesService(db) as unknown as MessagesServiceImpl;
+  const messageOpenApiProperties = {
+    message_id: { type: 'string', format: 'uuid' },
+    session_id: { type: 'string', format: 'uuid' },
+    task_id: { type: 'string', format: 'uuid' },
+    type: {
+      type: 'string',
+      enum: [
+        'user',
+        'assistant',
+        'system',
+        'file-history-snapshot',
+        'permission_request',
+        'input_request',
+        'daemon_restart',
+        'daemon_crash',
+        'widget_request',
+      ],
+    },
+    role: { type: 'string', enum: ['user', 'assistant', 'system'] },
+    index: { type: 'integer', minimum: 0 },
+    timestamp: { type: 'string', format: 'date-time' },
+    content_preview: { type: 'string' },
+    content: {
+      oneOf: [{ type: 'string' }, { type: 'array', items: {} }, { type: 'object' }],
+    },
+    tool_uses: { type: 'array', items: { type: 'object' } },
+    parent_tool_use_id: { type: 'string', nullable: true },
+    metadata: { type: 'object', additionalProperties: true },
+  };
 
   app.use('/messages', messagesService, {
     methods: [...MESSAGES_SERVICE_TRANSPORT_METHODS],
@@ -341,20 +371,37 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     ],
     docs: {
       description: 'Conversation messages within AI agent sessions',
+      refs: { createRequest: 'messagesCreate', createResponse: 'messages' },
       definitions: {
         messages: {
           type: 'object',
+          properties: messageOpenApiProperties,
+        },
+        messagesCreate: {
+          type: 'object',
+          required: [
+            'session_id',
+            'type',
+            'role',
+            'index',
+            'timestamp',
+            'content_preview',
+            'content',
+          ],
+          additionalProperties: false,
+          properties: messageOpenApiProperties,
+        },
+        messagesList: {
+          type: 'object',
+          required: ['total', 'limit', 'skip', 'data'],
           properties: {
-            message_id: { type: 'string', format: 'uuid' },
-            session_id: { type: 'string', format: 'uuid' },
-            task_id: { type: 'string', format: 'uuid' },
-            type: {
-              type: 'string',
-              enum: ['user', 'assistant', 'system', 'tool_use', 'tool_result'],
+            total: { type: 'integer', minimum: 0 },
+            limit: { type: 'integer', minimum: 0, maximum: MESSAGE_PAGINATION.MAX_LIMIT },
+            skip: { type: 'integer', minimum: 0 },
+            data: {
+              type: 'array',
+              items: { $ref: '#/components/schemas/messages' },
             },
-            role: { type: 'string' },
-            content: { type: 'string' },
-            created_at: { type: 'string', format: 'date-time' },
           },
         },
       },

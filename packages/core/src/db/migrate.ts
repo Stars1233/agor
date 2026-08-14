@@ -48,6 +48,10 @@ const OFFLINE_CUTOVER_MIGRATIONS = new Set([
   '0074_knowledge_embedding_claims',
   '0078_mcp_oauth_pending_flows',
   '0082_github_install_state',
+  // This index migration uses regular CREATE INDEX. Existing multi-daemon
+  // PostgreSQL installations must stop writers while it is built; embedded
+  // SQLite remains a single-daemon migration.
+  '0083_transcript_hydration_keysets',
 ]);
 
 export interface RunMigrationsOptions {

@@ -60,6 +60,7 @@ import {
   branchQueryValidator,
   mcpCatalogQueryValidator,
   mcpServerQueryValidator,
+  messageQueryValidator,
   repoQueryValidator,
   sessionQueryValidator,
   taskQueryValidator,
@@ -119,6 +120,7 @@ import {
   protectExternalProviderFailureMetadata,
 } from './hooks/classify-missing-credential.js';
 import { gatewayRouteHook } from './hooks/gateway-route.js';
+import { validateMessageCreate } from './hooks/validate-message-create.js';
 import { resolveForUserIdWithGate } from './oauth-auth-helpers.js';
 import { protectExternalPermissionMessageWrites } from './permissions/permission-message-boundary.js';
 import type { RedisRealtimeRuntime } from './realtime/redis-realtime.js';
@@ -1136,7 +1138,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   app.service('messages').hooks({
     before: {
-      all: [requireAuth, executorRuntimeScopeGuard()],
+      all: [typedValidateQuery(messageQueryValidator), requireAuth, executorRuntimeScopeGuard()],
       find: [
         // RBAC: Scope messages.find() to sessions the caller can access.
         // Without this backstop, any authenticated member could list messages
@@ -1155,6 +1157,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
       create: [
         requireMinimumRole(ROLES.MEMBER, 'create messages'),
+        validateMessageCreate,
         protectProviderFailureMetadata,
         protectWidgetMessageWrites,
         protectPermissionMessageWrites,
