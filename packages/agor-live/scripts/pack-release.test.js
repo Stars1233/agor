@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -9,6 +9,27 @@ import { createPublishManifest, packRelease } from './pack-release.mjs';
 import { BUNDLED_INTERNAL_PACKAGES } from './package-contract.js';
 
 const execFileAsync = promisify(execFile);
+
+test('CLI runs when pack-release is reached through a symlink', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('creating symlinks requires additional privileges on Windows');
+    return;
+  }
+  const fixture = await mkdtemp(join(tmpdir(), 'agor-live-invocation-test-'));
+  const linkedScripts = join(fixture, 'scripts');
+  try {
+    await symlink(import.meta.dirname, linkedScripts, 'dir');
+    await assert.rejects(
+      execFileAsync(process.execPath, [join(linkedScripts, 'pack-release.mjs'), '--destination']),
+      (error) => {
+        assert.match(error.stderr, /--destination requires a directory/);
+        return true;
+      }
+    );
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
 
 test('publish manifest resolves the client workspace edge without install scripts', () => {
   const source = {
