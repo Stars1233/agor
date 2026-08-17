@@ -13,6 +13,7 @@ import { type AgorConfig, createUserProcessEnvironment } from '@agor/core/config
 import {
   BranchRepository,
   getCurrentTenantId,
+  RepoRepository,
   runWithTenantDatabaseScope,
   shortId,
   type TenantScopeAwareDatabase,
@@ -40,7 +41,12 @@ import {
 } from '../terminal-socket-connection.js';
 import { REMOVED_AGENTIC_TOOL_RUNTIME_MESSAGE } from '../utils/agentic-tool-runtime.js';
 import { hasBranchPermission } from '../utils/branch-authorization.js';
-import { generateScopedServiceToken, spawnExecutorFireAndForget } from '../utils/spawn-executor.js';
+import { resolveOwnerHomeStore, resolveSandboxStoragePaths } from '../utils/sandbox-context.js';
+import {
+  generateScopedServiceToken,
+  getDaemonUrl,
+  spawnExecutorFireAndForget,
+} from '../utils/spawn-executor.js';
 
 const TERMINAL_EXECUTOR_TOKEN_TTL = '30d';
 
@@ -275,6 +281,48 @@ export class TerminalsService {
     const executorEnv = await this.withTenantDatabase((tenantDb) =>
       createUserProcessEnvironment(userId, tenantDb, undefined, !!impersonation.unixUser)
     );
+
+    // Sandbox mount context for the terminal. The OWNER is the terminal user
+    // (they opened the shell), so the per-user home overlay + RBAC branch mount
+    // key off `userId` — unlike prompts, which key off session.created_by.
+    const sandboxCfg = config.execution?.sandbox;
+    const rbacOn = config.execution?.branch_rbac === true;
+    let sandboxHomeStore: string | undefined;
+    let sandboxBaseRepoPath: string | undefined;
+    const sandboxWorktreesRoot =
+      sandboxCfg?.enabled === true
+        ? resolveSandboxStoragePaths(config, tenantId).worktreesRoot
+        : undefined;
+    let principalBranchAccess: 'write' | 'read' | 'none' = 'write';
+    if (sandboxCfg?.enabled === true) {
+      if (branch.storage_mode !== 'clone' && branch.repo_id) {
+        sandboxBaseRepoPath = await this.withTenantDatabase((tenantDb) =>
+          new RepoRepository(tenantDb)
+            .findById(branch.repo_id)
+            .then((r) => r?.local_path ?? undefined)
+        );
+      }
+      if (rbacOn) {
+        const access = await this.withTenantDatabase((tenantDb) =>
+          new BranchRepository(tenantDb).resolveUserAccess(branch, userId)
+        );
+        principalBranchAccess =
+          access.fs_access === 'write' ? 'write' : access.fs_access === 'read' ? 'read' : 'none';
+        if (principalBranchAccess === 'none') {
+          throw new Forbidden(
+            'You have no filesystem access to this branch; cannot open a sandboxed terminal on it.'
+          );
+        }
+      }
+      if (sandboxCfg.home_mode === 'per_user') {
+        sandboxHomeStore = resolveOwnerHomeStore({
+          config,
+          tenantId,
+          ownerUserId: userId,
+          filesystemHome: user?.filesystem_home,
+        });
+      }
+    }
     const identity = this.app.get('distributedWorkIdentity') ?? {
       instanceId: 'daemon',
       bootId: `process-${process.pid}`,
@@ -307,7 +355,7 @@ export class TerminalsService {
       },
       TERMINAL_EXECUTOR_TOKEN_TTL
     );
-    const daemonUrl = `http://127.0.0.1:${config.daemon?.port || 3030}`;
+    const daemonUrl = getDaemonUrl();
 
     this.terminals.set(terminalId, terminal);
     this.terminalByScope.set(scopeKey, terminalId);
@@ -331,6 +379,12 @@ export class TerminalsService {
             cwd: branch.path,
             cols: data.cols || 160,
             rows: data.rows || 40,
+            // Sandbox mount context (consumed in spawn-executor → buildSandboxWrap).
+            // Undefined when the sandbox / per_user home is off.
+            sandboxHomeStore,
+            sandboxBaseRepoPath,
+            sandboxWorktreesRoot,
+            principalBranchAccess,
           },
         },
         {
