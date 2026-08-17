@@ -1,4 +1,4 @@
-import type { Database } from '@agor/core/db';
+import { type Database, runWithTenantContext } from '@agor/core/db';
 import type { User, UserID } from '@agor/core/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -16,13 +16,16 @@ vi.mock('@agor/core/db', async () => {
   const actual = await vi.importActual<Record<string, unknown>>('@agor/core/db');
   return {
     ...actual,
+    runWithTenantDatabaseScope: vi.fn(
+      async (_db: unknown, _tenantId: string, work: (tenantDb: unknown) => unknown) => work({})
+    ),
     UsersRepository: class {
       findById = mocks.findById;
     },
   };
 });
 
-import { resolveExecutorReadAsUser } from './executor-read-impersonation.js';
+import { resolveDelegatedExecutionHomeKey } from './executor-delegated-home.js';
 
 const db = {} as Database;
 const user = {
@@ -35,27 +38,11 @@ beforeEach(() => {
   mocks.loadConfigSync.mockReturnValue({ execution: { unix_user_mode: 'simple' } });
 });
 
-describe('resolveExecutorReadAsUser', () => {
+describe('resolveDelegatedExecutionHomeKey', () => {
   it('does not force sudo in simple mode', async () => {
     await expect(
-      resolveExecutorReadAsUser(db, user, mocks.loadConfigSync())
+      resolveDelegatedExecutionHomeKey(db, user, mocks.loadConfigSync())
     ).resolves.toBeUndefined();
-  });
-
-  it('leaves insulated mode to configured executor defaults', async () => {
-    mocks.loadConfigSync.mockReturnValue({
-      execution: { unix_user_mode: 'insulated', executor_unix_user: 'agor_executor' },
-    });
-    await expect(
-      resolveExecutorReadAsUser(db, user, mocks.loadConfigSync())
-    ).resolves.toBeUndefined();
-  });
-
-  it('returns the requesting unix_username in strict mode', async () => {
-    mocks.loadConfigSync.mockReturnValue({ execution: { unix_user_mode: 'strict' } });
-    await expect(resolveExecutorReadAsUser(db, user, mocks.loadConfigSync())).resolves.toBe(
-      'alice'
-    );
   });
 
   it('reports the requesting unix_username to a delegated executor command template', async () => {
@@ -67,25 +54,19 @@ describe('resolveExecutorReadAsUser', () => {
     });
     mocks.findById.mockResolvedValue(user);
 
-    await expect(resolveExecutorReadAsUser(db, user.user_id, mocks.loadConfigSync())).resolves.toBe(
-      'alice'
-    );
+    await expect(
+      runWithTenantContext('tenant-test', () =>
+        resolveDelegatedExecutionHomeKey(db, user.user_id, mocks.loadConfigSync())
+      )
+    ).resolves.toBe('alice');
     expect(mocks.findById).toHaveBeenCalledWith(user.user_id);
   });
 
   it('does not turn delegated local execution into sudo impersonation', async () => {
     mocks.loadConfigSync.mockReturnValue({ execution: { unix_user_mode: 'delegated' } });
     await expect(
-      resolveExecutorReadAsUser(db, user, mocks.loadConfigSync())
+      resolveDelegatedExecutionHomeKey(db, user, mocks.loadConfigSync())
     ).resolves.toBeUndefined();
-  });
-
-  it('loads a user id and fails clearly when strict mode lacks unix_username', async () => {
-    mocks.loadConfigSync.mockReturnValue({ execution: { unix_user_mode: 'strict' } });
-    mocks.findById.mockResolvedValue({ user_id: user.user_id });
-    await expect(
-      resolveExecutorReadAsUser(db, user.user_id, mocks.loadConfigSync())
-    ).rejects.toThrow(/unix_username/);
   });
 
   it('fails before launch when a delegated command template lacks unix_username', async () => {
@@ -98,7 +79,23 @@ describe('resolveExecutorReadAsUser', () => {
     mocks.findById.mockResolvedValue({ user_id: user.user_id });
 
     await expect(
-      resolveExecutorReadAsUser(db, user.user_id, mocks.loadConfigSync())
+      runWithTenantContext('tenant-test', () =>
+        resolveDelegatedExecutionHomeKey(db, user.user_id, mocks.loadConfigSync())
+      )
     ).rejects.toThrow(/unix_username/);
+  });
+
+  it('fails closed when an id lookup has no active tenant context', async () => {
+    mocks.loadConfigSync.mockReturnValue({
+      execution: {
+        unix_user_mode: 'delegated',
+        executor_command_template: 'launcher --user {unix_user} -- agor-executor --stdin',
+      },
+    });
+
+    await expect(
+      resolveDelegatedExecutionHomeKey(db, user.user_id, mocks.loadConfigSync())
+    ).rejects.toThrow(/Missing active tenant context/);
+    expect(mocks.findById).not.toHaveBeenCalled();
   });
 });
