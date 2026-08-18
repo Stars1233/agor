@@ -1,6 +1,6 @@
 {
   "name": "@agor/cli",
-  "version": "0.25.1",
+  "version": "0.25.2",
   "private": true,
   "type": "module",
   "bin": {
@@ -47,6 +47,46 @@
     "hooks": {
       "command_not_found": "./dist/hooks/command-not-found.js",
       "prerun": "./dist/hooks/prerun.js"
+    },
+    "topics": {
+      "board": {
+        "description": "Manage boards"
+      },
+      "branch": {
+        "description": "Manage branches and their environments"
+      },
+      "daemon": {
+        "description": "Manage the local daemon lifecycle"
+      },
+      "db": {
+        "description": "Manage local database migrations"
+      },
+      "local": {
+        "description": "Run local filesystem operations"
+      },
+      "mcp": {
+        "description": "Manage MCP servers"
+      },
+      "repo": {
+        "description": "Manage repositories"
+      },
+      "session": {
+        "description": "Inspect agent sessions"
+      },
+      "telemetry": {
+        "description": "Manage community telemetry"
+      },
+      "tenant": {
+        "description": "Manage local tenant data operations",
+        "subtopics": {
+          "gate": {
+            "description": "Manage tenant write gates"
+          }
+        }
+      },
+      "user": {
+        "description": "Manage user accounts"
+      }
     }
   }
 }
