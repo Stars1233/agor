@@ -12,6 +12,7 @@ import path from 'node:path';
 import * as yaml from 'js-yaml';
 import { type InstallableAgenticTool, isInstallableAgenticTool } from '../agentic-integrations';
 import type { AgenticToolName } from '../types';
+import { normalizeHttpBaseUrl } from '../utils/url';
 import { getDefaultAnalyticsConfig } from './analytics-defaults.js';
 import { DAEMON, MCP_TOKEN } from './constants';
 import { validateRedisKeyPrefix, validateRedisUrl } from './deployment';
@@ -480,6 +481,7 @@ function validateConfig(config: AgorConfig): void {
     }
   }
   only(config.daemon, 'daemon', [
+    'deployment_id',
     'port',
     'host',
     'host_ip_address',
@@ -797,6 +799,18 @@ function validateConfig(config: AgorConfig): void {
   validateExternalLaunchReturnHostParam(config);
 }
 
+/** Return the deployment identity after enforcing the daemon startup invariant. */
+export function requireDeploymentId(config: AgorConfig): string {
+  const deploymentId = config.daemon?.deployment_id;
+  if (
+    typeof deploymentId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deploymentId)
+  ) {
+    throw new Error("Config error: 'daemon.deployment_id' is required and must be a valid UUID");
+  }
+  return deploymentId;
+}
+
 /**
  * Query-parameter name the UI reserves for the relative deep-link it forwards
  * to the launch-init endpoint (see apps/agor-ui/src/utils/launchInitUrl.ts). The
@@ -935,6 +949,50 @@ export async function loadConfig(): Promise<AgorConfig> {
 export async function loadConfigFromFile(filePath: string): Promise<AgorConfig> {
   const content = await fs.readFile(filePath, 'utf-8');
   return parseAndValidateConfig(content);
+}
+
+/**
+ * Explicit upgrade escape hatch for configs created before deployment identity
+ * became mandatory. This is deliberately not a relaxed config loader: the
+ * returned value is validated only after the generated identity is inserted.
+ */
+export async function migrateConfigDeploymentId(
+  filePath = getConfigPath(),
+  deploymentId = randomUUID()
+): Promise<{ config: AgorConfig; deploymentId: string; backupPath: string }> {
+  const content = await fs.readFile(filePath, 'utf-8');
+  const parsed = (yaml.load(content) ?? {}) as AgorConfig;
+  if (parsed.daemon?.deployment_id) {
+    validateConfig(parsed);
+    try {
+      requireDeploymentId(parsed);
+      return { config: parsed, deploymentId: parsed.daemon.deployment_id, backupPath: filePath };
+    } catch {
+      // The explicitly-confirmed migration also repairs malformed legacy IDs.
+    }
+  }
+  parsed.daemon = { ...parsed.daemon, deployment_id: deploymentId };
+  validateConfig(parsed);
+  requireDeploymentId(parsed);
+
+  const backupPath = `${filePath}.backup-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+  await fs.copyFile(filePath, backupPath, fs.constants.COPYFILE_EXCL);
+  const stat = await fs.stat(filePath);
+  const tempPath = `${filePath}.rewrite-${process.pid}-${randomUUID()}`;
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(tempPath, 'wx', stat.mode & 0o7777);
+    await handle.writeFile(yaml.dump(parsed, { indent: 2, lineWidth: 120, noRefs: true }), 'utf-8');
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await fs.rename(tempPath, filePath);
+  } finally {
+    await handle?.close();
+    await fs.rm(tempPath, { force: true });
+  }
+  invalidateConfigCache();
+  return { config: parsed, deploymentId, backupPath };
 }
 
 /**
@@ -1342,15 +1400,14 @@ export async function getConfigValue(key: string): Promise<string | boolean | nu
  * @returns Daemon URL (e.g., "http://localhost:3030")
  */
 export async function getDaemonUrl(): Promise<string> {
-  // 1. Check for explicit DAEMON_URL env var (highest priority)
-  if (process.env.DAEMON_URL) {
-    console.log('[getDaemonUrl] Using DAEMON_URL from env:', process.env.DAEMON_URL);
-    return process.env.DAEMON_URL;
-  }
+  return resolveDaemonUrl(await loadConfig());
+}
 
-  console.log('[getDaemonUrl] DAEMON_URL not in env, loading config...');
-  // 2. Construct from host:port (always localhost for internal communication)
-  return constructDaemonLocalUrl(await loadConfig());
+/** Resolve the internal daemon URL from an already processed config snapshot. */
+export function resolveDaemonUrl(config: AgorConfig): string {
+  return process.env.DAEMON_URL
+    ? normalizeHttpBaseUrl(process.env.DAEMON_URL, 'DAEMON_URL')
+    : constructDaemonLocalUrl(config);
 }
 
 /**
