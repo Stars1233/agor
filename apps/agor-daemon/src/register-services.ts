@@ -197,8 +197,10 @@ import {
   shouldExposeMCPServerSecretsForSessionToken,
 } from './utils/mcp-header-secrets.js';
 import {
+  isMcpGrantOwnerEntitled,
   isSessionMcpServerLinkVisibleToCaller,
   loadMcpServerForCaller,
+  registerMcpCapabilityRoleFloor,
 } from './utils/mcp-server-authorization.js';
 import { resolveOwnerHomeStore, resolveSandboxStoragePaths } from './utils/sandbox-context.js';
 import { type SpawnExecutorOptions, spawnExecutor } from './utils/spawn-executor.js';
@@ -1470,13 +1472,25 @@ async function registerMCPServices(
    */
   const AWAIT_TOKEN_TIMEOUT_MS = 5 * 60 * 1000;
 
+  /**
+   * How long a standalone pending flow may sit between `oauth-start` and the
+   * provider redirect.
+   *
+   * Enforced wherever a flow is *taken*, not only by the sweeper below. A
+   * periodic job alone makes this a TTL plus up to one sweep interval of
+   * jitter, and the reason the extra minute matters is that a demotion can land
+   * inside it — the flow would then be consumed and its token persisted.
+   */
+  const LOCAL_OAUTH_FLOW_TTL_MS = 10 * 60 * 1000;
+  const isLocalOAuthFlowExpired = (flow: PendingOAuthFlow): boolean =>
+    Date.now() - flow.createdAt > LOCAL_OAUTH_FLOW_TTL_MS;
+
   // Standalone cleanup remains process-local. PostgreSQL cleanup is a
   // fleet-safe, idempotent state-machine transition plus terminal retention.
   const oauthCleanupTimer = setInterval(() => {
     const now = Date.now();
-    const tenMinutes = 10 * 60 * 1000;
     for (const [state, flow] of pendingOAuthFlows.entries()) {
-      if (now - flow.createdAt > tenMinutes) {
+      if (isLocalOAuthFlowExpired(flow)) {
         pendingOAuthFlows.delete(state);
         localOAuthAttemptStatuses.set(flow.attemptId, {
           status: 'expired',
@@ -1878,30 +1892,62 @@ async function registerMCPServices(
     (params as (AuthenticatedParams & { tenant?: { tenant_id?: string } }) | undefined)?.tenant
       ?.tenant_id ?? getCurrentTenantId();
 
-  const assertDurableFlowStillAuthorized = async (
+  /**
+   * The standing of whoever started a flow, re-asked at the moment it completes.
+   *
+   * `oauth-start` carries a role floor, but the provider redirect can arrive
+   * minutes later — up to the 10-minute pending-flow TTL — and the callback is
+   * unauthenticated, so nothing between the two re-asks. Without this, a member
+   * who starts a flow and is demoted before finishing it still gets a token
+   * exchanged and persisted, which is the floor being on the start rather than
+   * on the issuance.
+   *
+   * Keyed on the flow's recorded initiator, not on a caller: at the callback
+   * there is no caller, only `state`. Both deployment modes record one — the
+   * durable record on Postgres and the in-memory entry on SQLite — so this
+   * covers both, which is why it sits ahead of the `!record` return below
+   * rather than inside the durable-only block.
+   *
+   * Fails closed when the flow names no initiator. Every flow-start path takes
+   * its `userId` from an authenticated caller, so an unattributable flow is not
+   * a legitimate case to keep working.
+   */
+  const assertFlowInitiatorStillEntitled = async (
+    initiatorId: string | undefined,
+    tenantId: string | undefined,
+    oauthMode: 'per_user' | 'shared'
+  ): Promise<void> => {
+    if (!(await isMcpGrantOwnerEntitled(db, tenantId, initiatorId, oauthMode))) {
+      throw new Error(
+        oauthMode === 'shared'
+          ? 'Shared MCP OAuth grant requires current admin access'
+          : 'MCP OAuth grant requires current member access'
+      );
+    }
+  };
+
+  const assertPendingFlowStillAuthorized = async (
     pendingFlow: PendingOAuthFlow,
     afterProviderExchange = false
   ): Promise<void> => {
     const record = pendingFlow.durableRecord;
-    if (!record) return;
     try {
+      await assertFlowInitiatorStillEntitled(
+        record?.userId ?? pendingFlow.userId,
+        record?.tenantId ?? pendingFlow.tenantId,
+        record?.oauthMode ?? pendingFlow.oauthMode ?? 'per_user'
+      );
+      if (!record) return;
       await runInOAuthTenantScope(db, record.tenantId, async () => {
-        const [server, user] = await Promise.all([
-          new MCPServerRepository(db).findById(record.mcpServerId),
-          new UsersRepository(db).findById(record.userId),
-        ]);
+        const server = await new MCPServerRepository(db).findById(record.mcpServerId);
         if (
           !server?.enabled ||
-          !user ||
           server.auth?.type !== 'oauth' ||
           (server.auth.oauth_mode ?? 'per_user') !== record.oauthMode ||
           server.url !== pendingFlow.context.resourceUri ||
           !isMCPOAuthGrantBindingVersion(record.configFingerprintVersion)
         ) {
           throw new Error('MCP OAuth server configuration changed; restart authorization');
-        }
-        if (record.oauthMode === 'shared' && !hasMinimumRole(user.role, ROLES.ADMIN)) {
-          throw new Error('Shared MCP OAuth grant requires current admin access');
         }
         const fingerprint = fingerprintMCPOAuthGrantConfiguration(
           process.env.AGOR_MASTER_SECRET!,
@@ -1981,7 +2027,7 @@ async function registerMCPServices(
           pendingFlow.durableRecord.mcpServerId
         );
       }
-      await assertDurableFlowStillAuthorized(pendingFlow, true);
+      await assertPendingFlowStillAuthorized(pendingFlow, true);
       await work();
       if (pendingFlow.durableRecord) {
         const transitioned = await durableOAuthFlows!.finish(
@@ -2145,7 +2191,17 @@ async function registerMCPServices(
           // Consume before the provider call. A second callback can never run
           // the single-use authorization code concurrently.
           pendingOAuthFlows.delete(state);
-          markLocalOAuthAttempt(pendingFlow, 'exchanging');
+          // Age checked on retrieval, not left to the sweeper. That timer runs
+          // once a minute, so a flow created just after a pass stayed usable
+          // for up to 10m59s — a TTL with a jitter window, and the reason the
+          // window matters is that a demotion can land inside it.
+          if (isLocalOAuthFlowExpired(pendingFlow)) {
+            markLocalOAuthAttempt(pendingFlow, 'expired', 'authorization_timed_out');
+            pendingFlow.tokenReject?.(new Error('OAuth flow expired before callback was received'));
+            pendingFlow = undefined;
+          } else {
+            markLocalOAuthAttempt(pendingFlow, 'exchanging');
+          }
         }
       }
       if (!pendingFlow) {
@@ -2158,7 +2214,7 @@ async function registerMCPServices(
       }
 
       try {
-        await assertDurableFlowStillAuthorized(pendingFlow);
+        await assertPendingFlowStillAuthorized(pendingFlow);
         const { completeMCPOAuthFlow } = await import('@agor/core/tools/mcp/oauth-mcp-transport');
         const tokenResponse = await completeMCPOAuthFlow(pendingFlow.context, code, state, {
           cacheToken: false,
@@ -2989,10 +3045,19 @@ async function registerMCPServices(
             };
           }
           pendingOAuthFlows.delete(state);
+          // Same age check the callback applies — see `isLocalOAuthFlowExpired`.
+          if (isLocalOAuthFlowExpired(pendingFlow)) {
+            markLocalOAuthAttempt(pendingFlow, 'expired', 'authorization_timed_out');
+            pendingFlow.tokenReject?.(new Error('OAuth flow expired before callback was received'));
+            return {
+              success: false,
+              error: 'OAuth flow expired or not found. Please start the flow again.',
+            };
+          }
           markLocalOAuthAttempt(pendingFlow, 'exchanging');
         }
 
-        await assertDurableFlowStillAuthorized(pendingFlow);
+        await assertPendingFlowStillAuthorized(pendingFlow);
         const tokenResponse = await completeMCPOAuthFlow(pendingFlow.context, code, state, {
           cacheToken: false,
           issuer,
@@ -3261,6 +3326,25 @@ async function registerMCPServices(
         '@agor/core/tools/mcp/oauth-refresh'
       );
 
+      /**
+       * The grant owner's current standing, for the refresh paths below.
+       *
+       * A refresh is not a read: `refreshAndPersistToken` obtains and stores a
+       * *new* access token, which is issuance by the same definition the rest of
+       * this file uses. The caller here is an executor under a session token or
+       * a service account, so flooring the caller would floor a robot — the
+       * standing that matters belongs to the user the grant is keyed on.
+       *
+       * Resolved once. Every per-user grant in one request belongs to the same
+       * user: `tokenUserId` is the caller's own id, and cross-user lookup is
+       * reserved for service accounts by `resolveForUserIdWithGate`.
+       */
+      let perUserGrantOwnerEntitled: Promise<boolean> | undefined;
+      const isPerUserGrantOwnerEntitled = (): Promise<boolean> => {
+        perUserGrantOwnerEntitled ??= isMcpGrantOwnerEntitled(db, tenantId, userId, 'per_user');
+        return perUserGrantOwnerEntitled;
+      };
+
       await Promise.all(
         serverIds.map(async (serverId) => {
           if (headers[serverId]) return;
@@ -3311,6 +3395,35 @@ async function registerMCPServices(
               headers[serverId] = { error: 'needs_reauth' };
               return;
             }
+
+            /**
+             * Refuse to *extend* a grant whose owner no longer stands where they
+             * did, while still vending one that is already valid.
+             *
+             * That is deliberately where the line falls. A demoted user's
+             * running session keeps its MCP tools until the access token
+             * expires, then reports `needs_reauth` — an error the executor
+             * already surfaces and a person can act on, and which is literally
+             * true: re-authorizing needs member standing back. The alternative,
+             * cutting a running task off the moment its owner is demoted, fails
+             * mid-tool-call with nothing the agent or the user can do about it,
+             * and revoking a credential is not what a role change has ever meant
+             * here (#2301 — demotion is still a column write that revokes
+             * nothing).
+             *
+             * `shared` grants are out of scope: they belong to the tenant rather
+             * than to a person, are admin-only to establish, and have no owner
+             * whose demotion this could describe.
+             */
+            const refreshWouldRun =
+              row.refresh_status === 'refreshing' ||
+              (needsRefresh(row.oauth_token_expires_at) && !!row.oauth_refresh_token);
+            if (refreshWouldRun && mode === 'per_user' && !(await isPerUserGrantOwnerEntitled())) {
+              console.warn('[OAuth AuthHeaders] refresh_refused category=grant_owner_role');
+              headers[serverId] = { error: 'needs_reauth' };
+              return;
+            }
+
             if (row.refresh_status === 'refreshing') {
               try {
                 const observed = await refreshAndPersistToken({
@@ -4049,6 +4162,25 @@ async function registerMCPServices(
   });
 
   app.service('mcp-servers/discover').hooks({ before: { create: [ctx.requireAuth] } });
+
+  /**
+   * Role floor for the endpoints that issue capability rather than exercise it.
+   *
+   * Each of the services above authenticates and then admits the caller who
+   * owns the named row (`loadMcpServerForCaller`). Ownership survives a role
+   * change — nothing revisits `owner_user_id` when a user is demoted — so
+   * without this a user demoted to `viewer` keeps every one of these: starting
+   * an OAuth flow, exchanging the code, refreshing the grant, and re-probing
+   * the server on its stored credential. Configuration CRUD already grew this
+   * floor (`authorizeMcpServerWrite`); these are the rest of it.
+   *
+   * Registered by one pass over `MCP_CAPABILITY_ISSUING_SERVICE_PATHS` — where
+   * the reasoning and the deliberate exclusions live — rather than added to
+   * each `.hooks()` call above, which is spread over ~1,800 lines and is
+   * exactly where the next endpoint would be forgotten. Same shape as the
+   * tenant-identity registration loop.
+   */
+  registerMcpCapabilityRoleFloor(app);
 
   return { oauthCallbackHandler };
 }
