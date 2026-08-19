@@ -205,6 +205,7 @@ import {
 import { resolveOwnerHomeStore, resolveSandboxStoragePaths } from './utils/sandbox-context.js';
 import { type SpawnExecutorOptions, spawnExecutor } from './utils/spawn-executor.js';
 import { classifyExecutorExit } from './utils/task-launch-state.js';
+import { createFreshTenantWriteDatabaseRunner } from './utils/tenant-db-scope.js';
 
 /**
  * Interface for dependencies needed by service registration.
@@ -973,6 +974,10 @@ function createExecuteHandler(
     );
 
     const taskId = data.taskId;
+    const runInFreshTerminationTenantWriteDatabase = createFreshTenantWriteDatabaseRunner(
+      db,
+      tenantId
+    );
 
     // Get branch path (+ authoritative base repo path for the sandbox) and, for
     // RBAC-aware mounting, the session OWNER's effective filesystem access to
@@ -1272,12 +1277,14 @@ function createExecuteHandler(
           if (disposition !== 'authoritative') {
             if (disposition === 'ambiguous') {
               try {
-                await (
-                  app.service('tasks') as unknown as TasksServiceImpl
-                ).recordExecutorStartupWarning(
-                  taskId,
-                  `Executor launcher exited with code ${code ?? 'unknown'}, but configuration says remote work may have been dispatched.`,
-                  { ...params, provider: undefined }
+                await runInFreshTerminationTenantWriteDatabase(() =>
+                  (
+                    app.service('tasks') as unknown as TasksServiceImpl
+                  ).recordExecutorStartupWarning(
+                    taskId,
+                    `Executor launcher exited with code ${code ?? 'unknown'}, but configuration says remote work may have been dispatched.`,
+                    { ...params, provider: undefined }
+                  )
                 );
               } catch (error) {
                 console.warn(`${logPrefix} Failed to record ambiguous launcher exit:`, error);
@@ -1309,6 +1316,7 @@ function createExecuteHandler(
               tool: session.agentic_tool,
               termination: 'requested',
             },
+            runInFreshTenantWriteDatabase: runInFreshTerminationTenantWriteDatabase,
             // A remote executor may connect while its launcher is exiting.
             // Resolve that race only at the row-locked claim.
             ...(spawnContext.mode === 'templated'

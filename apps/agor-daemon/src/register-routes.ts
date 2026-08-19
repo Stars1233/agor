@@ -179,6 +179,7 @@ import { buildTaskLaunchState } from './utils/task-launch-state.js';
 import { normalizeMessageSource, runExistingTask } from './utils/task-runner.js';
 import { isAgenticToolEnabledForTenant } from './utils/tenant-agentic-tool-validation.js';
 import {
+  createFreshTenantWriteDatabaseRunner,
   createTenantDatabaseScopeAroundHook,
   deferWithTenantContext,
 } from './utils/tenant-db-scope.js';
@@ -2696,6 +2697,65 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         if (!id) throw new Error('Session ID required');
         const body = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
         const sessionsServiceWithHooks = app.service('sessions') as unknown as SessionsServiceImpl;
+        const runInFreshTerminationTenantWriteDatabase = createFreshTenantWriteDatabaseRunner(
+          db,
+          getCurrentTenantId()
+        );
+        const session = await inCurrentTenantDatabaseScope(() =>
+          app.service('sessions').get(id, params)
+        );
+
+        // Stop is process control and must use the same authorization policy as
+        // prompting the target session. A session-tier collaborator may view a
+        // teammate's session but must not stop an executor running with that
+        // teammate's identity and credentials. Force-fail deliberately skips
+        // this check and applies its narrower owner-or-admin policy below.
+        if (
+          body.force_unverified !== true &&
+          branchRbacEnabled &&
+          params.provider &&
+          !(params.user as { _isServiceAccount?: boolean } | undefined)?._isServiceAccount
+        ) {
+          const stopUserId = params.user?.user_id as UUID | undefined;
+          if (!stopUserId) {
+            throw new NotAuthenticated('Authentication required to stop a session');
+          }
+          if (!session.branch_id) {
+            throw new Forbidden('Not authorized to stop this session');
+          }
+          const access = await inCurrentTenantDatabaseScope(async () => {
+            const branch = await branchRepository.findById(session.branch_id);
+            if (!branch) return null;
+            const isOwner = await branchRepository.isOwner(branch.branch_id, stopUserId);
+            const branchPermission = await branchRepository.resolveUserPermission(
+              branch,
+              stopUserId
+            );
+            return { branch, branchPermission, isOwner };
+          });
+          if (!access) {
+            throw new NotFound(`Branch ${session.branch_id} not found`);
+          }
+          const { allowed, effectiveLevel } = resolveSessionPromptAccess({
+            branch: access.branch,
+            session,
+            userId: stopUserId,
+            isOwner: access.isOwner,
+            userRole: params.user?.role,
+            allowSuperadmin: superadminOpts.allowSuperadmin,
+            branchPermission: access.branchPermission,
+          });
+          if (!allowed) {
+            throw new Forbidden(
+              effectiveLevel === 'session'
+                ? `You have 'session' permission — you can only stop sessions you created. ` +
+                    `This session was created by another user. Ask a branch owner to upgrade ` +
+                    `your access to 'prompt' if you need to stop other users' sessions.`
+                : `You need 'prompt' permission to stop this session. You have ` +
+                    `'${effectiveLevel}' permission.`
+            );
+          }
+        }
         const triggerPreservedQueue = () => {
           deferInFreshTenantScope(params, async () => {
             try {
@@ -2728,13 +2788,15 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
                   stopRouteRepositories.branchRepo.isOwner(branchId, userId),
               });
             });
-            const failedTask = await forceFailUnverifiedTask({
-              app,
-              taskId: target.task.task_id,
-              terminationRequestedAt: target.terminationRequestedAt,
-              confirmation: target.confirmation,
-              params,
-            });
+            const failedTask = await runInFreshTerminationTenantWriteDatabase(() =>
+              forceFailUnverifiedTask({
+                app,
+                taskId: target.task.task_id,
+                terminationRequestedAt: target.terminationRequestedAt,
+                confirmation: target.confirmation,
+                params,
+              })
+            );
             return {
               success: true,
               status: failedTask.status,
@@ -2756,6 +2818,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
                 inCurrentTenantDatabaseScope(() =>
                   findActiveTasksForSession(stopApp, sessionId, stopParams)
                 ),
+              runInFreshTenantWriteDatabase: runInFreshTerminationTenantWriteDatabase,
             },
             id as SessionID,
             params,
