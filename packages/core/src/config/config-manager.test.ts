@@ -9,7 +9,9 @@ import * as yaml from 'js-yaml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   __resetConfigCacheForTests,
+  AtomicConfigPublicationUnsupportedError,
   assertValidEffectiveExecutionConfig,
+  ConfigAlreadyExistsError,
   createInitialConfig,
   ensureBranchCloneDepthAllowed,
   ensureBranchStorageModeAllowed,
@@ -1360,8 +1362,30 @@ describe('initConfig', () => {
       createInitialConfig({ daemon: { port: 3002 } }),
     ]);
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
-    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected?.reason).toBeInstanceOf(ConfigAlreadyExistsError);
     expect([3001, 3002]).toContain((await loadConfig()).daemon?.port);
+  });
+
+  it('explains the filesystem requirement when atomic publication is unsupported', async () => {
+    vi.spyOn(fs, 'link').mockRejectedValueOnce(
+      Object.assign(new Error('hard links are unsupported'), { code: 'EOPNOTSUPP' })
+    );
+
+    let thrown: unknown;
+    try {
+      await createInitialConfig({ daemon: { port: 3001 } });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AtomicConfigPublicationUnsupportedError);
+    expect(thrown).toMatchObject({
+      name: 'AtomicConfigPublicationUnsupportedError',
+      configPath: getConfigPath(),
+      filesystemErrorCode: 'EOPNOTSUPP',
+    });
+    await expect(fs.access(getConfigPath())).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readdir(path.dirname(getConfigPath()))).toEqual([]);
   });
 
   it('preserves existing permission bits during an explicit atomic rewrite', async () => {

@@ -1126,8 +1126,50 @@ export async function migrateConfigDeploymentId(
   return { config: parsed, deploymentId, backupPath };
 }
 
+/** Raised when immutable deployment config has already been published. */
+export class ConfigAlreadyExistsError extends Error {
+  constructor(public readonly configPath: string) {
+    super(`Refusing to overwrite existing config: ${configPath}`);
+    this.name = 'ConfigAlreadyExistsError';
+  }
+}
+
+/** Raised when a filesystem cannot provide atomic create-without-replace. */
+export class AtomicConfigPublicationUnsupportedError extends Error {
+  constructor(
+    public readonly configPath: string,
+    public readonly filesystemErrorCode: string
+  ) {
+    super(
+      `Cannot atomically create ${configPath}: the containing filesystem does not support same-directory hard links (${filesystemErrorCode}). Run Agor with a home directory on a filesystem with hard-link support, or provision config.yaml through configuration management before starting Agor.`
+    );
+    this.name = 'AtomicConfigPublicationUnsupportedError';
+  }
+}
+
+const HARD_LINK_UNSUPPORTED_ERROR_CODES = new Set([
+  'ENOSYS',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'EPERM',
+  'EXDEV',
+]);
+
+async function syncContainingDirectory(filePath: string): Promise<void> {
+  // Node cannot open directories as files on Windows. link(2) still provides
+  // atomic publication there, but directory fsync is a POSIX durability step.
+  if (process.platform === 'win32') return;
+
+  const directoryHandle = await fs.open(path.dirname(filePath), 'r');
+  try {
+    await directoryHandle.sync();
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
 /**
- * Save config to ~/.agor/config.yaml
+ * Save config to ~/.agor/config.yaml without replacing an existing file.
  *
  * Invalidates the in-memory cache so the next load reflects the fresh value.
  */
@@ -1146,21 +1188,33 @@ export async function createInitialConfig(config: AgorConfig = getDefaultConfig(
     yaml.dump(config, { indent: 2, lineWidth: 120, noRefs: true }),
   ].join('\n');
 
+  // Node has no portable rename-without-replace primitive. Publish a fully
+  // written same-directory inode with link(2): the hard-link creation is atomic
+  // and fails with EEXIST rather than replacing operator-owned configuration.
+  const tempPath = `${configPath}.create-${process.pid}-${randomUUID()}`;
   let handle: fs.FileHandle | undefined;
+  let published = false;
   try {
-    // `wx` is the important part of the config ownership contract: two initializers
-    // may race, but neither can replace a file created by the other (or by an
-    // operator/config-management system).
-    handle = await fs.open(configPath, 'wx', 0o600);
+    handle = await fs.open(tempPath, 'wx', 0o600);
     await handle.writeFile(content, 'utf-8');
     await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await fs.link(tempPath, configPath);
+    published = true;
+    await syncContainingDirectory(configPath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      throw new Error(`Refusing to overwrite existing config: ${configPath}`);
+    const errorCode = (error as NodeJS.ErrnoException).code;
+    if (!published && errorCode === 'EEXIST') {
+      throw new ConfigAlreadyExistsError(configPath);
+    }
+    if (!published && errorCode && HARD_LINK_UNSUPPORTED_ERROR_CODES.has(errorCode)) {
+      throw new AtomicConfigPublicationUnsupportedError(configPath, errorCode);
     }
     throw error;
   } finally {
     await handle?.close();
+    await fs.rm(tempPath, { force: true });
   }
   invalidateConfigCache();
 }
@@ -1215,8 +1269,7 @@ export async function saveConfigForTests(config: AgorConfig): Promise<void> {
   try {
     await createInitialConfig(config);
   } catch (error) {
-    if (!(error instanceof Error) || !error.message.startsWith('Refusing to overwrite'))
-      throw error;
+    if (!(error instanceof ConfigAlreadyExistsError)) throw error;
     await rewriteConfigFile(config, { acknowledgedFormattingLoss: true });
   }
 }
