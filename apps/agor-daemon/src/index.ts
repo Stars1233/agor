@@ -66,6 +66,10 @@ import express from 'express';
 import expressStaticGzip from 'express-static-gzip';
 import { scopeExecutorRuntimeAuth } from './auth/executor-runtime-scope.js';
 import { createRequireAuthHook } from './auth/require-auth.js';
+import { reconcileTrackedExecutorGauge } from './executor-tracking.js';
+import { createHttpMetricsMiddleware } from './metrics/http.js';
+import { createDaemonMetrics, NOOP_METRICS, resolveMetricsWorkIdentity } from './metrics/index.js';
+import { type OwnStartupMetrics, runWithStartupMetricsOwner } from './metrics/startup-ownership.js';
 import { RedisRealtimeRuntime } from './realtime/redis-realtime.js';
 import { registerHooks } from './register-hooks.js';
 import { registerRoutes } from './register-routes.js';
@@ -150,6 +154,15 @@ export interface DaemonStartOptions {
  * or from main.ts with no args for direct execution.
  */
 export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
+  await runWithStartupMetricsOwner((ownMetrics) =>
+    startDaemonWithOwnedMetrics(options, ownMetrics)
+  );
+}
+
+async function startDaemonWithOwnedMetrics(
+  options: DaemonStartOptions | undefined,
+  ownMetrics: OwnStartupMetrics
+): Promise<void> {
   // Initialize Handlebars helpers for template rendering
   registerHandlebarsHelpers();
   console.log('✅ Handlebars helpers registered');
@@ -176,7 +189,7 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // Deployment environment overrides are resolved in memory. Container and
   // Kubernetes entrypoints must never materialize them back into config.yaml.
   config = resolveEffectiveConfig(config);
-  requireDeploymentId(config);
+  const deploymentId = requireDeploymentId(config);
   assertValidEffectiveExecutionConfig(config);
   const databaseUrl = resolveDatabaseUrl({ config, env: process.env });
 
@@ -341,6 +354,34 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     },
     generateBootId: generateId,
   });
+  const explicitMetricsInstanceId = process.env.AGOR_DAEMON_INSTANCE_ID?.trim();
+  const metricsWorkIdentity = resolveMetricsWorkIdentity(
+    deployment.mode,
+    distributedWorkIdentity,
+    explicitMetricsInstanceId
+  );
+  const unsafeHaMetricsIdentity =
+    effectiveConfig.metrics?.statsd?.enabled === true && !metricsWorkIdentity;
+  const metrics = unsafeHaMetricsIdentity
+    ? NOOP_METRICS
+    : createDaemonMetrics(effectiveConfig.metrics?.statsd, {
+        workIdentity: metricsWorkIdentity ?? distributedWorkIdentity,
+        deploymentMode: deployment.mode,
+        deploymentId,
+      });
+  ownMetrics(metrics);
+  app.set('metrics', metrics);
+  reconcileTrackedExecutorGauge(app);
+  if (unsafeHaMetricsIdentity) {
+    console.warn(
+      '[metrics.statsd] Metrics disabled: HA requires a stable, unique AGOR_DAEMON_INSTANCE_ID per replica (letters, digits, dot, underscore, or hyphen; max 100 characters) so gauges cannot collapse into a last-writer-wins series.'
+    );
+  }
+  if (metrics.enabled) {
+    console.log(
+      `📈 DogStatsD metrics enabled (${effectiveConfig.metrics?.statsd?.host}:${effectiveConfig.metrics?.statsd?.port}, prefix=${effectiveConfig.metrics?.statsd?.prefix})`
+    );
+  }
   const realtimeRuntime =
     deployment.mode === 'ha'
       ? new RedisRealtimeRuntime(deployment.redis, distributedWorkIdentity)
@@ -495,6 +536,15 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
       }) as never
     );
   }
+
+  // Start API transport timing before body parsing so malformed/oversized
+  // payload responses are visible too. Static/UI and the OAuth callback are
+  // excluded by code-defined prefixes rather than becoming route tags.
+  app.use(
+    createHttpMetricsMiddleware(app, metrics, {
+      excludedPathPrefixes: [UI_MOUNT_PATH, '/static', '/mcp-servers/oauth-callback'],
+    }) as never
+  );
 
   // Default to a 10MB JSON body. The previous 10MB pre-hardening default was
   // unbounded enough to allow trivial memory-pressure DoS, and a 1MB ceiling

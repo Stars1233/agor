@@ -109,6 +109,8 @@ import {
   publicHealthDb,
 } from './health/payload.js';
 import { registerHealthProbeRoutes } from './health/routes.js';
+import { createFeathersMetricsHook } from './metrics/feathers.js';
+import { getDaemonMetrics } from './metrics/index.js';
 import { resolveForUserIdWithGate } from './oauth-auth-helpers.js';
 import {
   deliverPermissionDecision,
@@ -123,7 +125,11 @@ import {
 } from './services/scheduler.js';
 import type { TerminalsService } from './services/terminals.js';
 import { createUserApiKeysService } from './services/user-api-keys.js';
-import { markAuthenticationUserLookup, markLocalAuthenticationLookup } from './services/users.js';
+import {
+  isAuthenticationUserLookup,
+  markAuthenticationUserLookup,
+  markLocalAuthenticationLookup,
+} from './services/users.js';
 import { resolveWebTerminalCapability } from './terminal-capability.js';
 import { forceFailUnverifiedTask } from './termination-coordinator.js';
 import {
@@ -4612,6 +4618,18 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // ============================================================================
 
   app.hooks({
+    around: {
+      all: [
+        createFeathersMetricsHook(getDaemonMetrics(app), {
+          // Health probes already have HTTP metrics; avoid doubling their
+          // high-frequency signal at the Feathers boundary.
+          excludedServicePaths: ['health'],
+          // JWT/local strategies preserve provider for the serialized entity
+          // lookup even though it is authentication framework work.
+          isInternalCall: (context) => isAuthenticationUserLookup(context.params),
+        }),
+      ],
+    },
     before: {
       all: [enforcePasswordChange],
     },
