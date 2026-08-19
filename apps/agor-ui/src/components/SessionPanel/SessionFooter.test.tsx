@@ -244,6 +244,20 @@ describe('SessionFooter', () => {
     expect(chip.textContent).toContain('3');
   });
 
+  it('centers the MCP count chip against the label instead of its baseline', () => {
+    render(<SessionFooter {...baseProps} sessionMcpServerIds={['a', 'b', 'c']} />, {
+      wrapper: Wrapper,
+    });
+    const count = within(screen.getByTitle(/3 MCP servers need attention/)).getByText('3');
+
+    // Without a flex line on antd's content span the chip falls back to
+    // `vertical-align` against the label's baseline and renders visibly high.
+    const content = count.parentElement;
+    expect(content?.style.display).toBe('inline-flex');
+    expect(content?.style.alignItems).toBe('center');
+    expect(count.style.alignItems).toBe('center');
+  });
+
   it('opens session settings from the final footer overflow action', async () => {
     const onOpenSessionSettings = vi.fn();
     render(<SessionFooter {...baseProps} onOpenSessionSettings={onOpenSessionSettings} />, {

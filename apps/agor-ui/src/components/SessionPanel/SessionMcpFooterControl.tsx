@@ -120,6 +120,8 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
         color="default"
         title={badgeTitle}
         style={{ cursor: 'pointer', height: 22, display: 'inline-flex', alignItems: 'center' }}
+        // antd nests children in a content span, so the root's align-items never reaches the chip.
+        styles={{ content: { display: 'inline-flex', alignItems: 'center' } }}
       >
         <span>MCP</span>
         <AntTag
@@ -141,7 +143,6 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
             fontSize: 10,
             textAlign: 'center',
             fontVariantNumeric: 'tabular-nums',
-            verticalAlign: 'middle',
             // Recolor the count red via semantic tokens only — the neutral chip's
             // geometry (size, radius, shape) is untouched, so the unauthorized
             // state differs from the healthy state purely in color, theme-aware
@@ -152,13 +153,7 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
               : {}),
           }}
         >
-          {/* Numerals have no descender, so they sit optically high in the line
-              box; nudge down ~1px so the digit reads centered in the (now
-              visible, in the error state) chip. Applies in every state so the
-              healthy and unauthorized chips stay pixel-identical bar color. */}
-          <span style={{ display: 'block', transform: 'translateY(1px)' }}>
-            {summary.attachedCount}
-          </span>
+          {summary.attachedCount}
         </AntTag>
       </Tag>
     </Popover>
