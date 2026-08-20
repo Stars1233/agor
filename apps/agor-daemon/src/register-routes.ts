@@ -10,8 +10,10 @@ import { Transform } from 'node:stream';
 import {
   type AgorConfig,
   type ResolvedDeploymentConfig,
+  type ResolvedExternalLaunchProvider,
   requireDeploymentId,
   resolveBranchStorageConfig,
+  resolveIdentityAuthority,
   resolveMultiTenancyConfig,
   resolveSdkWatchdogConfig,
   resolveTeammateFrameworkRepoUrl,
@@ -266,6 +268,7 @@ export interface RegisterRoutesContext {
   db: TenantScopeAwareDatabase;
   app: Application & { io?: import('socket.io').Server };
   config: AgorConfig;
+  externalLaunchProvider: ResolvedExternalLaunchProvider;
   jwtSecret: string;
   branchRbacEnabled: boolean;
   requireAuth: (context: HookContext) => Promise<HookContext>;
@@ -472,6 +475,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     db,
     app,
     config,
+    externalLaunchProvider,
     jwtSecret,
     branchRbacEnabled,
     requireAuth,
@@ -497,6 +501,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   } = ctx;
 
   registerExecutorResponseRoutes(app);
+
+  // Health and launch auth share the exact startup-resolved provider. The
+  // public DTO is immutable and contains no verification or exchange secrets.
+  const publicLaunchAuth = Object.freeze(resolvePublicLaunchAuthSettings(externalLaunchProvider));
 
   const usersService = app.service('users');
   const tasksService = app.service('tasks') as unknown as TasksServiceImpl;
@@ -717,6 +725,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     createLaunchAuthService({
       db,
       config,
+      provider: externalLaunchProvider,
       jwtSecret,
       accessTokenTtl: ACCESS_TOKEN_TTL,
       refreshTokenTtl: REFRESH_TOKEN_TTL,
@@ -4470,7 +4479,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
   app.use('/health', {
     async find(params?: AuthenticatedParams) {
-      const publicLaunchAuth = resolvePublicLaunchAuthSettings(config);
+      const identityAuthority = resolveIdentityAuthority(config);
       // `/health` stays 200 always (pre-login UI fetches must not throw), so the
       // DB signal rides on `status`: ok | degraded. /readyz is the one that 503s.
       // Only { ok, latencyMs } is public; the raw error is authenticated-only below.
@@ -4498,6 +4507,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         auth: {
           requireAuth: true,
           externalLaunch: publicLaunchAuth,
+          identity: identityAuthority,
         },
         instance: {
           label: config.daemon?.instanceLabel,

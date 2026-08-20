@@ -37,6 +37,8 @@ import {
 import type { AgorConfig, ResolvedSecurity } from '@agor/core/config';
 import {
   assertValidEffectiveExecutionConfig,
+  assertValidEffectiveIdentityConfig,
+  assertValidRawConfig,
   getConfigPath,
   loadConfig,
   loadConfigFromFile,
@@ -46,8 +48,10 @@ import {
   resolveDeploymentConfig,
   resolveEffectiveConfig,
   resolveGitConfigParameters,
+  resolveIdentityAuthority,
   resolveMultiTenancyConfig,
   resolveSecurity,
+  resolveValidExternalLaunchProvider,
 } from '@agor/core/config';
 import { generateId, resolveDatabaseUrl } from '@agor/core/db';
 import {
@@ -187,11 +191,17 @@ async function startDaemonWithOwnedMetrics(
       ? await loadConfigFromFile(options.configPath)
       : await loadConfig();
 
+  // Programmatic startup must cross the same untrusted config boundary as
+  // YAML before environment projection reads nested scalar values.
+  assertValidRawConfig(config);
+
   // Deployment environment overrides are resolved in memory. Container and
   // Kubernetes entrypoints must never materialize them back into config.yaml.
   config = resolveEffectiveConfig(config);
   const deploymentId = requireDeploymentId(config);
   assertValidEffectiveExecutionConfig(config);
+  const externalLaunchProvider = resolveValidExternalLaunchProvider(config);
+  assertValidEffectiveIdentityConfig(config);
   const databaseUrl = resolveDatabaseUrl({ config, env: process.env });
 
   // Deployment package availability is instance-global. Validate it before
@@ -732,7 +742,8 @@ async function startDaemonWithOwnedMetrics(
   const { db } = await initializeDatabase(databaseUrl, {
     tenantId: multiTenancy.mode === 'static' ? multiTenancy.static_tenant_id : undefined,
     requireTenantScope: multiTenancy.mode === 'required_from_auth',
-    skipFirstRunAdminBootstrap: effectiveConfig.external_launch?.enabled === true,
+    skipFirstRunAdminBootstrap:
+      !resolveIdentityAuthority(effectiveConfig).capabilities.users.create,
     // The URL may come from DATABASE_URL, but operators still need to size the
     // per-replica pool from config.yaml. Keep this deliberately limited to max:
     // the public idleTimeout setting is documented in milliseconds while the
@@ -849,6 +860,7 @@ async function startDaemonWithOwnedMetrics(
     db,
     app,
     config: effectiveConfig,
+    externalLaunchProvider,
     jwtSecret,
     branchRbacEnabled,
     requireAuth,

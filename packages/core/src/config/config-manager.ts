@@ -23,10 +23,20 @@ import {
   resolveSdkWatchdogConfig,
 } from './executor-heartbeat';
 import { resolveExecutorResponseConfig } from './executor-response';
+import {
+  assertValidRawExternalLaunchConfig,
+  resolveEffectiveExternalLaunchConfig,
+} from './external-launch';
 import { assertValidMultiTenancyConfig } from './multitenancy';
+import { isPlainConfigRecord } from './plain-record';
 import {
   type AgorConfig,
+  AgorExternalIdentityProvider,
+  AgorExternalIdentityProvisioning,
+  AgorLocalAuthMode,
+  AgorRoleAuthority,
   type AgorStatsDSettings,
+  AgorUserLifecycleAuthority,
   BRANCH_STORAGE_MODES,
   type BranchStorageMode,
   DEFAULT_BRANCH_STORAGE_MODE,
@@ -406,7 +416,14 @@ function resolveUnknownConfigKeyPolicy(): UnknownConfigKeyPolicy {
   );
 }
 
+function requirePlainConfigRecord(value: unknown, path: string): void {
+  if (!isPlainConfigRecord(value)) {
+    throw new Error(`Config error: ${path} must be an object`);
+  }
+}
+
 function validateConfig(config: AgorConfig): void {
+  requirePlainConfigRecord(config, 'config');
   const configuredAnalyticsPlugins = (config.analytics as { plugins?: unknown[] } | undefined)
     ?.plugins;
   const removedModulePluginIndex = configuredAnalyticsPlugins?.findIndex(
@@ -491,6 +508,7 @@ function validateConfig(config: AgorConfig): void {
     'ui',
     'database',
     'external_launch',
+    'identity',
     'execution',
     'security',
     'branches',
@@ -513,8 +531,10 @@ function validateConfig(config: AgorConfig): void {
 
   const unknownPaths: string[] = [];
   const only = (value: unknown, path: string, allowed: readonly string[]) => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
-    for (const key of Object.keys(value)) {
+    if (value === undefined) return;
+    requirePlainConfigRecord(value, path);
+    const record = value as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
       if (!allowed.includes(key)) unknownPaths.push(`${path}.${key}`);
     }
   };
@@ -668,6 +688,39 @@ function validateConfig(config: AgorConfig): void {
     'trusted_host_header',
     'return_host_param',
   ]);
+  assertValidRawExternalLaunchConfig(config.external_launch);
+  only(config.identity, 'identity', ['user_lifecycle', 'role_authority', 'local_auth', 'external']);
+  only(config.identity?.external, 'identity.external', ['provider', 'provisioning']);
+  if (
+    config.identity?.user_lifecycle !== undefined &&
+    !Object.values(AgorUserLifecycleAuthority).includes(config.identity.user_lifecycle)
+  ) {
+    throw new Error('Config error: identity.user_lifecycle must be internal or external');
+  }
+  if (
+    config.identity?.role_authority !== undefined &&
+    !Object.values(AgorRoleAuthority).includes(config.identity.role_authority)
+  ) {
+    throw new Error('Config error: identity.role_authority must be internal or claims');
+  }
+  if (
+    config.identity?.local_auth !== undefined &&
+    !Object.values(AgorLocalAuthMode).includes(config.identity.local_auth)
+  ) {
+    throw new Error('Config error: identity.local_auth must be enabled or disabled');
+  }
+  if (
+    config.identity?.external?.provider !== undefined &&
+    config.identity.external.provider !== AgorExternalIdentityProvider.EXTERNAL_LAUNCH
+  ) {
+    throw new Error('Config error: identity.external.provider must be external_launch');
+  }
+  if (
+    config.identity?.external?.provisioning !== undefined &&
+    config.identity.external.provisioning !== AgorExternalIdentityProvisioning.JIT
+  ) {
+    throw new Error('Config error: identity.external.provisioning must be jit');
+  }
   if (config.uploads !== undefined) {
     if (
       typeof config.uploads.location !== 'undefined' &&
@@ -968,14 +1021,14 @@ function validateConfig(config: AgorConfig): void {
   }
 
   assertValidMultiTenancyConfig(config);
+}
 
-  validateOptionalHttpUrl(
-    config.external_launch as Record<string, unknown> | undefined,
-    'login_redirect_url',
-    'external_launch.login_redirect_url'
-  );
-
-  validateExternalLaunchReturnHostParam(config);
+/**
+ * Validate a preloaded/programmatic config through the same raw boundary used
+ * for YAML. Daemon startup calls this before applying environment overrides.
+ */
+export function assertValidRawConfig(config: AgorConfig): void {
+  validateConfig(config);
 }
 
 /** Return the deployment identity after enforcing the daemon startup invariant. */
@@ -988,55 +1041,6 @@ export function requireDeploymentId(config: AgorConfig): string {
     throw new Error("Config error: 'daemon.deployment_id' is required and must be a valid UUID");
   }
   return deploymentId;
-}
-
-/**
- * Query-parameter name the UI reserves for the relative deep-link it forwards
- * to the launch-init endpoint (see apps/agor-ui/src/utils/launchInitUrl.ts). The
- * host param must never reuse this name: the UI sets `return_to` first and then
- * the host param, so an equal name would overwrite the deep-link with the host.
- */
-const RESERVED_RETURN_TO_PARAM = 'return_to';
-
-function validateExternalLaunchReturnHostParam(config: AgorConfig): void {
-  const raw = config.external_launch?.return_host_param;
-  if (raw === undefined) return;
-  if (typeof raw !== 'string') {
-    throw new Error('Config error: external_launch.return_host_param must be a string');
-  }
-  // An empty value intentionally falls back to the default (`return_host`) at
-  // resolve time, so it is left untouched here.
-  if (raw === '') return;
-  if (raw === RESERVED_RETURN_TO_PARAM) {
-    throw new Error(
-      `Config error: external_launch.return_host_param must not be "${RESERVED_RETURN_TO_PARAM}" — ` +
-        'that name is reserved for the relative deep-link the UI forwards to the launch-init ' +
-        'endpoint, and reusing it would overwrite the deep-link with the return host.'
-    );
-  }
-  // Conservative query-parameter-name charset: the value becomes a URL query
-  // key, so restrict it to opaque identifier characters and reject separators.
-  if (!/^[A-Za-z0-9_.-]+$/.test(raw)) {
-    throw new Error(
-      'Config error: external_launch.return_host_param may only contain letters, digits, ' +
-        'underscore, hyphen, and dot'
-    );
-  }
-}
-
-function validateOptionalHttpUrl(
-  container: Record<string, unknown> | undefined,
-  key: string,
-  configPath: string
-): void {
-  if (!container || container[key] === undefined) return;
-
-  const raw = container[key];
-  if (typeof raw !== 'string') {
-    throw new Error(`Config error: ${configPath} must be an HTTP(S) URL string`);
-  }
-
-  container[key] = validateHttpUrlString(raw, configPath);
 }
 
 function validateHttpUrlString(
@@ -1383,6 +1387,7 @@ export function resolveEffectiveConfig(
     'AGOR_STATSD_ENABLED'
   );
   const statsdPort = parseOptionalPortEnvironmentValue(env.AGOR_STATSD_PORT, 'AGOR_STATSD_PORT');
+  const externalLaunch = resolveEffectiveExternalLaunchConfig(config.external_launch, env);
 
   // Resolve the effective Unix isolation mode (env override wins) so the
   // `sandbox` mode can imply the rest of its machinery.
@@ -1453,6 +1458,7 @@ export function resolveEffectiveConfig(
       ...(env.INSTANCE_LABEL ? { instanceLabel: env.INSTANCE_LABEL } : {}),
     },
     ui: { ...defaults.ui, ...config.ui },
+    ...(externalLaunch ? { external_launch: externalLaunch } : {}),
     execution: {
       ...defaults.execution,
       ...config.execution,

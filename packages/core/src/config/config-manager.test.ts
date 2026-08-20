@@ -906,6 +906,66 @@ describe('loadConfig', () => {
     expect(loaded.external_launch?.login_redirect_url).toBeUndefined();
   });
 
+  it('loads the explicit external identity authority contract', async () => {
+    const agorDir = path.join(tempDir, '.agor');
+    const configPath = path.join(agorDir, 'config.yaml');
+    await fs.mkdir(agorDir, { recursive: true });
+    await fs.writeFile(
+      configPath,
+      yaml.dump({
+        identity: {
+          user_lifecycle: 'external',
+          role_authority: 'claims',
+          local_auth: 'disabled',
+          external: { provider: 'external_launch', provisioning: 'jit' },
+        },
+      }),
+      'utf-8'
+    );
+
+    await expect(loadConfig()).resolves.toMatchObject({
+      identity: {
+        user_lifecycle: 'external',
+        role_authority: 'claims',
+        local_auth: 'disabled',
+        external: { provider: 'external_launch', provisioning: 'jit' },
+      },
+    });
+  });
+
+  it('rejects unknown identity keys and unsupported authority values', async () => {
+    const agorDir = path.join(tempDir, '.agor');
+    const configPath = path.join(agorDir, 'config.yaml');
+    await fs.mkdir(agorDir, { recursive: true });
+    await fs.writeFile(
+      configPath,
+      yaml.dump({ identity: { user_lifecycle: 'remote', surprise: true } }),
+      'utf-8'
+    );
+
+    await expect(loadConfig()).rejects.toThrow(/identity\.user_lifecycle|identity\.surprise/);
+  });
+
+  it('rejects scalar identity and external launch sections', async () => {
+    const agorDir = path.join(tempDir, '.agor');
+    const configPath = path.join(agorDir, 'config.yaml');
+    await fs.mkdir(agorDir, { recursive: true });
+
+    await fs.writeFile(configPath, 'identity: external\n', 'utf-8');
+    await expect(loadConfig()).rejects.toThrow(/identity must be an object/);
+
+    await fs.writeFile(configPath, 'external_launch: enabled\n', 'utf-8');
+    await expect(loadConfig()).rejects.toThrow(/external_launch must be an object/);
+
+    __resetConfigCacheForTests();
+    await fs.writeFile(configPath, 'identity: 2026-08-20\n', 'utf-8');
+    await expect(loadConfig()).rejects.toThrow(/identity must be an object/);
+
+    __resetConfigCacheForTests();
+    await fs.writeFile(configPath, 'external_launch: 2026-08-20\n', 'utf-8');
+    await expect(loadConfig()).rejects.toThrow(/external_launch must be an object/);
+  });
+
   it('accepts an HTTP(S) external launch login redirect URL', async () => {
     const agorDir = path.join(tempDir, '.agor');
     const configPath = path.join(agorDir, 'config.yaml');
@@ -923,7 +983,8 @@ describe('loadConfig', () => {
     );
 
     const loaded = await loadConfig();
-    expect(loaded.external_launch?.login_redirect_url).toBe('https://workspace.example.com/open');
+    // Validation is non-mutating; startup's retained provider owns normalization.
+    expect(loaded.external_launch?.login_redirect_url).toBe(' https://workspace.example.com/open ');
   });
 
   it('rejects a non-HTTP(S) external launch login redirect URL', async () => {
