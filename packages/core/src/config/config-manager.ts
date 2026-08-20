@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import * as yaml from 'js-yaml';
 import { type InstallableAgenticTool, isInstallableAgenticTool } from '../agentic-integrations';
+import { EXECUTOR_RESPONSE_PROTOCOL } from '../executor-protocol';
 import type { AgenticToolName } from '../types';
 import { normalizeHttpBaseUrl } from '../utils/url';
 import { getDefaultAnalyticsConfig } from './analytics-defaults.js';
@@ -21,6 +22,7 @@ import {
   resolveExecutorHeartbeatConfig,
   resolveSdkWatchdogConfig,
 } from './executor-heartbeat';
+import { resolveExecutorResponseConfig } from './executor-response';
 import { assertValidMultiTenancyConfig } from './multitenancy';
 import {
   type AgorConfig,
@@ -377,6 +379,33 @@ function parseOptionalPortEnvironmentValue(
   return port;
 }
 
+/**
+ * Policy for config keys the daemon does not recognize.
+ *
+ * `error` (default) fails closed — the safe choice for humans editing config,
+ * because a typo like `unix_user_mdoe` is caught instead of silently ignored.
+ *
+ * `warn` tolerates unknown keys (logs each and continues). This exists for
+ * forward compatibility during rolling deploys and rollbacks: config written
+ * for a newer daemon can be read by an older one that predates a purely
+ * ADDITIVE key it can safely ignore (e.g. `execution.executor_response` — an
+ * older daemon just uses its old path). It is NOT safe for a key that changes a
+ * default or security posture the old binary must honor; those still require
+ * deploy ordering. Env-only (not a config key) to avoid the chicken-and-egg of
+ * a strictness switch that could itself be an unknown key, and because it is a
+ * deploy/ops decision that should persist across image rollbacks.
+ */
+type UnknownConfigKeyPolicy = 'error' | 'warn';
+
+function resolveUnknownConfigKeyPolicy(): UnknownConfigKeyPolicy {
+  const raw = process.env.AGOR_UNKNOWN_CONFIG_KEYS?.trim().toLowerCase();
+  if (raw === undefined || raw === '' || raw === 'error') return 'error';
+  if (raw === 'warn') return 'warn';
+  throw new Error(
+    `Config error: AGOR_UNKNOWN_CONFIG_KEYS must be 'error' or 'warn' (got '${process.env.AGOR_UNKNOWN_CONFIG_KEYS}')`
+  );
+}
+
 function validateConfig(config: AgorConfig): void {
   const configuredAnalyticsPlugins = (config.analytics as { plugins?: unknown[] } | undefined)
     ?.plugins;
@@ -691,6 +720,7 @@ function validateConfig(config: AgorConfig): void {
   }
   only(config.execution, 'execution', [
     'executor_heartbeat',
+    'executor_response',
     'sdk_watchdog',
     'dispatch_connect_timeout_ms',
     'unix_user_mode',
@@ -722,6 +752,18 @@ function validateConfig(config: AgorConfig): void {
     'command_template',
     'timeout_ms',
   ]);
+  only(config.execution?.executor_response, 'execution.executor_response', [
+    'max_response_bytes',
+    'max_active_requests',
+    'timeout_ms',
+    'origin_url',
+    'external_protocol',
+  ]);
+  only(config.execution?.executor_response?.timeout_ms, 'execution.executor_response.timeout_ms', [
+    'default',
+    'by_command',
+  ]);
+  resolveExecutorResponseConfig(config.execution?.executor_response);
   only(config.execution?.sdk_watchdog, 'execution.sdk_watchdog', [
     'mode',
     'first_progress_timeout_ms',
@@ -901,9 +943,15 @@ function validateConfig(config: AgorConfig): void {
   // not stop a daemon from booting on upgrade; the keys are read and ignored.
   only(legacyConfig.mcp_catalog, 'mcp_catalog', RETIRED_CONFIG_KEYS.mcp_catalog);
   if (unknownPaths.length > 0) {
-    throw new Error(
-      `Config error: unrecognized ${unknownPaths.length === 1 ? 'key' : 'keys'}: ${unknownPaths.join(', ')}`
-    );
+    const summary = `unrecognized ${unknownPaths.length === 1 ? 'key' : 'keys'}: ${unknownPaths.join(', ')}`;
+    if (resolveUnknownConfigKeyPolicy() === 'warn') {
+      console.warn(
+        `[config] Ignoring ${summary} (AGOR_UNKNOWN_CONFIG_KEYS=warn). This tolerates ` +
+          'config written for a newer daemon; use the default (error) in dev/CI to catch typos.'
+      );
+    } else {
+      throw new Error(`Config error: ${summary}`);
+    }
   }
 
   assertSupportedUnixUserMode(config.execution?.unix_user_mode);
@@ -1379,6 +1427,18 @@ export function resolveEffectiveConfig(
       ...(envHomeMode ? { home_mode: envHomeMode } : {}),
     };
   }
+  const resolvedExecutorResponse =
+    defaults.execution?.executor_response ||
+    config.execution?.executor_response ||
+    env.AGOR_EXECUTOR_RESPONSE_ORIGIN_URL
+      ? {
+          ...defaults.execution?.executor_response,
+          ...config.execution?.executor_response,
+          ...(env.AGOR_EXECUTOR_RESPONSE_ORIGIN_URL
+            ? { origin_url: env.AGOR_EXECUTOR_RESPONSE_ORIGIN_URL }
+            : {}),
+        }
+      : undefined;
 
   const resolved: AgorConfig = {
     ...defaults,
@@ -1396,6 +1456,7 @@ export function resolveEffectiveConfig(
     execution: {
       ...defaults.execution,
       ...config.execution,
+      ...(resolvedExecutorResponse ? { executor_response: resolvedExecutorResponse } : {}),
       ...(env.AGOR_RBAC_ENABLED === 'true' ? { branch_rbac: true } : {}),
       ...(env.AGOR_UNIX_USER_MODE
         ? {
@@ -1457,6 +1518,8 @@ export function assertValidEffectiveExecutionConfig(config: AgorConfig): void {
   const execution = config.execution;
   if (!execution) return;
 
+  const response = resolveExecutorResponseConfig(execution.executor_response);
+
   if (execution.unix_user_mode === 'delegated' && !execution.executor_command_template) {
     throw new Error(
       "execution.unix_user_mode 'delegated' requires execution.executor_command_template so execution is actually delegated to an external substrate."
@@ -1470,6 +1533,17 @@ export function assertValidEffectiveExecutionConfig(config: AgorConfig): void {
     throw new Error(
       `execution.executor_command_template uses removed placeholder(s): ${[...new Set(retiredPlaceholders)].join(', ')}. ` +
         'Use {unix_user} as the opaque delegated execution-home key instead.'
+    );
+  }
+
+  if (
+    execution.executor_command_template &&
+    (response.externalProtocol !== EXECUTOR_RESPONSE_PROTOCOL || !response.originUrl)
+  ) {
+    throw new Error(
+      'execution.executor_command_template requires request-mode response support: set ' +
+        `execution.executor_response.external_protocol=${EXECUTOR_RESPONSE_PROTOCOL} and an exact ` +
+        'execution.executor_response.origin_url for this daemon replica.'
     );
   }
 

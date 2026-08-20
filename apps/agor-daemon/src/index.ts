@@ -26,7 +26,7 @@ import {
 } from '@agor/core/telemetry';
 import { patchConsole } from '@agor/core/utils/logger';
 import { extractDbFilePath } from '@agor/core/utils/path';
-import { UI_MOUNT_PATH } from '@agor/core/utils/url';
+import { deriveLoopbackReachableOrigin, UI_MOUNT_PATH } from '@agor/core/utils/url';
 
 patchConsole();
 
@@ -345,6 +345,7 @@ async function startDaemonWithOwnedMetrics(
   // for existing deployments).
   configureExecutor(effectiveConfig.execution, {
     requireTenantContext: multiTenancy.mode === 'required_from_auth',
+    localResponseOriginUrl: deriveLoopbackReachableOrigin(DAEMON_HOST, DAEMON_PORT),
     sandboxRuntimePaths: {
       homeDir: homedir(),
       dataHome,

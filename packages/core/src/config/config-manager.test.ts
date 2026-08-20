@@ -134,6 +134,34 @@ describe('resolveEffectiveConfig', () => {
     expect(resolved.paths?.data_home).toBe('/from-environment');
   });
 
+  it('projects the replica-local executor response origin without mutating YAML', () => {
+    const input: AgorConfig = {
+      execution: {
+        executor_response: {
+          max_response_bytes: 2 * 1024 * 1024,
+          timeout_ms: {
+            default: 300_000,
+            by_command: { 'branch.files.read': 60_000 },
+          },
+          origin_url: 'https://yaml-daemon.internal',
+        },
+      },
+    };
+    const resolved = resolveEffectiveConfig(input, {
+      AGOR_EXECUTOR_RESPONSE_ORIGIN_URL: 'http://daemon-2.agor.svc:3030',
+    });
+
+    expect(resolved.execution?.executor_response).toEqual({
+      max_response_bytes: 2 * 1024 * 1024,
+      timeout_ms: {
+        default: 300_000,
+        by_command: { 'branch.files.read': 60_000 },
+      },
+      origin_url: 'http://daemon-2.agor.svc:3030',
+    });
+    expect(input.execution?.executor_response?.origin_url).toBe('https://yaml-daemon.internal');
+  });
+
   it('materializes StatsD YAML and strict environment overrides', () => {
     const input: AgorConfig = {
       metrics: {
@@ -283,6 +311,26 @@ describe('assertValidEffectiveExecutionConfig', () => {
     }
   );
 
+  it('requires templated execution to declare request-response support at startup', () => {
+    expect(() =>
+      assertValidEffectiveExecutionConfig({
+        execution: { executor_command_template: 'launcher -- {command}' },
+      })
+    ).toThrow(/requires request-mode response support/);
+
+    expect(() =>
+      assertValidEffectiveExecutionConfig({
+        execution: {
+          executor_command_template: 'launcher -- {command}',
+          executor_response: {
+            external_protocol: 'executor-response-v1',
+            origin_url: 'http://daemon-0.internal:3030',
+          },
+        },
+      })
+    ).not.toThrow();
+  });
+
   it('rejects sandboxing combined with an external executor template', () => {
     expect(() =>
       assertValidEffectiveExecutionConfig({
@@ -414,6 +462,46 @@ describe('loadConfig', () => {
     );
     __resetConfigCacheForTests();
     await expect(loadConfig()).rejects.toThrow(/preserve_canonical_home_alias must be a boolean/);
+  });
+
+  describe('AGOR_UNKNOWN_CONFIG_KEYS forward-compatibility policy', () => {
+    const writeConfigWithFutureKey = async () => {
+      const agorDir = path.join(tempDir, '.agor');
+      await fs.mkdir(agorDir, { recursive: true });
+      // A key an older daemon would not recognize (as if written by a newer one).
+      await fs.writeFile(
+        path.join(agorDir, 'config.yaml'),
+        'execution:\n  a_future_additive_key: true\n',
+        'utf-8'
+      );
+    };
+
+    afterEach(() => {
+      delete process.env.AGOR_UNKNOWN_CONFIG_KEYS;
+    });
+
+    it('rejects unknown keys by default (fails closed, catches typos)', async () => {
+      await writeConfigWithFutureKey();
+      __resetConfigCacheForTests();
+      await expect(loadConfig()).rejects.toThrow(/execution\.a_future_additive_key/);
+    });
+
+    it('tolerates unknown keys and warns when set to warn', async () => {
+      process.env.AGOR_UNKNOWN_CONFIG_KEYS = 'warn';
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await writeConfigWithFutureKey();
+      __resetConfigCacheForTests();
+
+      await expect(loadConfig()).resolves.toBeTruthy();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('execution.a_future_additive_key'));
+    });
+
+    it('rejects an invalid policy value', async () => {
+      process.env.AGOR_UNKNOWN_CONFIG_KEYS = 'lenient';
+      await writeConfigWithFutureKey();
+      __resetConfigCacheForTests();
+      await expect(loadConfig()).rejects.toThrow(/AGOR_UNKNOWN_CONFIG_KEYS must be/);
+    });
   });
 
   it('boots with a full mcp_catalog block from before the catalog moved into the repository', async () => {
@@ -757,11 +845,17 @@ describe('loadConfig', () => {
     await fs.mkdir(agorDir, { recursive: true });
     await fs.writeFile(
       configPath,
-      yaml.dump({ daemon: { surprise: true }, execution: { branch_storage: { mystery: 1 } } }),
+      yaml.dump({
+        daemon: { surprise: true },
+        execution: {
+          branch_storage: { mystery: 1 },
+          executor_response: { timeout_ms: { unexpected: 1 } },
+        },
+      }),
       'utf-8'
     );
     await expect(loadConfig()).rejects.toThrow(
-      /daemon\.surprise.*execution\.branch_storage\.mystery/
+      /daemon\.surprise.*execution\.executor_response\.timeout_ms\.unexpected.*execution\.branch_storage\.mystery/
     );
   });
 
