@@ -201,6 +201,22 @@ describe('loadCuratedCatalog', () => {
     ).toBeGreaterThan(0.2);
   });
 
+  it('files Tavily under its official Registry identity, not an inferred alias', async () => {
+    const source = await fs.readFile(curatedCatalogPath(), 'utf-8');
+    const document = loadYaml(source) as {
+      entries: Array<{ name?: string }>;
+      unpublished: Array<{ name?: string }>;
+    };
+
+    expect(document.entries.map((entry) => entry.name)).toContain('io.github.tavily-ai/tavily-mcp');
+    expect(document.unpublished.map((entry) => entry.name)).not.toContain(
+      'io.github.tavily-ai/tavily-mcp'
+    );
+    expect([...document.entries, ...document.unpublished].map((entry) => entry.name)).not.toContain(
+      'com.tavily/mcp'
+    );
+  });
+
   it('loads the checked-in catalog with complete, unique curation', async () => {
     const entries = await loadCuratedCatalog();
 
@@ -348,6 +364,148 @@ ${block}
 });
 
 describe('the shipped catalog', () => {
+  it('keeps material destructive, sensitive, and operational authority in disclosures', async () => {
+    const entries = await loadCuratedCatalog();
+    const disclosure = (name: string): string => {
+      const entry = entries.find((candidate) => candidate.name === name);
+      expect(entry, `missing catalog entry ${name}`).toBeDefined();
+      return entry!.permission_disclosure;
+    };
+
+    const expectTerms = (name: string, terms: string[]): void => {
+      const copy = disclosure(name).toLowerCase();
+      for (const term of terms) expect(copy).toContain(term.toLowerCase());
+    };
+    expectTerms('io.github.cloudinary/asset-management-mcp', [
+      'creates, moves, and deletes folders',
+      'recursive folder deletion',
+      'all assets',
+    ]);
+    expectTerms('com.netlify/mcp', [
+      'user and team',
+      'access controls',
+      'install or remove extensions',
+      'secrets',
+    ]);
+    expectTerms('com.klaviyo/mcp', [
+      'default unparameterized endpoint',
+      'write actions',
+      'user-generated-content tools',
+      'all non-beta toolsets',
+      'send, or clone campaigns',
+      'create, update, or delete flows',
+      'delete lists and segments',
+      'add or remove list members',
+      'profile deletion requests',
+      'delete webhooks and forms',
+      'coupons and coupon codes',
+      'tag groups',
+      'images',
+      'email templates',
+      'custom metrics',
+    ]);
+    expectTerms('io.customer/mcp', [
+      'US-region',
+      'every scope',
+      'sensitive profile',
+      'live messages',
+      'subscriptions',
+      'integrations',
+      'webhooks',
+    ]);
+    expectTerms('io.incident/mcp', [
+      'investigation',
+      'post-mortem',
+      'logs',
+      'metrics',
+      'traces',
+      'dashboards',
+      'Allowed redirect domains',
+    ]);
+    expect(entries.find((entry) => entry.name === 'io.incident/mcp')).toMatchObject({
+      website_url: 'https://docs.incident.io/ai/remote-mcp',
+    });
+  });
+
+  it("uses Firecrawl's documented versioned keyless endpoint", async () => {
+    const entries = await loadCuratedCatalog();
+    expect(entries).toContainEqual(
+      expect.objectContaining({
+        name: 'com.firecrawl/mcp',
+        remote_url: 'https://mcp.firecrawl.dev/v2/mcp',
+        auth_type: 'none',
+        capabilities: ['web-search', 'web-scrape'],
+      })
+    );
+  });
+
+  it('keeps the 2026-08-20 boundary-audited expansion on its reviewed endpoints and auth paths', async () => {
+    // Live provider metadata evidence and the mocked production service-boundary
+    // fixture are documented in the accompanying audit report.
+    // Assert identities rather than a whole-catalog count: unrelated additions
+    // should not require this audit contract to change.
+    const entries = await loadCuratedCatalog();
+    expect(entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'com.postman/postman-mcp-server',
+          remote_url: 'https://mcp.postman.com/mcp',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'io.github.clerk/mcp-server',
+          remote_url: 'https://mcp.clerk.com/mcp',
+          auth_type: 'none',
+        }),
+        expect.objectContaining({
+          name: 'io.github.cloudinary/asset-management-mcp',
+          remote_url: 'https://asset-management.mcp.cloudinary.com/mcp',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'io.github.miroapp/mcp-server',
+          remote_url: 'https://mcp.miro.com/',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'co.axiom/mcp',
+          remote_url: 'https://mcp.axiom.co/mcp',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'io.github.algolia/algolia-productivity',
+          remote_url: 'https://mcp.algolia.com/mcp',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'com.netlify/mcp',
+          remote_url: 'https://netlify-mcp.netlify.app/mcp',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'com.klaviyo/mcp',
+          remote_url: 'https://mcp.klaviyo.com/mcp',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'io.customer/mcp',
+          remote_url: 'https://mcp.customer.io/mcp',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'io.incident/mcp',
+          remote_url: 'https://mcp.incident.io/mcp',
+          auth_type: 'oauth',
+        }),
+        expect.objectContaining({
+          name: 'io.github.tavily-ai/tavily-mcp',
+          remote_url: 'https://mcp.tavily.com/mcp/',
+          auth_type: 'oauth',
+        }),
+      ])
+    );
+  });
+
   it('opts the providers that pass the strict production boundary into strict mode', async () => {
     // Marketplace installs with no statement use the daemon's bounded
     // interoperability profile. These three publish the exact PRM/issuer,
@@ -374,6 +532,7 @@ describe('the shipped catalog', () => {
       'com.slack/mcp',
       'com.pagerduty/mcp',
       'com.kagi/mcp',
+      'com.render/mcp',
     ];
 
     expect(entries.filter((entry) => unsupported.includes(entry.name))).toEqual([]);
