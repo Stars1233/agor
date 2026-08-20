@@ -33,6 +33,7 @@ import {
   TaskRepository,
   type TenantScopeAwareDatabase,
   UploadRepository,
+  UserMCPOAuthTokenRepository,
   UsersRepository,
 } from '@agor/core/db';
 import { MANAGED_ENV_EXECUTION_MODE_DEFAULT } from '@agor/core/environment/webhook';
@@ -70,6 +71,7 @@ import type {
   Task,
   TaskMetadata,
   User,
+  UserID,
   UUID,
 } from '@agor/core/types';
 import {
@@ -342,6 +344,30 @@ export function createRequiredTenantDatabaseRunner(db: TenantScopeAwareDatabase)
     if (!tenantId) throw new Error('Missing active tenant context for database operation');
     return runWithTenantDatabaseScope(db, tenantId, work);
   };
+}
+
+/**
+ * Build the catalog-connect service exactly as the production route registers it.
+ * Kept as a named boundary so PostgreSQL integration coverage can exercise the
+ * authenticated tenant-scoped grant lookup instead of substituting a test
+ * implementation of that decisive dependency.
+ */
+export function createRegisteredMCPCatalogConnectService(
+  app: Application,
+  db: TenantScopeAwareDatabase
+) {
+  return createMCPCatalogConnectService(app, {
+    async readGrantResourceUri(serverId, params) {
+      const userId = params.user?.user_id as UserID | undefined;
+      if (!userId) return undefined;
+      const tenantId =
+        (params as { tenant?: { tenant_id?: string } }).tenant?.tenant_id ?? getCurrentTenantId();
+      const read = async () =>
+        (await new UserMCPOAuthTokenRepository(db).getToken(userId, serverId))
+          ?.oauth_resource_uri ?? undefined;
+      return tenantId ? runWithTenantDatabaseScope(db, tenantId, read) : read();
+    },
+  });
 }
 
 export function createUploadAuthMiddleware(input: {
@@ -4274,7 +4300,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   registerLongAuthenticatedRoute(
     app,
     '/mcp-catalog/connect',
-    createMCPCatalogConnectService(app),
+    createRegisteredMCPCatalogConnectService(app, db),
     { create: { role: ROLES.MEMBER, action: 'connect MCP catalog entries' } },
     requireAuth
   );
