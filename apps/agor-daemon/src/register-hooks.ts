@@ -83,6 +83,7 @@ import type {
   UserID,
 } from '@agor/core/types';
 import {
+  assertPublicMCPOAuthCompatibilityMode,
   GATEWAY_CHANNEL_WRITE_FIELDS,
   GATEWAY_REDACTED_SENTINEL,
   GATEWAY_SENSITIVE_CONFIG_FIELDS,
@@ -116,7 +117,14 @@ import type { RedisRealtimeRuntime } from './realtime/redis-realtime.js';
 import type { ArtifactsService } from './services/artifacts.js';
 import type { GatewayService } from './services/gateway.js';
 import { groupMembershipsHooks, groupsHooks } from './services/groups.js';
-import { isMCPOAuthGrantBoundToServer } from './services/mcp-oauth-grant-binding.js';
+import {
+  presentMCPOAuthCompatibilityPolicy,
+  resolveMCPOAuthCompatibilityPolicy,
+} from './services/mcp-oauth-compatibility.js';
+import {
+  isMCPOAuthGrantBoundToServer,
+  shouldVerifyMCPOAuthGrantBinding,
+} from './services/mcp-oauth-grant-binding.js';
 import {
   isRemoteRelationshipsEnrichedResult,
   markRemoteRelationshipsEnrichedResult,
@@ -1739,14 +1747,17 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       authPayloadType,
       callerUserId: context.params?.user?.user_id,
     });
-    if (!userId) {
-      return context;
-    }
-
     const injectToken = async (server: MCPServer) => {
       if (server.auth?.type !== 'oauth') {
         return server;
       }
+
+      const compatibilityPolicy = await resolveMCPOAuthCompatibilityPolicy(server);
+      const serverWithPolicy: MCPServer = {
+        ...server,
+        oauth_compatibility_policy: presentMCPOAuthCompatibilityPolicy(compatibilityPolicy),
+      };
+      if (!userId) return serverWithPolicy;
 
       // Tokens for both modes live in user_mcp_oauth_tokens:
       //   - per_user  → row keyed by (userId, serverId)
@@ -1760,14 +1771,23 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         const row = await userTokenRepo.getToken(tokenUserId, server.mcp_server_id);
 
         if (!row) {
-          return server;
+          return serverWithPolicy;
         }
+        const compatibilityMode = compatibilityPolicy.mode;
         if (
-          isPostgresDatabaseHandle(db) &&
-          !isMCPOAuthGrantBoundToServer(process.env.AGOR_MASTER_SECRET!, server, row)
+          shouldVerifyMCPOAuthGrantBinding(
+            isPostgresDatabaseHandle(db),
+            row.grant_binding_version
+          ) &&
+          !isMCPOAuthGrantBoundToServer(
+            process.env.AGOR_MASTER_SECRET!,
+            server,
+            row,
+            compatibilityMode
+          )
         ) {
           console.warn('[MCP OAuth] grant_rejected category=binding_mismatch');
-          return server;
+          return serverWithPolicy;
         }
 
         // Response enrichment is a durable read only. Refresh is coordinated
@@ -1777,13 +1797,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           row.refresh_status !== 'idle' ||
           (row.oauth_token_expires_at && row.oauth_token_expires_at <= new Date())
         ) {
-          return server;
+          return serverWithPolicy;
         }
         const accessToken = row.oauth_access_token;
         const expiresAt = row.oauth_token_expires_at;
 
         return {
-          ...server,
+          ...serverWithPolicy,
           auth: {
             ...server.auth,
             oauth_access_token: accessToken,
@@ -1797,7 +1817,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         console.warn('[MCP OAuth] grant_resolution_failed category=local_error');
       }
 
-      return server;
+      return serverWithPolicy;
     };
 
     // Handle both single result and array/paginated results
@@ -1819,6 +1839,22 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   const authorizeMcpServerWriteHook = createMcpServerWriteAuthorizationHook(db) as unknown as (
     context: HookContext
   ) => Promise<HookContext>;
+
+  const validateMcpServerOAuthCompatibility = async (
+    context: HookContext
+  ): Promise<HookContext> => {
+    const items = Array.isArray(context.data) ? context.data : [context.data];
+    try {
+      for (const item of items) {
+        assertPublicMCPOAuthCompatibilityMode(
+          item && typeof item === 'object' ? (item as { auth?: unknown }).auth : undefined
+        );
+      }
+    } catch (error) {
+      throw new BadRequest(error instanceof Error ? error.message : 'Invalid MCP OAuth policy');
+    }
+    return context;
+  };
 
   const scopeMcpServerFindToUsable = async (context: HookContext): Promise<HookContext> => {
     if (!context.params.provider) return context;
@@ -1857,9 +1893,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     before: {
       all: [typedValidateQuery(mcpServerQueryValidator), requireAuth],
       find: [scopeMcpServerFindToUsable],
-      create: [authorizeMcpServerWriteHook],
-      update: [authorizeMcpServerWriteHook],
-      patch: [authorizeMcpServerWriteHook],
+      create: [validateMcpServerOAuthCompatibility, authorizeMcpServerWriteHook],
+      update: [validateMcpServerOAuthCompatibility, authorizeMcpServerWriteHook],
+      patch: [validateMcpServerOAuthCompatibility, authorizeMcpServerWriteHook],
       remove: [authorizeMcpServerWriteHook],
     },
     after: {
