@@ -69,12 +69,33 @@ import {
   SessionSortButton,
 } from '../SessionSearchControls';
 import { ToolIcon } from '../ToolIcon';
-import { buildSessionTree, type SessionTreeNode } from './buildSessionTree';
+import {
+  buildSessionTree,
+  collectSessionSubtreeIds,
+  type SessionTreeNode,
+} from './buildSessionTree';
 
 // Stable theme object so the ConfigProvider context value doesn't churn.
 const NO_MOTION_THEME = { token: { motion: false } };
 
 const SECTION_KEYS: BranchSectionKey[] = ['sessions', 'scheduled-runs', 'gateway-sessions'];
+
+const isSessionFailed = (session: Session): boolean => session.status === SessionStatus.FAILED;
+
+function getSessionRowAccessibleLabel(session: Session): string {
+  const details = [
+    `Open session ${getSessionDisplayTitle(session, { includeAgentFallback: true })}`,
+  ];
+
+  if (session.remote_surrogate) {
+    details.push('remote session', 'opens in its own branch');
+  }
+  if (isSessionFailed(session)) {
+    details.push('latest task failed');
+  }
+
+  return details.join('; ');
+}
 
 export type BranchSessionSectionsMode = 'card' | 'panel';
 type CollapseKey = string | number;
@@ -134,7 +155,9 @@ const SessionItemWithActions: React.FC<{
   children,
 }) => {
   const [hovered, setHovered] = useState(false);
+  const [focusWithin, setFocusWithin] = useState(false);
   const { token } = theme.useToken();
+  const showActions = hovered || focusWithin;
 
   const buttonStyle: React.CSSProperties = {
     background: `${token.colorBgContainer}cc`,
@@ -159,6 +182,12 @@ const SessionItemWithActions: React.FC<{
       style={{ position: 'relative', minWidth: 0, width: '100%' }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
+      onFocus={() => setFocusWithin(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setFocusWithin(false);
+        }
+      }}
     >
       {children}
       <div
@@ -167,9 +196,9 @@ const SessionItemWithActions: React.FC<{
           right: 4,
           top: '50%',
           transform: 'translateY(-50%)',
-          opacity: hovered ? 1 : 0,
+          opacity: showActions ? 1 : 0,
           transition: 'opacity 0.15s ease-in-out',
-          pointerEvents: hovered ? 'auto' : 'none',
+          pointerEvents: showActions ? 'auto' : 'none',
           display: 'flex',
           gap: 2,
           width: 'fit-content',
@@ -521,32 +550,16 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     [activeSessions, isGatewaySession]
   );
   const gatewayTreeSessionIds = useMemo(() => {
-    const included = new Set<string>(gatewayRootSessions.map((session) => session.session_id));
     const candidates = activeSessions.filter((session) => !session.scheduled_from_branch);
-    const childrenByParent = new Map<string, string[]>();
 
-    // A gateway child does not carry gateway_source itself. Follow the same
+    // A gateway child does not carry gateway_source itself. Follow the exact
     // genealogy edges used by buildSessionTree (including remote surrogates)
     // so descendants stay with the gateway conversation instead of being
     // promoted to unrelated roots in the manual Sessions section.
-    for (const session of candidates) {
-      const parentId =
-        session.genealogy?.parent_session_id ?? session.genealogy?.forked_from_session_id;
-      if (!parentId) continue;
-      const children = childrenByParent.get(parentId) ?? [];
-      children.push(session.session_id);
-      childrenByParent.set(parentId, children);
-    }
-    const pending = [...included];
-    for (let index = 0; index < pending.length; index += 1) {
-      for (const childId of childrenByParent.get(pending[index]) ?? []) {
-        if (included.has(childId)) continue;
-        included.add(childId);
-        pending.push(childId);
-      }
-    }
-
-    return included;
+    return collectSessionSubtreeIds(
+      candidates,
+      gatewayRootSessions.map((session) => session.session_id)
+    );
   }, [activeSessions, gatewayRootSessions]);
   const manualSessions = useMemo(
     () =>
@@ -625,8 +638,6 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   const isCreating = branch.filesystem_status === 'creating';
   const isFailed = branch.filesystem_status === 'failed';
 
-  const isSessionFailed = (session: Session): boolean => session.status === SessionStatus.FAILED;
-
   // Parent sessions default to expanded; only collapsed exceptions are kept in
   // the collapsedBranchNodes store. Deriving the expanded set means sessions
   // that newly gain children start expanded, while stored exceptions survive
@@ -675,11 +686,9 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     const isSessionSelected = session.session_id === selectedSessionId;
     const isRemoteSurrogate = Boolean(session.remote_surrogate);
     return {
-      border: session.ready_for_prompt
-        ? `1px solid ${token.colorPrimary}`
-        : isRemoteSurrogate
-          ? `1px dashed ${token.colorBorderSecondary}`
-          : `1px solid ${token.colorBorderSecondary}`,
+      borderWidth: 1,
+      borderStyle: isRemoteSurrogate ? 'dashed' : 'solid',
+      borderColor: session.ready_for_prompt ? token.colorPrimary : token.colorBorderSecondary,
       borderRadius: isPanel ? 6 : 4,
       padding: isPanel ? 10 : 8,
       background: isRemoteSurrogate
@@ -689,9 +698,15 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
           : 'transparent',
       display: 'flex',
       alignItems: 'center',
+      justifyContent: 'flex-start',
       width: '100%',
+      height: 'auto',
       boxSizing: 'border-box',
       cursor: 'pointer',
+      color: 'inherit',
+      font: 'inherit',
+      textAlign: 'left',
+      whiteSpace: 'normal',
       marginBottom: 4,
       opacity: isRemoteSurrogate ? 0.78 : undefined,
       boxShadow: session.ready_for_prompt ? `0 0 12px ${token.colorPrimary}30` : undefined,
@@ -786,9 +801,11 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             : undefined
         }
       >
-        <div
+        <button
+          type="button"
           style={sessionRowStyle(session)}
           data-session-id={session.session_id}
+          aria-label={getSessionRowAccessibleLabel(session)}
           onClick={() => onSessionClick?.(session.session_id)}
         >
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 4, flex: 1, minWidth: 0 }}>
@@ -828,7 +845,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
               )}
             </div>
           </div>
-        </div>
+        </button>
       </SessionItemWithActions>
     );
   };
@@ -907,9 +924,11 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             : undefined
         }
       >
-        <div
+        <button
+          type="button"
           style={sessionRowStyle(session)}
           data-session-id={session.session_id}
+          aria-label={getSessionRowAccessibleLabel(session)}
           onClick={() => onSessionClick?.(session.session_id)}
           onContextMenu={(e) => {
             if (onForkSession || onSpawnSession) {
@@ -940,6 +959,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                   <ChannelPill
                     channelType={gatewaySource.channel_type}
                     channelName={gatewaySource.channel_name}
+                    style={{ alignSelf: 'flex-start' }}
                   />
                 ) : (
                   <Typography.Text type="secondary" style={{ fontSize: 11, fontStyle: 'italic' }}>
@@ -948,7 +968,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                 ))}
             </Flex>
           </Flex>
-        </div>
+        </button>
       </SessionItemWithActions>
     );
   };
@@ -1055,8 +1075,10 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                 : undefined
             }
           >
-            <div
+            <button
+              type="button"
               style={sessionRowStyle(session)}
+              aria-label={getSessionRowAccessibleLabel(session)}
               onClick={() => onSessionClick?.(session.session_id)}
             >
               <Space size={4} align="center" style={{ flex: 1, minWidth: 0 }}>
@@ -1067,7 +1089,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                 )}
                 {renderSessionTitleWithFailure(session, { secondary: true })}
               </Space>
-            </div>
+            </button>
           </SessionItemWithActions>
         );
       })}
