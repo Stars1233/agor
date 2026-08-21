@@ -25,6 +25,7 @@ import {
   Button,
   Collapse,
   ConfigProvider,
+  Flex,
   Space,
   Spin,
   Tooltip,
@@ -515,9 +516,45 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   }, []);
 
   const activeSessions = useMemo(() => sessions.filter((s) => !s.archived), [sessions]);
-  const manualSessions = useMemo(
-    () => activeSessions.filter((s) => !s.scheduled_from_branch && !isGatewaySession(s)),
+  const gatewayRootSessions = useMemo(
+    () => activeSessions.filter((s) => !s.scheduled_from_branch && isGatewaySession(s)),
     [activeSessions, isGatewaySession]
+  );
+  const gatewayTreeSessionIds = useMemo(() => {
+    const included = new Set<string>(gatewayRootSessions.map((session) => session.session_id));
+    const candidates = activeSessions.filter((session) => !session.scheduled_from_branch);
+    const childrenByParent = new Map<string, string[]>();
+
+    // A gateway child does not carry gateway_source itself. Follow the same
+    // genealogy edges used by buildSessionTree (including remote surrogates)
+    // so descendants stay with the gateway conversation instead of being
+    // promoted to unrelated roots in the manual Sessions section.
+    for (const session of candidates) {
+      const parentId =
+        session.genealogy?.parent_session_id ?? session.genealogy?.forked_from_session_id;
+      if (!parentId) continue;
+      const children = childrenByParent.get(parentId) ?? [];
+      children.push(session.session_id);
+      childrenByParent.set(parentId, children);
+    }
+    const pending = [...included];
+    for (let index = 0; index < pending.length; index += 1) {
+      for (const childId of childrenByParent.get(pending[index]) ?? []) {
+        if (included.has(childId)) continue;
+        included.add(childId);
+        pending.push(childId);
+      }
+    }
+
+    return included;
+  }, [activeSessions, gatewayRootSessions]);
+  const manualSessions = useMemo(
+    () =>
+      activeSessions.filter(
+        (session) =>
+          !session.scheduled_from_branch && !gatewayTreeSessionIds.has(session.session_id)
+      ),
+    [activeSessions, gatewayTreeSessionIds]
   );
   const scheduledSessions = useMemo(
     () =>
@@ -526,13 +563,16 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         .sort((a, b) => (b.scheduled_run_at || 0) - (a.scheduled_run_at || 0)),
     [activeSessions]
   );
-  const gatewaySessions = useMemo(
-    () => activeSessions.filter((s) => isGatewaySession(s)),
-    [activeSessions, isGatewaySession]
+  const gatewayTreeSessions = useMemo(
+    () =>
+      activeSessions.filter(
+        (session) => !session.scheduled_from_branch && gatewayTreeSessionIds.has(session.session_id)
+      ),
+    [activeSessions, gatewayTreeSessionIds]
   );
   const searchablePanelSessions = useMemo(
-    () => [...manualSessions, ...scheduledSessions, ...gatewaySessions],
-    [gatewaySessions, manualSessions, scheduledSessions]
+    () => [...manualSessions, ...scheduledSessions, ...gatewayTreeSessions],
+    [gatewayTreeSessions, manualSessions, scheduledSessions]
   );
   const sortedManualSessions = useMemo(
     () => (isManualSessionsOpen ? sortSessions(manualSessions, sort) : []),
@@ -542,20 +582,29 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     () => (isManualSessionsOpen ? buildSessionTree(sortedManualSessions) : []),
     [isManualSessionsOpen, sortedManualSessions]
   );
-  const expandableKeys = useMemo(() => {
-    const collectKeysWithChildren = (nodes: SessionTreeNode[]): React.Key[] => {
-      const keys: React.Key[] = [];
-      for (const node of nodes) {
-        if (node.children && node.children.length > 0) {
-          keys.push(node.key);
-          keys.push(...collectKeysWithChildren(node.children));
-        }
+  const gatewaySessionTreeData = useMemo(
+    () =>
+      isGatewaySessionsOpen ? buildSessionTree(sortSessions(gatewayTreeSessions, 'recent')) : [],
+    [gatewayTreeSessions, isGatewaySessionsOpen]
+  );
+  const collectExpandableKeys = useCallback((nodes: SessionTreeNode[]): React.Key[] => {
+    const keys: React.Key[] = [];
+    for (const node of nodes) {
+      if (node.children && node.children.length > 0) {
+        keys.push(node.key);
+        keys.push(...collectExpandableKeys(node.children));
       }
-      return keys;
-    };
-
-    return collectKeysWithChildren(sessionTreeData);
-  }, [sessionTreeData]);
+    }
+    return keys;
+  }, []);
+  const manualExpandableKeys = useMemo(
+    () => collectExpandableKeys(sessionTreeData),
+    [collectExpandableKeys, sessionTreeData]
+  );
+  const gatewayExpandableKeys = useMemo(
+    () => collectExpandableKeys(gatewaySessionTreeData),
+    [collectExpandableKeys, gatewaySessionTreeData]
+  );
   const searchResults = useMemo(
     () =>
       isPanel && searchActive
@@ -569,8 +618,8 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     [scheduledSessions]
   );
   const hasRunningGatewaySession = useMemo(
-    () => gatewaySessions.some(isSessionExecuting),
-    [gatewaySessions]
+    () => gatewayTreeSessions.some(isSessionExecuting),
+    [gatewayTreeSessions]
   );
 
   const isCreating = branch.filesystem_status === 'creating';
@@ -583,9 +632,13 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   // that newly gain children start expanded, while stored exceptions survive
   // sessions temporarily leaving the tree (archive, lost children).
   const collapsedSessionIds = collapsedNode.sessionIds;
-  const expandedKeys = useMemo(
-    () => expandableKeys.filter((key) => !collapsedSessionIds?.includes(String(key))),
-    [collapsedSessionIds, expandableKeys]
+  const expandedManualKeys = useMemo(
+    () => manualExpandableKeys.filter((key) => !collapsedSessionIds?.includes(String(key))),
+    [collapsedSessionIds, manualExpandableKeys]
+  );
+  const expandedGatewayKeys = useMemo(
+    () => gatewayExpandableKeys.filter((key) => !collapsedSessionIds?.includes(String(key))),
+    [collapsedSessionIds, gatewayExpandableKeys]
   );
 
   const toggleSessionCollapsed = useCallback(
@@ -601,7 +654,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   );
 
   const handleSessionTreeExpand = useCallback(
-    (keys: React.Key[]) => {
+    (keys: React.Key[], expandableKeys: React.Key[]) => {
       // Only reconcile keys currently in the tree so exceptions stored for
       // sessions outside this render set (archived, filtered) are preserved.
       const expandedKeySet = new Set(keys.map(String));
@@ -615,7 +668,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         return { ...node, sessionIds: [...sessionIds] };
       });
     },
-    [expandableKeys, updateCollapsedNode]
+    [updateCollapsedNode]
   );
 
   const sessionRowStyle = (session: Session): React.CSSProperties => {
@@ -827,6 +880,8 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     const isRemoteSurrogate = node.relationshipType === 'remote';
     const callbackToggle = getCallbackToggle(session);
     const remoteParentId = getRemoteParentId(session);
+    const gatewaySource = getGatewaySource(session);
+    const isGateway = isGatewaySession(session);
 
     return (
       <SessionItemWithActions
@@ -862,7 +917,12 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             }
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, minWidth: 0 }}>
+          <Flex
+            align={isGateway ? 'flex-start' : 'center'}
+            gap={token.marginXXS}
+            flex={1}
+            style={{ minWidth: 0 }}
+          >
             {isActive ? <Spin size="small" /> : <ToolIcon tool={session.agentic_tool} size={20} />}
             {isRemoteSurrogate ? (
               <Tooltip title="Remote session created from this session. Click to open it in its own branch.">
@@ -871,40 +931,53 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             ) : (
               <SessionRelationshipIcon session={session} size={10} />
             )}
-            {renderSessionTitleWithFailure(session)}
-          </div>
+            <Flex vertical gap={isGateway ? token.marginXXS : 0} flex={1} style={{ minWidth: 0 }}>
+              <Flex align="center" gap={token.marginXXS} style={{ minWidth: 0 }}>
+                {renderSessionTitleWithFailure(session)}
+              </Flex>
+              {isGateway &&
+                (gatewaySource ? (
+                  <ChannelPill
+                    channelType={gatewaySource.channel_type}
+                    channelName={gatewaySource.channel_name}
+                  />
+                ) : (
+                  <Typography.Text type="secondary" style={{ fontSize: 11, fontStyle: 'italic' }}>
+                    (Gateway - metadata unavailable)
+                  </Typography.Text>
+                ))}
+            </Flex>
+          </Flex>
         </div>
       </SessionItemWithActions>
     );
   };
 
-  const sessionListContent = isManualSessionsOpen ? (
-    <ConfigProvider theme={{ components: { Tree: { colorBgContainer: 'transparent' } } }}>
-      <Tree
-        className="agor-flat-tree"
-        treeData={sessionTreeData}
-        expandedKeys={expandedKeys}
-        onExpand={(keys) => handleSessionTreeExpand(keys as React.Key[])}
-        showLine
-        switcherIcon={renderTreeSwitcherIcon}
-        showIcon={false}
-        blockNode
-        selectable={false}
-        style={{ background: 'transparent', borderRadius: 0, padding: 0 }}
-        titleRender={renderSessionNode}
-      />
-    </ConfigProvider>
-  ) : null;
+  const renderSessionTree = (
+    treeData: SessionTreeNode[],
+    expandedKeys: React.Key[],
+    expandableKeys: React.Key[]
+  ) => (
+    <Tree
+      className="agor-flat-tree"
+      treeData={treeData}
+      expandedKeys={expandedKeys}
+      onExpand={(keys) => handleSessionTreeExpand(keys as React.Key[], expandableKeys)}
+      showLine
+      switcherIcon={renderTreeSwitcherIcon}
+      showIcon={false}
+      blockNode
+      selectable={false}
+      titleRender={renderSessionNode}
+    />
+  );
+
+  const sessionListContent = isManualSessionsOpen
+    ? renderSessionTree(sessionTreeData, expandedManualKeys, manualExpandableKeys)
+    : null;
 
   const sessionListHeader = (
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        width: '100%',
-      }}
-    >
+    <Flex justify="space-between" align="center" style={{ width: '100%' }}>
       <Space size={4} align="center">
         <Typography.Text strong>Sessions</Typography.Text>
         <Badge
@@ -933,18 +1006,11 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
           </Button>
         </div>
       )}
-    </div>
+    </Flex>
   );
 
   const scheduledRunsHeader = (
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        width: '100%',
-      }}
-    >
+    <Flex justify="space-between" align="center" style={{ width: '100%' }}>
       <Space size={4} align="center">
         <ClockCircleOutlined style={{ color: token.colorInfo }} />
         <Typography.Text strong>Scheduled Runs</Typography.Text>
@@ -955,7 +1021,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         />
         {hasRunningScheduledSession && <Spin size="small" />}
       </Space>
-    </div>
+    </Flex>
   );
 
   const scheduledRunsContent = isScheduledRunsOpen ? (
@@ -1009,99 +1075,23 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   ) : null;
 
   const gatewaySessionsHeader = (
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        width: '100%',
-      }}
-    >
+    <Flex justify="space-between" align="center" style={{ width: '100%' }}>
       <Space size={4} align="center">
         <MessageOutlined style={{ color: token.colorSuccess }} />
         <Typography.Text strong>Gateway Sessions</Typography.Text>
         <Badge
-          count={gatewaySessions.length}
+          count={gatewayRootSessions.length}
           showZero
           style={{ backgroundColor: token.colorSuccessBgHover }}
         />
         {hasRunningGatewaySession && <Spin size="small" />}
       </Space>
-    </div>
+    </Flex>
   );
 
-  const gatewaySessionsContent = isGatewaySessionsOpen ? (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-      {gatewaySessions.map((session) => {
-        const gatewaySource = getGatewaySource(session);
-        const isActive = isSessionExecuting(session);
-        const callbackToggle = getCallbackToggle(session);
-        const remoteParentId = getRemoteParentId(session);
-
-        return (
-          <SessionItemWithActions
-            key={session.session_id}
-            sessionId={session.session_id}
-            isArchiving={archivingSessionIds.has(session.session_id)}
-            isPeeked={peekedIds.has(session.session_id)}
-            onArchive={handleArchiveSession}
-            onTogglePeek={onTogglePeekSession ? handleTogglePeekSession : undefined}
-            callbackToggle={callbackToggle ?? undefined}
-            onToggleCallback={callbackToggle ? handleToggleCallback : undefined}
-            remoteParentLink={
-              remoteParentId
-                ? { tooltip: 'Open remote parent session that created this session' }
-                : undefined
-            }
-            onOpenRemoteParent={remoteParentId ? handleOpenRemoteParent : undefined}
-            onSettings={
-              onOpenSessionSettings
-                ? (id, e) => {
-                    e.stopPropagation();
-                    onOpenSessionSettings(id);
-                  }
-                : undefined
-            }
-          >
-            <div
-              style={sessionRowStyle(session)}
-              onClick={() => onSessionClick?.(session.session_id)}
-            >
-              <Space size={4} align="center" style={{ flex: 1, minWidth: 0 }}>
-                {isActive ? (
-                  <Spin size="small" />
-                ) : (
-                  <ToolIcon tool={session.agentic_tool} size={20} />
-                )}
-                <div
-                  style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
-                    {renderSessionTitleWithFailure(session)}
-                  </div>
-                  <div style={{ alignSelf: 'flex-start' }}>
-                    {gatewaySource ? (
-                      <ChannelPill
-                        channelType={gatewaySource.channel_type}
-                        channelName={gatewaySource.channel_name}
-                      />
-                    ) : (
-                      <Typography.Text
-                        type="secondary"
-                        style={{ fontSize: 11, fontStyle: 'italic' }}
-                      >
-                        (Gateway - metadata unavailable)
-                      </Typography.Text>
-                    )}
-                  </div>
-                </div>
-              </Space>
-            </div>
-          </SessionItemWithActions>
-        );
-      })}
-    </div>
-  ) : null;
+  const gatewaySessionsContent = isGatewaySessionsOpen
+    ? renderSessionTree(gatewaySessionTreeData, expandedGatewayKeys, gatewayExpandableKeys)
+    : null;
 
   const sessionSearchBar =
     isPanel && activeSessions.length > 0 ? (
@@ -1269,7 +1259,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             />
           )}
 
-          {gatewaySessions.length > 0 && (
+          {gatewayRootSessions.length > 0 && (
             <Collapse
               activeKey={openSectionKeys}
               onChange={handleGatewaySessionsChange}
