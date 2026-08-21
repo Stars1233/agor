@@ -6,6 +6,8 @@ import {
   galleryCardsForFilter,
   getCategoryColor,
   getTeammateTemplate,
+  getTemplateBySourceBranch,
+  getTemplateForFrameworkSource,
   recommendedTemplateIds,
   resolveTemplateSourceBranch,
   TEAMMATE_GALLERY_CARDS,
@@ -133,6 +135,57 @@ describe('resolveTemplateSourceBranch', () => {
     expect(resolveTemplateSourceBranch(BLANK_TEMPLATE_ID)).toBeUndefined();
     expect(resolveTemplateSourceBranch(null)).toBeUndefined();
     expect(() => resolveTemplateSourceBranch('nope')).toThrow('Unknown teammate template id: nope');
+  });
+});
+
+describe('getTemplateBySourceBranch', () => {
+  it('recovers the template from its contract source branch', () => {
+    expect(getTemplateBySourceBranch('template/legal-analyst')?.id).toBe('legal-analyst');
+    expect(getTemplateBySourceBranch('template/deal-desk-revops-analyst')?.id).toBe('deal-desk');
+    // Round-trips with resolveTemplateSourceBranch for every real template.
+    for (const template of TEAMMATE_TEMPLATES) {
+      expect(getTemplateBySourceBranch(template.sourceBranch)?.id).toBe(template.id);
+    }
+  });
+
+  it('treats blank/main and empty input as "no template"', () => {
+    expect(getTemplateBySourceBranch(BLANK_TEMPLATE.sourceBranch)).toBeUndefined(); // 'main'
+    expect(getTemplateBySourceBranch('main')).toBeUndefined();
+    expect(getTemplateBySourceBranch('  ')).toBeUndefined();
+    expect(getTemplateBySourceBranch('')).toBeUndefined();
+    expect(getTemplateBySourceBranch(null)).toBeUndefined();
+    expect(getTemplateBySourceBranch(undefined)).toBeUndefined();
+  });
+
+  it('returns undefined for an unrecognized branch', () => {
+    expect(getTemplateBySourceBranch('feature/whatever')).toBeUndefined();
+  });
+});
+
+describe('getTemplateForFrameworkSource', () => {
+  it('recovers a template only for the detected framework repository', () => {
+    expect(
+      getTemplateForFrameworkSource({
+        sourceBranch: 'template/legal-analyst',
+        selectedRepoId: 'repo-framework',
+        frameworkRepoId: 'repo-framework',
+      })?.id
+    ).toBe('legal-analyst');
+
+    expect(
+      getTemplateForFrameworkSource({
+        sourceBranch: 'template/legal-analyst',
+        selectedRepoId: 'repo-unrelated',
+        frameworkRepoId: 'repo-framework',
+      })
+    ).toBeUndefined();
+    expect(
+      getTemplateForFrameworkSource({
+        sourceBranch: 'template/legal-analyst',
+        selectedRepoId: 'repo-framework',
+        frameworkRepoId: undefined,
+      })
+    ).toBeUndefined();
   });
 });
 

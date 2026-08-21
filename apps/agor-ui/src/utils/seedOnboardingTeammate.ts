@@ -30,6 +30,8 @@ Framework source branch from the chosen gallery template. Undefined falls
   suggestedIntegrations?: OnboardingIntegrationRecommendation[];
   /** Onboarding goal ids (order-preserving, primary first); [] when skipped. */
   goals?: string[];
+  /** Chosen gallery template id (persona); null/undefined = blank starter. */
+  templateId?: string | null;
   user?: { name?: string | null; email?: string | null } | null;
   client: AgorClient | null;
   repoById: TeammateCreationDeps['repoById'];
@@ -219,6 +221,7 @@ export async function seedOnboardingTeammate(
           userName: input.user?.name,
           userEmail: input.user?.email,
           goals: input.goals,
+          templateId: input.templateId,
           suggestedIntegrations: input.suggestedIntegrations,
         }),
       },

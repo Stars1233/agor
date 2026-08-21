@@ -155,6 +155,32 @@ describe('seedOnboardingTeammate', () => {
     expect(onWarn).not.toHaveBeenCalled();
   });
 
+  it('threads the template persona and routed integration guidance into the first-session prompt', async () => {
+    createTeammateBranchMock.mockResolvedValue({
+      branch_id: 'branch-1',
+      board_id: 'board-1',
+    } as Branch);
+    startTeammateBootstrapSessionMock.mockResolvedValue('session-1');
+
+    const { input } = setup({
+      goals: [],
+      templateId: 'legal-analyst',
+    });
+    await seedOnboardingTeammate(input);
+
+    const sessionArg = startTeammateBootstrapSessionMock.mock.calls[0][0];
+    const initialPrompt = (sessionArg.sessionConfig as { initialPrompt: string }).initialPrompt;
+    // Template persona surfaces in context and drives the personal opener even
+    // though no goal was picked.
+    expect(initialPrompt).toContain('- Created from the Legal Analyst template.');
+    expect(initialPrompt).toMatch(/Open as yourself: one warm line/);
+    // The official MCP route keeps safe, session-scoped agency while GitHub
+    // remains native repository access rather than an invented MCP install.
+    expect(initialPrompt).toContain('https://mcp.slack.com/mcp');
+    expect(initialPrompt).toMatch(/use session scope and attach it to this session/i);
+    expect(initialPrompt).toContain('GitHub: use the repository already connected to Agor');
+  });
+
   it('forwards the template source branch to createTeammateBranch', async () => {
     createTeammateBranchMock.mockResolvedValue({
       branch_id: 'branch-1',
