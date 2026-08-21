@@ -1151,6 +1151,8 @@ export const users = pgTable(
             permissionMode?: string;
           };
         };
+        primary_agentic_tool?: import('../types/agentic-tool').AgenticToolName;
+        primary_teammate_id?: import('../types/id').BranchID;
         default_mcp_server_ids?: string[];
         default_agentic_selection?: import('../types/user').UserAgenticDefaultSelections;
       }>()

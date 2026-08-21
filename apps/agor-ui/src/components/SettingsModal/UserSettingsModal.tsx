@@ -16,6 +16,7 @@ import type {
   User,
 } from '@agor-live/client';
 import {
+  AGENTIC_TOOL_NAMES,
   canAssignUserRole,
   hasMinimumRole,
   hasRoleAuthorityOver,
@@ -83,20 +84,14 @@ import { UserIdentityAvatar } from '../UserIdentityAvatar';
 import { AudioSettingsTab } from './AudioSettingsTab';
 import { syncGroupsForUser } from './groupMembershipSync';
 import { PersonalApiKeysTab } from './PersonalApiKeysTab';
-import { FieldRow, PanelHeader, SectionDivider } from './panelPrimitives';
+import { PrimaryTeammatePicker } from './PrimaryTeammatePicker';
+import { FieldRow, PanelHeader, SectionDivider, SettingsSection } from './panelPrimitives';
 import { UploadsTab } from './UploadsTab';
 import { UserAgenticDefaultEditor } from './UserAgenticDefaultEditor';
 
 const { Sider, Content } = Layout;
 
-const AGENTIC_TOOL_TABS = [
-  'claude-code',
-  'codex',
-  'gemini',
-  'opencode',
-  'copilot',
-  'cursor',
-] as const satisfies readonly AgenticToolName[];
+const AGENTIC_TOOL_TABS = AGENTIC_TOOL_NAMES;
 
 // Panels that own the shared `form` instance. Every other panel (tokens,
 // env-vars, providers) keeps the instance alive via a hidden connector.
@@ -174,6 +169,7 @@ const toolFromProviderKey = (key: string): AgenticToolName =>
 const LEGACY_TAB_ALIASES: Record<string, string> = {
   general: 'profile',
   audio: 'preferences',
+  'primary-teammate': 'preferences',
   groups: 'access',
   'personal-api-keys': 'tokens',
 };
@@ -206,7 +202,8 @@ const PANEL_META: Record<string, { title: string; icon: React.ReactNode; keyword
   preferences: {
     title: 'Preferences',
     icon: <BellOutlined />,
-    keywords: 'audio sound interface chime',
+    keywords:
+      'assistant teammate primary coding agent agentic tool audio sound notification chime event stream',
   },
   security: { title: 'Security', icon: <LockOutlined />, keywords: 'account password credentials' },
   tokens: { title: 'API tokens', icon: <KeyOutlined />, keywords: 'api token key ci pipeline' },
@@ -364,6 +361,7 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   const [copilotForm] = Form.useForm();
   const [cursorForm] = Form.useForm();
   const [audioForm] = Form.useForm();
+  const [primaryToolForm] = Form.useForm();
 
   const agenticFormByTool = useMemo<Record<AgenticToolName, ReturnType<typeof Form.useForm>[0]>>(
     () => ({
@@ -462,8 +460,9 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
         useSlackAvatar: userData.preferences?.use_slack_avatar !== false,
         must_change_password: userData.must_change_password ?? false,
       });
+      primaryToolForm.setFieldValue('primaryAgenticTool', userData.primary_agentic_tool);
     },
-    [form, initialTab]
+    [form, initialTab, primaryToolForm]
   );
 
   const loadUserGroups = useCallback(async () => {
@@ -754,6 +753,12 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
           minDurationSeconds: audioValues.minDurationSeconds,
         };
         nextPreferences.eventStream = { enabled: form.getFieldValue('eventStreamEnabled') ?? true };
+        const primaryAgenticTool = primaryToolForm.getFieldValue('primaryAgenticTool') as
+          | AgenticToolName
+          | undefined;
+        if (primaryAgenticTool !== undefined) {
+          updates.primary_agentic_tool = primaryAgenticTool;
+        }
         preferencesTouched = true;
       }
 
@@ -1065,7 +1070,8 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
             : [{ key: 'security', ...PANEL_META.security }]),
           // Personal API tokens and uploads are scoped to the signed-in caller,
           // so they are meaningless (and misleading) when an admin edits another
-          // user.
+          // user. The caller-scoped Primary Assistant control lives within
+          // Preferences and is hidden there while editing another user.
           ...(isEditingOther
             ? []
             : [
@@ -1211,6 +1217,20 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
         kind: 'setting',
         keywords: 'impersonation os process user',
         panelKey: 'security',
+      });
+    }
+    if (!isEditingOther) {
+      entries.push({
+        label: 'Primary assistant',
+        kind: 'setting',
+        keywords: 'teammate default agent personal ambient work',
+        panelKey: 'preferences',
+      });
+      entries.push({
+        label: 'Primary coding agent',
+        kind: 'setting',
+        keywords: 'agentic tool default claude codex gemini opencode copilot cursor',
+        panelKey: 'preferences',
       });
     }
     if (isSelf && onRestartOnboarding) {
@@ -1636,23 +1656,91 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   const renderPreferencesPanel = () => (
     <>
       <PanelHeader title={PANEL_META.preferences.title} />
-      <AudioSettingsTab form={audioForm} onValuesChange={() => markMainPanelDirty('preferences')} />
-      <SectionDivider label="Interface" />
-      <Form form={form} layout="vertical" onValuesChange={() => markMainPanelDirty('preferences')}>
-        <FieldRow
-          label="Live event stream"
-          badge={
-            <Tag color={token.colorPrimary} style={{ fontSize: token.fontSizeSM }}>
-              BETA
-            </Tag>
-          }
-          name="eventStreamEnabled"
-          valuePropName="checked"
-          tooltip="Adds an icon to the navbar to inspect live WebSocket events for debugging."
+
+      {!isEditingOther && hasMinimumRole(currentUser?.role, ROLES.MEMBER) && (
+        <SettingsSection title="Assistant">
+          <Typography.Text strong>Primary assistant</Typography.Text>
+          <Typography.Paragraph
+            type="secondary"
+            style={{ maxWidth: 560, marginTop: token.marginXXS, marginBottom: token.marginMD }}
+          >
+            Choose the teammate Agor uses by default for personal and ambient work.
+          </Typography.Paragraph>
+          <PrimaryTeammatePicker
+            key={currentUser?.user_id ?? 'anonymous'}
+            client={client}
+            currentUserId={currentUser?.user_id}
+            compact
+          />
+
+          <SectionDivider label="Coding sessions" />
+          <Form
+            form={primaryToolForm}
+            layout="vertical"
+            onValuesChange={() => markMainPanelDirty('preferences')}
+          >
+            <FieldRow
+              name="primaryAgenticTool"
+              label="Primary coding agent"
+              help={
+                user?.primary_agentic_tool
+                  ? 'Preselected for new sessions. Choosing another agent while composing affects only that session.'
+                  : 'Once you successfully use a coding agent, Agor will remember it here. You can choose one now instead.'
+              }
+              style={{ maxWidth: 560, marginBottom: 0 }}
+            >
+              <Select
+                placeholder="Not set — Claude Code is used initially"
+                loading={!tenantToolSettingsHydrated}
+                disabled={!tenantToolSettingsHydrated}
+                options={AGENTIC_TOOL_TABS.map((tool) => ({
+                  value: tool,
+                  disabled:
+                    tenantToolSettings.get(tool as TenantAgenticToolName)?.enabled === false,
+                  label: (
+                    <Space size={8}>
+                      <ToolIcon tool={tool} size={16} />
+                      <span>{AGENTIC_TOOL_DISPLAY_NAMES[tool]}</span>
+                      {tenantToolSettings.get(tool as TenantAgenticToolName)?.enabled === false && (
+                        <Typography.Text type="secondary">Disabled</Typography.Text>
+                      )}
+                    </Space>
+                  ),
+                }))}
+              />
+            </FieldRow>
+          </Form>
+        </SettingsSection>
+      )}
+
+      <SettingsSection title="Notifications">
+        <AudioSettingsTab
+          form={audioForm}
+          onValuesChange={() => markMainPanelDirty('preferences')}
+        />
+      </SettingsSection>
+
+      <SettingsSection title="Developer tools">
+        <Form
+          form={form}
+          layout="vertical"
+          onValuesChange={() => markMainPanelDirty('preferences')}
         >
-          <Switch />
-        </FieldRow>
-      </Form>
+          <FieldRow
+            label="Live event stream"
+            badge={
+              <Tag color={token.colorPrimary} style={{ fontSize: token.fontSizeSM }}>
+                BETA
+              </Tag>
+            }
+            name="eventStreamEnabled"
+            valuePropName="checked"
+            help="Show a navbar shortcut for inspecting live WebSocket events while debugging."
+          >
+            <Switch />
+          </FieldRow>
+        </Form>
+      </SettingsSection>
     </>
   );
 

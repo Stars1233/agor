@@ -27,6 +27,7 @@ import {
   boardPath,
   ENTITY_PATH_SEGMENTS,
   hasMinimumRole,
+  isAgenticToolName,
   ROLES,
   sessionPath,
 } from '@agor-live/client';
@@ -48,6 +49,12 @@ import { getDaemonUrl } from './config/daemon';
 import { CanvasNavigationProvider } from './contexts/CanvasNavigationContext';
 import { ConnectionProvider } from './contexts/ConnectionContext';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
+import { setPrimaryAgenticToolIfUnset } from './domain/primaryAgenticTool';
+import {
+  type NewSessionConfig,
+  runSessionCreationStages,
+  type SessionCreationResult,
+} from './domain/sessionCreation';
 import {
   IdentityContractState,
   useAgorClient,
@@ -79,6 +86,7 @@ import { isMobileDevice } from './utils/deviceDetection';
 import { completeForcedPasswordChange } from './utils/forcePasswordChange';
 import { useThemedMessage } from './utils/message';
 import { buildCompletedOnboardingPreferences } from './utils/onboardingGoals';
+import { savePromptDraft } from './utils/promptDrafts';
 import { seedOnboardingTeammate } from './utils/seedOnboardingTeammate';
 import { updateSessionMcpServers } from './utils/sessionMcpServers';
 import { getRouterBasename } from './utils/uiRoutes';
@@ -91,6 +99,26 @@ interface PendingEnvironmentToast {
   action: EnvironmentAction;
   key: string;
   requestedAt: number;
+}
+
+interface OnboardingOperationOwner {
+  userId: UUID;
+  authenticationGeneration: number;
+  activationGeneration: number;
+}
+
+function isSameOnboardingOwner(
+  left: OnboardingOperationOwner | null,
+  right: OnboardingOperationOwner | null
+): boolean {
+  return (
+    left === right ||
+    (!!left &&
+      !!right &&
+      left.userId === right.userId &&
+      left.authenticationGeneration === right.authenticationGeneration &&
+      left.activationGeneration === right.activationGeneration)
+  );
 }
 
 // Stable reference — an inline object here re-processes the modal on every App
@@ -331,6 +359,9 @@ function AppContent() {
     loading: authLoading,
     error: authError,
     accessToken,
+    authenticationGeneration,
+    isAuthenticationGenerationCurrent,
+    isAuthenticationOwnerCurrent,
     login,
     logout,
     reAuthenticate,
@@ -450,9 +481,6 @@ function AppContent() {
     }
   }, [location.pathname, location.search]);
 
-  // Per-session prompt drafts (persists across session switches)
-  const [promptDrafts, setPromptDrafts] = useState<Map<string, string>>(new Map());
-
   // Track if we've successfully loaded data at least once
   // This prevents UI from unmounting during reconnections
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
@@ -532,18 +560,66 @@ function AppContent() {
   }, [capturedSha, currentUser?.email]);
 
   // Onboarding wizard state
-  const [onboardingWizardOpen, setOnboardingWizardOpen] = useState(false);
-  const [onboardingWizardInstance, setOnboardingWizardInstance] = useState(0);
+  const [onboardingWizardOwner, setOnboardingWizardOwnerState] =
+    useState<OnboardingOperationOwner | null>(null);
+  const onboardingWizardOwnerRef = useRef<OnboardingOperationOwner | null>(null);
+  const onboardingActivationSequenceRef = useRef(0);
+  const setOnboardingWizardOwner = useCallback((owner: OnboardingOperationOwner | null) => {
+    if (isSameOnboardingOwner(onboardingWizardOwnerRef.current, owner)) return;
+    // Invalidate retained callbacks synchronously; waiting for React to commit
+    // the replacement wizard leaves a promise-continuation race.
+    onboardingWizardOwnerRef.current = owner;
+    setOnboardingWizardOwnerState(owner);
+  }, []);
+  const activateOnboardingWizard = useCallback(
+    (userId: UUID, ownerAuthenticationGeneration: number, replaceActive = false) => {
+      const activeOwner = onboardingWizardOwnerRef.current;
+      if (
+        !replaceActive &&
+        activeOwner?.userId === userId &&
+        activeOwner.authenticationGeneration === ownerAuthenticationGeneration
+      ) {
+        return activeOwner;
+      }
+
+      // Allocate a new opaque generation for every activation from an
+      // invalidated state. Never reconstruct a prior owner tuple: promises
+      // retained by an unmounted wizard must not become current again if the
+      // same user/authentication generation later becomes eligible to reopen.
+      onboardingActivationSequenceRef.current += 1;
+      const owner: OnboardingOperationOwner = {
+        userId,
+        authenticationGeneration: ownerAuthenticationGeneration,
+        activationGeneration: onboardingActivationSequenceRef.current,
+      };
+      setOnboardingWizardOwner(owner);
+      return owner;
+    },
+    [setOnboardingWizardOwner]
+  );
+  const isOnboardingOwnerCurrent = useCallback(
+    (owner: OnboardingOperationOwner) =>
+      isSameOnboardingOwner(onboardingWizardOwnerRef.current, owner) &&
+      isAuthenticationOwnerCurrent(owner.userId, owner.authenticationGeneration),
+    [isAuthenticationOwnerCurrent]
+  );
+  const onboardingWizardOpen =
+    !!currentUser &&
+    onboardingWizardOwner?.userId === currentUser.user_id &&
+    isOnboardingOwnerCurrent(onboardingWizardOwner);
   const onboardingSeedResultRef = useRef(
     new Map<string, { branchId?: string; sessionId?: string }>()
   );
   const onboardingSeedOwnerRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
-    if (onboardingSeedOwnerRef.current === currentUser?.user_id) return;
-    onboardingSeedOwnerRef.current = currentUser?.user_id;
+    const ownerKey = onboardingWizardOwner
+      ? `${onboardingWizardOwner.userId}:${onboardingWizardOwner.authenticationGeneration}`
+      : undefined;
+    if (onboardingSeedOwnerRef.current === ownerKey) return;
+    onboardingSeedOwnerRef.current = ownerKey;
     onboardingSeedResultRef.current.clear();
-  }, [currentUser?.user_id]);
+  }, [onboardingWizardOwner]);
 
   // Clone a repository (framework repo, GitHub repos, etc.). Defined here —
   // above the early returns and the onboarding auto-clone hook below — so it can
@@ -703,7 +779,7 @@ function AppContent() {
   // Trigger wizard when user is loaded and hasn't completed onboarding
   useEffect(() => {
     if (currentUser && !canRunOnboarding) {
-      setOnboardingWizardOpen(false);
+      setOnboardingWizardOwner(null);
       return;
     }
     if (
@@ -716,7 +792,7 @@ function AppContent() {
       currentSurface.startsWorkspaceRuntime &&
       !loading
     ) {
-      setOnboardingWizardOpen(true);
+      activateOnboardingWizard(currentUser.user_id, authenticationGeneration);
     }
   }, [
     currentUser,
@@ -725,15 +801,39 @@ function AppContent() {
     workspaceSurfaceShouldRun,
     currentSurface.startsWorkspaceRuntime,
     loading,
+    authenticationGeneration,
+    activateOnboardingWizard,
+    setOnboardingWizardOwner,
   ]);
 
   // Handle wizard completion
-  const handleOnboardingComplete = async (result: OnboardingCompletionResult) => {
+  const handleOnboardingComplete = async (
+    owner: OnboardingOperationOwner,
+    result: OnboardingCompletionResult
+  ) => {
     // The wizard awaits this and stays open in a loading state until it
     // resolves, so we do the teammate creation + navigation FIRST and only
     // close the modal at the very end — otherwise the user stares at a blank
     // homepage while the async work runs.
-    if (!currentUser || !client) throw new Error('Not connected - try again when Agor reconnects.');
+    if (!currentUser || !isOnboardingOwnerCurrent(owner)) return;
+    if (!client) throw new Error('Not connected - try again when Agor reconnects.');
+    const operationUserId = owner.userId;
+    const isCurrentUser = () => isOnboardingOwnerCurrent(owner);
+
+    // Completing onboarding is an explicit tool choice. Seed it only while the
+    // preference is unset; a Settings selection made concurrently always wins.
+    if (!isCurrentUser()) return;
+    if (result.agent && client) {
+      try {
+        await setPrimaryAgenticToolIfUnset(client, currentUser, result.agent);
+      } catch (error) {
+        console.warn(
+          '[onboarding] Failed to seed primary coding agent:',
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    if (!isCurrentUser()) return;
 
     // Seed the user's first AI teammate on the board they just named. The
     // framework repo has been cloning in the background since the wizard opened
@@ -761,6 +861,7 @@ function AppContent() {
     if (!readyFrameworkRepo && result.teammateName?.trim() && client) {
       readyFrameworkRepo = await waitForFrameworkRepoReady(client, 20_000);
     }
+    if (!isCurrentUser()) return;
 
     const retainedSeed = onboardingSeedResultRef.current.get(result.boardId);
     const seeded = await seedOnboardingTeammate({
@@ -780,18 +881,31 @@ function AppContent() {
         name: currentUser.name,
         email: currentUser.email,
       },
+      expectedUserId: operationUserId,
+      isCurrentUser: (expectedUserId) => expectedUserId === operationUserId && isCurrentUser(),
       client,
       repoById: agorStore.getState().repoById,
       branchById: agorStore.getState().branchById,
       sessionById: agorStore.getState().sessionById,
       existingBranchId: retainedSeed?.branchId || result.branchId || undefined,
       existingSessionId: retainedSeed?.sessionId || result.sessionId || undefined,
-      onCreateBranch: handleCreateBranch,
-      onUpdateBranch: (branchId, updates) =>
-        handleUpdateBranch(branchId, updates as BranchUpdate, { silent: true }),
-      onCreateSession: handleCreateSession,
-      onWarn: (message) => showWarning(message, { key: 'onboarding-teammate', duration: 8 }),
+      onCreateBranch: (repoId, data) =>
+        isCurrentUser() ? handleCreateBranch(repoId, data) : Promise.resolve(null),
+      onUpdateBranch: (branchId, updates) => {
+        if (!isCurrentUser()) return;
+        return handleUpdateBranch(branchId, updates as BranchUpdate, { silent: true });
+      },
+      onCreateSession: async (config, boardId) => {
+        if (!isCurrentUser()) return null;
+        return handleCreateSession(config, boardId);
+      },
+      onWarn: (message) => {
+        if (isCurrentUser()) {
+          showWarning(message, { key: 'onboarding-teammate', duration: 8 });
+        }
+      },
     });
+    if (!isCurrentUser()) return;
     const branchId = seeded.branchId ?? retainedSeed?.branchId ?? result.branchId;
     const sessionId = seeded.sessionId ?? retainedSeed?.sessionId ?? result.sessionId;
     onboardingSeedResultRef.current.set(result.boardId, {
@@ -806,6 +920,7 @@ function AppContent() {
     // Fetch immediately before the whole-preferences patch to preserve any
     // unrelated setting changed while the wizard was open.
     const latestUser = (await client.service('users').get(currentUser.user_id)) as User;
+    if (!isCurrentUser()) return;
     const completionResult = { ...result, branchId, sessionId };
     await handleUpdateUser(
       currentUser.user_id,
@@ -815,6 +930,7 @@ function AppContent() {
       },
       { silent: true }
     );
+    if (!isCurrentUser()) return;
 
     // Always land the user on a board — never the homepage. Prefer the seeded
     // session, then the board the wizard created, then the user's main board,
@@ -836,7 +952,7 @@ function AppContent() {
 
     // Close the wizard only now that creation + navigation are done, so the
     // loading affordance stayed visible for the whole operation.
-    setOnboardingWizardOpen(false);
+    setOnboardingWizardOwner(null);
   };
 
   const handleCheckAuth = useCallback(
@@ -997,150 +1113,102 @@ function AppContent() {
     );
   }
 
-  // Handle session creation
-  // biome-ignore lint/suspicious/noExplicitAny: Config type from AgorApp component props
-  const handleCreateSession = async (config: any, boardId: string) => {
-    try {
-      const branch_id = config.branch_id;
+  // Handle session creation. The browser owns only the multipart upload gap;
+  // the daemon commits required session configuration, then uses its ordinary
+  // prompt-admission lifecycle. A prompt failure leaves a usable configured
+  // blank session and seeds the normal composer rather than retaining a second
+  // recovery state machine.
+  const handleCreateSession = async (
+    config: NewSessionConfig,
+    _boardId: string
+  ): Promise<SessionCreationResult | null> => {
+    const branch_id = config.branch_id;
+    if (!branch_id) {
+      showError('Failed to create session: Branch ID is required to create a session');
+      return null;
+    }
+    if (!client || !currentUser) {
+      showError('Failed to create session: Authentication required');
+      return null;
+    }
 
-      if (!branch_id) {
-        throw new Error('Branch ID is required to create a session');
-      }
-
-      // Files pasted/dropped into the New Session modal ride along on the
-      // config but must never enter the session-create REST payload — strip
-      // them out and upload them once the session (and its ID) exists.
-      const { attachmentFiles, ...sessionConfig } = config;
-
-      // Create the session with the branch_id
-      const session = await createSession({
-        ...sessionConfig,
-        branch_id,
-      });
-
-      if (session) {
-        // Optimistically insert the authoritative row `create` just returned so
-        // the store knows the session before we navigate to it. Selection is
-        // routed through URL→store resolution, which can only resolve a session
-        // that's already in `sessionById`; without this the drawer would blank
-        // until the socket `created` event re-delivered the same object. That
-        // event is now a harmless no-op — `sessionCreated` is idempotent.
+    const operationUserId = currentUser.user_id;
+    const operationAuthenticationGeneration = authenticationGeneration;
+    const operationAccessToken = accessToken;
+    const shouldContinue = () =>
+      isAuthenticationOwnerCurrent(operationUserId, operationAuthenticationGeneration);
+    const { attachmentFiles, ...sessionConfig } = config;
+    const outcome = await runSessionCreationStages({
+      createSession: () => createSession({ ...sessionConfig, branch_id }),
+      onSessionCreated: (session) => {
         sessionCreated(session);
-
-        // Associate MCP servers if provided
-        if (config.mcpServerIds && config.mcpServerIds.length > 0) {
-          for (const serverId of config.mcpServerIds) {
-            try {
-              await client?.service(`sessions/${session.session_id}/mcp-servers`).create({
-                mcpServerId: serverId,
-              });
-            } catch (error) {
-              console.error(`Failed to associate MCP server ${serverId}:`, error);
-            }
-          }
-        }
-
-        // Associate session-scope env var selections if provided.
-        if (config.envVarNames && config.envVarNames.length > 0) {
-          await handleUpdateSessionEnvSelections(session.session_id, config.envVarNames);
-        }
-
         showSuccess('Session created!');
-
-        // Upload any pasted/dropped files to the freshly created session, then
-        // fold their server paths into the initial prompt. A screenshot with no
-        // typed text is valid — the attachment block becomes the message — so we
-        // send whenever there is prompt text OR at least one attachment.
-        const trimmedPrompt = config.initialPrompt?.trim() ?? '';
-        if (attachmentFiles?.length) {
-          try {
+      },
+      initialPrompt: config.initialPrompt ?? '',
+      preparePrompt: attachmentFiles?.length
+        ? async (session, prompt) => {
             const uploaded = await uploadFilesToSession({
               sessionId: session.session_id,
               daemonUrl: getDaemonUrl(),
               files: attachmentFiles,
               notifyAgent: false,
+              accessToken: operationAccessToken,
             });
-            const finalPrompt = buildPromptWithAttachments(
-              config.initialPrompt ?? '',
-              uploaded.files
-            );
-            if (finalPrompt.trim()) {
-              await handleSendPrompt(session.session_id, finalPrompt, config.permissionMode);
-            }
-          } catch (error) {
-            // Never silently drop the user's words: surface the upload failure
-            // but still send the text-only prompt so their typing isn't lost.
-            showError(
-              `Failed to upload attachments: ${
-                error instanceof Error ? error.message : String(error)
-              }`
-            );
-            if (trimmedPrompt) {
-              await handleSendPrompt(
-                session.session_id,
-                config.initialPrompt,
-                config.permissionMode
-              );
-            }
+            return buildPromptWithAttachments(prompt, uploaded.files);
           }
-        } else if (trimmedPrompt) {
-          await handleSendPrompt(session.session_id, config.initialPrompt, config.permissionMode);
-        }
+        : undefined,
+      initializeSession: (session, prompt) =>
+        client.sessions.initialize(session.session_id, {
+          expectedUserId: operationUserId,
+          mcpServerIds: config.mcpServerIds,
+          envVarNames: config.envVarNames,
+          prompt,
+          permissionMode: config.permissionMode,
+        }),
+      shouldContinue,
+    });
 
-        // Return the session ID so AgorApp can open the drawer
-        return session.session_id;
-      } else {
-        showError('Failed to create session');
-        return null;
-      }
-    } catch (error) {
+    if (outcome.status === 'cancelled') return null;
+    if (outcome.status === 'create-failed') {
+      if (!shouldContinue()) return null;
       showError(
-        `Failed to create session: ${error instanceof Error ? error.message : String(error)}`
+        `Failed to create session: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`
       );
       return null;
     }
-  };
 
-  // Update draft for a specific session
-  const handleUpdateDraft = (sessionId: string, draft: string) => {
-    setPromptDrafts((prev) => {
-      const next = new Map(prev);
-      if (draft.trim()) {
-        next.set(sessionId, draft);
-      } else {
-        next.delete(sessionId); // Clean up empty drafts
+    if (outcome.status === 'complete') {
+      if (!shouldContinue()) return null;
+      if (isAgenticToolName(config.agent)) {
+        void setPrimaryAgenticToolIfUnset(client, currentUser, config.agent).catch((error) => {
+          console.warn(
+            '[sessions] Failed to seed primary coding agent:',
+            error instanceof Error ? error.message : String(error)
+          );
+        });
       }
-      return next;
-    });
-  };
+      return { sessionId: outcome.session.session_id };
+    }
 
-  // Clear draft for a specific session
-  const handleClearDraft = (sessionId: string) => {
-    setPromptDrafts((prev) => {
-      const next = new Map(prev);
-      next.delete(sessionId);
-      return next;
-    });
+    if (!shouldContinue()) return null;
+    savePromptDraft(operationUserId, outcome.session.session_id, outcome.prompt);
+    showError(
+      `Session created, but it did not start: ${
+        outcome.error instanceof Error ? outcome.error.message : String(outcome.error)
+      }. Open the session to review its setup and retry the prompt.`
+    );
+    return { sessionId: outcome.session.session_id };
   };
 
   // Handle fork session
   //
   // On failure we RETHROW the error so upstream modals (ForkSpawnModal) can
   // stay open and preserve the user's typed prompt. The error toast is still
-  // surfaced here so the user gets immediate feedback either way. We also
-  // mirror the prompt onto the forked session's per-session draft so that if
-  // the async executor spawn fails later (the fork REST call can succeed
-  // while the background executor errors out silently), the user can still
-  // find their prompt in the new session's compose box.
+  // surfaced here so the user gets immediate feedback either way.
   const handleForkSession = async (sessionId: string, prompt: string) => {
     try {
-      const session = await forkSession(sessionId as SessionID, prompt);
+      await forkSession(sessionId as SessionID, prompt);
       showSuccess('Session forked successfully!');
-      // Seed a per-session draft on the new fork so the prompt is recoverable
-      // even if the background executor fails after the REST call returned.
-      handleUpdateDraft(session.session_id, prompt);
-      // Clear the parent's draft after a successful fork
-      handleClearDraft(sessionId);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to fork session';
       showError(`Failed to fork session: ${message}`);
@@ -1151,10 +1219,8 @@ function AppContent() {
   // Handle btw fork session (ephemeral fork for side questions)
   const handleBtwForkSession = async (sessionId: string, prompt: string) => {
     try {
-      const session = await btwForkSession(sessionId as SessionID, prompt);
+      await btwForkSession(sessionId as SessionID, prompt);
       showSuccess('Side question sent via btw fork');
-      handleUpdateDraft(session.session_id, prompt);
-      handleClearDraft(sessionId);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to create btw fork';
       showError(`Failed to create btw fork: ${message}`);
@@ -1167,13 +1233,8 @@ function AppContent() {
     // Handle both string prompt and full SpawnConfig
     const spawnConfig = typeof config === 'string' ? { prompt: config } : config;
     try {
-      const session = await spawnSession(sessionId as SessionID, spawnConfig);
+      await spawnSession(sessionId as SessionID, spawnConfig);
       showSuccess('Subsession session spawned successfully!');
-      if (spawnConfig.prompt?.trim()) {
-        handleUpdateDraft(session.session_id, spawnConfig.prompt);
-      }
-      // Clear the draft after spawning subsession
-      handleClearDraft(sessionId);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to spawn session';
       showError(`Failed to spawn session: ${message}`);
@@ -1187,19 +1248,19 @@ function AppContent() {
     prompt: string,
     permissionMode?: PermissionMode
   ): Promise<boolean> => {
-    if (!client) return false;
-
+    if (!client || !currentUser) return false;
+    const operationUserId = currentUser.user_id;
+    const operationAuthenticationGeneration = authenticationGeneration;
     try {
-      await client.sessions.prompt(sessionId, prompt, {
-        permissionMode,
-      });
-
-      // Clear the draft after sending
-      handleClearDraft(sessionId);
-      return true;
+      await client.sessions.prompt(sessionId, prompt, { permissionMode });
+      return isAuthenticationOwnerCurrent(operationUserId, operationAuthenticationGeneration);
     } catch (error) {
-      showError(`Failed to send prompt: ${error instanceof Error ? error.message : String(error)}`);
-      console.error('Prompt error:', error);
+      if (isAuthenticationOwnerCurrent(operationUserId, operationAuthenticationGeneration)) {
+        showError(
+          `Failed to send prompt: ${error instanceof Error ? error.message : String(error)}`
+        );
+        console.error('Prompt error:', error);
+      }
       return false;
     }
   };
@@ -1262,6 +1323,8 @@ function AppContent() {
 
   const handleRestartOnboarding = async () => {
     if (!currentUser || !canRunOnboarding) return;
+    const operationUserId = currentUser.user_id;
+    const operationAuthenticationGeneration = authenticationGeneration;
 
     const preferences = { ...(currentUser.preferences ?? {}) } as NonNullable<User['preferences']>;
     delete preferences.onboarding;
@@ -1275,9 +1338,12 @@ function AppContent() {
       return;
     }
 
+    if (!isAuthenticationOwnerCurrent(operationUserId, operationAuthenticationGeneration)) {
+      return;
+    }
+
     setOpenUserSettings(false);
-    setOnboardingWizardInstance((value) => value + 1);
-    setOnboardingWizardOpen(true);
+    activateOnboardingWizard(operationUserId, operationAuthenticationGeneration, true);
   };
 
   // Handle delete user
@@ -1857,6 +1923,8 @@ function AppContent() {
     <AgorApp
       client={client}
       user={currentUser}
+      authenticationGeneration={authenticationGeneration}
+      isAuthenticationGenerationCurrent={isAuthenticationGenerationCurrent}
       connected={connected}
       connecting={connecting}
       availableAgents={AVAILABLE_AGENTS}
@@ -1966,21 +2034,42 @@ function AppContent() {
         />
       )}
 
-      {/* Onboarding Wizard - shown for new users.
-            Key by user identity so the wizard's local React state is bound to
-            the signed-in user. On any user change (logout → login as someone
-            else, or admin impersonate), React tears down + remounts the wizard
-            with fresh state, so one user's onboarding progress can never leak
-            into another user's session. */}
+      {/* Onboarding Wizard - shown for new users. Both visibility and local
+            React state belong to one authenticated generation, not merely a
+            user ID. Logout/login as the same user and principal changes both
+            invalidate the old wizard and any pending completion work. */}
       <ConfigProvider theme={ONBOARDING_DARK_THEME}>
         <OnboardingWizard
-          key={`${currentUser?.user_id ?? '__anon__'}:${onboardingWizardInstance}`}
+          key={`${onboardingWizardOwner?.userId ?? '__anon__'}:${onboardingWizardOwner?.authenticationGeneration ?? authenticationGeneration}:${onboardingWizardOwner?.activationGeneration ?? 0}`}
           open={onboardingWizardOpen}
-          onComplete={handleOnboardingComplete}
+          isCurrent={() =>
+            !!onboardingWizardOwner && isOnboardingOwnerCurrent(onboardingWizardOwner)
+          }
+          onComplete={(result) => {
+            if (!onboardingWizardOwner || !isOnboardingOwnerCurrent(onboardingWizardOwner)) return;
+            return handleOnboardingComplete(onboardingWizardOwner, result);
+          }}
           user={currentUser}
           client={client}
-          onUpdateUser={(userId, updates) => handleUpdateUser(userId, updates, { silent: true })}
-          onCheckAuth={handleCheckAuth}
+          onUpdateUser={async (userId, updates) => {
+            if (
+              !onboardingWizardOwner ||
+              userId !== onboardingWizardOwner.userId ||
+              !isOnboardingOwnerCurrent(onboardingWizardOwner)
+            ) {
+              return;
+            }
+            await handleUpdateUser(userId, updates, { silent: true });
+          }}
+          onCheckAuth={async (tool, apiKey) => {
+            if (!onboardingWizardOwner || !isOnboardingOwnerCurrent(onboardingWizardOwner)) {
+              return { status: 'unknown', authenticated: false, method: 'none' };
+            }
+            const result = await handleCheckAuth(tool, apiKey);
+            return isOnboardingOwnerCurrent(onboardingWizardOwner)
+              ? result
+              : { status: 'unknown', authenticated: false, method: 'none' };
+          }}
         />
       </ConfigProvider>
 
@@ -2024,8 +2113,6 @@ function AppContent() {
                 onToggleReaction={handleToggleReaction}
                 onDeleteComment={handleDeleteComment}
                 onLogout={logout}
-                promptDrafts={promptDrafts}
-                onUpdateDraft={handleUpdateDraft}
               />
             }
           />

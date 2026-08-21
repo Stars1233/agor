@@ -5,6 +5,7 @@
  */
 
 import type {
+  AgenticToolName,
   AgenticToolPreset,
   Artifact,
   AuthenticationResult,
@@ -55,6 +56,7 @@ import type {
   SchedulePatchData,
   SdkHealthFailureInput,
   Session,
+  SessionID,
   SessionUpdate,
   Task,
   TeammateWelcomeNoteRequest,
@@ -66,6 +68,7 @@ import type {
   UserAvatarSettings,
   UserAvatarSyncRequest,
   UserAvatarSyncResult,
+  UserID,
   UUID,
 } from '@agor/core/types';
 import authentication from '@feathersjs/authentication-client';
@@ -122,33 +125,36 @@ export interface SessionPromptRequest {
   stream?: boolean;
 }
 
-export interface QueuedSessionPromptResult {
-  success: true;
-  queued: true;
-  message: Message;
-  queue_position: number;
-}
-
-export interface RunningSessionPromptResult {
-  success: true;
-  taskId: string;
-  status: string;
-  streaming: boolean;
-  queued?: false;
-}
-
-export type SessionPromptResult = QueuedSessionPromptResult | RunningSessionPromptResult;
-
 export interface SessionPromptOptions extends Omit<SessionPromptRequest, 'prompt'> {
   params?: Params;
 }
 
+/** Required setup for an already-created session, applied before its first prompt. */
+export interface SessionInitializationRequest {
+  /** Fence delayed calls to the identity that created the session. */
+  expectedUserId: UserID;
+  /** Validated and branded after crossing the daemon trust boundary. */
+  mcpServerIds?: string[];
+  envVarNames?: string[];
+  prompt?: string;
+  permissionMode?: PermissionMode;
+}
+
+export interface SessionInitializationOptions extends SessionInitializationRequest {
+  params?: Params;
+}
+
+export interface SessionInitializationResult {
+  sessionId: SessionID;
+  task?: Task;
+}
+
 export interface SessionsClientHelpers {
-  prompt(
+  prompt(sessionId: string, prompt: string, options?: SessionPromptOptions): Promise<Task>;
+  initialize(
     sessionId: string,
-    prompt: string,
-    options?: SessionPromptOptions
-  ): Promise<SessionPromptResult>;
+    options: SessionInitializationOptions
+  ): Promise<SessionInitializationResult>;
 }
 
 /**
@@ -581,6 +587,31 @@ export interface UsersService extends AgorService<User> {
     params?: Params
   ): Promise<UserAvatarSettings>;
   syncAvatars(data?: UserAvatarSyncRequest, params?: Params): Promise<UserAvatarSyncResult>;
+  /**
+   * Resolve the calling user's primary teammate branch, or null when unset or
+   * no longer accessible.
+   */
+  getPrimaryTeammate(data?: unknown, params?: Params): Promise<Branch | null>;
+  /** List active teammate branches the caller can start sessions on. */
+  getPrimaryTeammateCandidates(data?: unknown, params?: Params): Promise<Branch[]>;
+  /**
+   * Set the calling user's primary teammate to an accessible branch,
+   * recorded as an explicit user pick.
+   */
+  setPrimaryTeammate(
+    data: { branchId: string; expectedUserId: UserID },
+    params?: Params
+  ): Promise<Branch | null>;
+  /** Set an onboarding/default teammate only when the caller is still unset. */
+  setPrimaryTeammateIfUnset(
+    data: { branchId: string; expectedUserId: UserID },
+    params?: Params
+  ): Promise<Branch | null>;
+  /** Seed the caller's primary coding agent without overwriting an existing preference. */
+  setPrimaryAgenticToolIfUnset(
+    data: { tool: AgenticToolName; expectedUserId: UserID },
+    params?: Params
+  ): Promise<User>;
 }
 
 /**
@@ -1163,7 +1194,12 @@ function extendUsersService(client: AgorClient): void {
       'getGitEnvironment',
       'getAvatarSettings',
       'updateAvatarSettings',
-      'syncAvatars'
+      'syncAvatars',
+      'getPrimaryTeammate',
+      'getPrimaryTeammateCandidates',
+      'setPrimaryTeammate',
+      'setPrimaryTeammateIfUnset',
+      'setPrimaryAgenticToolIfUnset'
     );
   }
   usersService[USERS_SERVICE_EXTENDED] = true;
@@ -1242,7 +1278,14 @@ function extendSessionsHelpers(client: AgorClient): void {
       const response = await client
         .service(`sessions/${sessionId}/prompt`)
         .create({ prompt, ...requestOptions } as SessionPromptRequest, params);
-      return response as SessionPromptResult;
+      return response as Task;
+    },
+    initialize: async (sessionId: string, options: SessionInitializationOptions) => {
+      const { params, ...request } = options;
+      const response = await client
+        .service(`sessions/${sessionId}/initialize`)
+        .create(request, params);
+      return response as SessionInitializationResult;
     },
   };
 

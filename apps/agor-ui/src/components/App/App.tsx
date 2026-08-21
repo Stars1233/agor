@@ -20,7 +20,7 @@ import type {
   User,
 } from '@agor-live/client';
 import { hasMinimumRole, PermissionScope } from '@agor-live/client';
-import { Layout, theme, Upload } from 'antd';
+import { Flex, Layout, theme, Upload } from 'antd';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   type ImperativePanelHandle,
@@ -32,6 +32,7 @@ import { useLocation, useParams } from 'react-router-dom';
 import type { BranchStorageConfig } from '@/utils/branchStorage';
 import { AppActionsProvider } from '../../contexts/AppActionsContext';
 import { useRegisterBoardSwitcher } from '../../contexts/CanvasNavigationContext';
+import type { NewSessionConfig, SessionCreationResult } from '../../domain/sessionCreation';
 import { useAppNavigation } from '../../hooks/useAppNavigation';
 import { useBoardTitle } from '../../hooks/useBoardTitle';
 import { useEventStream } from '../../hooks/useEventStream';
@@ -88,7 +89,7 @@ import { EnvironmentLogsModal } from '../EnvironmentLogsModal';
 import { EventStreamPanel } from '../EventStreamPanel';
 import { HomePage } from '../HomePage';
 import { NewSessionButton } from '../NewSessionButton';
-import { type NewSessionConfig, NewSessionModal } from '../NewSessionModal';
+import { NewSessionModal } from '../NewSessionModal';
 import { SessionCanvas, type SessionCanvasRef } from '../SessionCanvas';
 import { SessionPanel } from '../SessionPanel';
 import { PendingToolChoicePanel } from '../SessionPanel/PendingToolChoicePanel';
@@ -155,6 +156,8 @@ const UrlStateBridge: React.FC<{
 export interface AppProps {
   client: AgorClient | null;
   user?: User | null;
+  authenticationGeneration?: number;
+  isAuthenticationGenerationCurrent?: (generation: number) => boolean;
   connected?: boolean;
   connecting?: boolean;
   availableAgents: AgenticToolOption[];
@@ -170,7 +173,10 @@ export interface AppProps {
   suppressLeftPanel?: boolean; // Temporarily hide the teammate/comments panel behind modal-first flows
   /** Rendered between AppHeader and main content (used for onboarding banners). */
   topBanner?: React.ReactNode;
-  onCreateSession?: (config: NewSessionConfig, boardId: string) => Promise<string | null>;
+  onCreateSession?: (
+    config: NewSessionConfig,
+    boardId: string
+  ) => Promise<SessionCreationResult | null>;
   onForkSession?: (sessionId: string, prompt: string) => Promise<void>;
   onBtwForkSession?: (sessionId: string, prompt: string) => Promise<void>;
   onSpawnSession?: (sessionId: string, config: string | Partial<SpawnConfig>) => Promise<void>;
@@ -291,6 +297,8 @@ const clampPercent = (value: number, min: number, max: number) =>
 export const App: React.FC<AppProps> = ({
   client,
   user,
+  authenticationGeneration = 0,
+  isAuthenticationGenerationCurrent,
   connected = false,
   connecting = false,
   availableAgents,
@@ -846,7 +854,8 @@ export const App: React.FC<AppProps> = ({
   };
 
   const handleCreateSession = async (config: NewSessionConfig) => {
-    const sessionId = await onCreateSession?.(config, currentBoardId);
+    const outcome = await onCreateSession?.(config, currentBoardId);
+    const sessionId = outcome?.sessionId ?? null;
     setNewSessionBranchId(null);
 
     // Select synchronously, then let the URL catch up. The create seam inserts
@@ -859,6 +868,7 @@ export const App: React.FC<AppProps> = ({
       setSelectedSessionId(sessionId);
       navigation.goToSession(sessionId);
     }
+    return outcome ?? null;
   };
 
   // Single mechanism behind both "pick a tool" entry points: the quick-start
@@ -880,7 +890,7 @@ export const App: React.FC<AppProps> = ({
       const branch = agorStore.getState().branchById.get(branchId as Branch['branch_id']);
       const mcpServerIds = resolveQuickStartMcpServerIds(user, branch);
 
-      const sessionId = await onCreateSession?.(
+      const outcome = await onCreateSession?.(
         {
           branch_id: branchId,
           agent: tool,
@@ -889,7 +899,8 @@ export const App: React.FC<AppProps> = ({
         },
         currentBoardId
       );
-      if (!sessionId) return null;
+      if (!outcome) return null;
+      const sessionId = outcome.sessionId;
 
       // Select the new session synchronously, in the same render that clears
       // the picker, so the drawer never has a frame with neither target set.
@@ -1062,7 +1073,7 @@ export const App: React.FC<AppProps> = ({
       if (!onCreateSession) {
         throw new Error('Missing session creation handler.');
       }
-      const sessionId = await startTeammateBootstrapSession({
+      const initialization = await startTeammateBootstrapSession({
         client,
         branchId: branch.branch_id,
         boardId: branch.board_id || currentBoardId,
@@ -1070,7 +1081,7 @@ export const App: React.FC<AppProps> = ({
         onCreateSession,
         onStatusChange: progress?.onStatusChange,
       });
-      navigation.goToSession(sessionId);
+      navigation.goToSession(initialization.sessionId);
       return;
     } catch (error) {
       console.error('AI teammate session bootstrap failed:', error);
@@ -1421,6 +1432,7 @@ export const App: React.FC<AppProps> = ({
   );
   const stableOnLogout = useStableCallback(onLogout);
   const stableOnRetryConnection = useStableCallback(onRetryConnection);
+  const stableOnCreateSession = useStableCallback(onCreateSession);
 
   return (
     <AppActionsProvider value={appActionsValue}>
@@ -1435,6 +1447,8 @@ export const App: React.FC<AppProps> = ({
       <Layout style={{ height: '100vh' }}>
         <AppHeader
           user={user}
+          authenticationGeneration={authenticationGeneration}
+          isAuthenticationGenerationCurrent={isAuthenticationGenerationCurrent}
           presenceClient={client}
           currentUserId={user?.user_id}
           connected={connected}
@@ -1454,6 +1468,7 @@ export const App: React.FC<AppProps> = ({
           onUserClick={handleHeaderUserClick}
           instanceLabel={instanceLabel}
           instanceDescription={instanceDescription}
+          onCreateSession={stableOnCreateSession}
         />
         {topBanner}
         <Content style={{ position: 'relative', overflow: 'hidden', display: 'flex' }}>
@@ -1687,16 +1702,20 @@ export const App: React.FC<AppProps> = ({
                       maxSize={sessionPanelMaxSizeWithinContent}
                     >
                       {effectiveSelectedSessionId ? (
-                        <SessionPanel
-                          client={client}
-                          session={selectedSession}
-                          branch={selectedSessionBranch}
-                          currentUserId={user?.user_id}
-                          sessionMcpServerIds={selectedSessionMcpServerIds}
-                          open={!!effectiveSelectedSessionId}
-                          onClose={handleCloseSessionPanel}
-                          uploadPolicy={uploadPolicy}
-                        />
+                        <Flex vertical style={{ height: '100%' }}>
+                          <div style={{ flex: 1, minHeight: 0 }}>
+                            <SessionPanel
+                              client={client}
+                              session={selectedSession}
+                              branch={selectedSessionBranch}
+                              currentUserId={user?.user_id}
+                              sessionMcpServerIds={selectedSessionMcpServerIds}
+                              open={!!effectiveSelectedSessionId}
+                              onClose={handleCloseSessionPanel}
+                              uploadPolicy={uploadPolicy}
+                            />
+                          </div>
+                        </Flex>
                       ) : pendingToolChoiceBranchId ? (
                         <PendingToolChoicePanel
                           branch={pendingToolChoiceBranch}

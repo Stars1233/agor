@@ -63,6 +63,30 @@ describe('prompt and widget transaction scopes', () => {
     expect(run).toContain('messageSource: normalizeMessageSource(data.messageSource, params)');
   });
 
+  it('commits required session configuration before using ordinary prompt admission', () => {
+    const start = source.indexOf("'/sessions/:id/initialize'");
+    const end = source.indexOf('// Health endpoint', start);
+    const initialization = source.slice(start - 100, end);
+
+    expect(start).toBeGreaterThan(0);
+    expect(initialization).toContain('registerLongAuthenticatedRoute(');
+    expect(initialization).toContain('data?.expectedUserId !== callerId');
+    const scopedAuthorization = initialization.indexOf(
+      'await inCurrentTenantDatabaseScope(() =>\n          authorizeAndLoadSessionForMcpConfig(id, params)'
+    );
+    const stagedInitialization = initialization.indexOf('runSessionInitializationStages({');
+    expect(scopedAuthorization).toBeGreaterThan(0);
+    expect(stagedInitialization).toBeGreaterThan(scopedAuthorization);
+    const mcpSetup = initialization.indexOf('sessionMCPServersService.setServers(');
+    const envSetup = initialization.indexOf('sessionEnvSelectionsService.setAll(');
+    const promptAdmission = initialization.indexOf("service('/sessions/:id/prompt').create(");
+    expect(mcpSetup).toBeGreaterThan(0);
+    expect(envSetup).toBeGreaterThan(mcpSetup);
+    expect(promptAdmission).toBeGreaterThan(envSetup);
+    expect(initialization.indexOf("path: 'session-mcp-servers'")).toBeLessThan(promptAdmission);
+    expect(initialization.indexOf("path: 'session-env-selections'")).toBeLessThan(promptAdmission);
+  });
+
   it('restores the queued user before hooked Session recovery under branch RBAC', () => {
     const start = source.indexOf('async function processNextQueuedTaskInternal(');
     const end = source.indexOf('// Inject queue processor into sessions service.', start);

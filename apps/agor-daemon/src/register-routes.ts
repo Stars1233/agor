@@ -7,6 +7,7 @@
  */
 
 import { Transform } from 'node:stream';
+import type { SessionInitializationRequest } from '@agor/core/api';
 import {
   type AgorConfig,
   type ResolvedDeploymentConfig,
@@ -61,6 +62,7 @@ import type {
   HookContext,
   MCPMemberPolicy,
   MCPMemberPolicySetting,
+  MCPServerID,
   Message,
   MessageID,
   MessageSource,
@@ -128,6 +130,7 @@ import {
   ScheduleNotReadyError,
   type SchedulerService,
 } from './services/scheduler.js';
+import { runSessionInitializationStages } from './services/session-initialization.js';
 import type { TerminalsService } from './services/terminals.js';
 import { createUserApiKeysService } from './services/user-api-keys.js';
 import {
@@ -4469,6 +4472,110 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       create: { role: ROLES.MEMBER, action: 'modify session env selections' },
       remove: { role: ROLES.MEMBER, action: 'modify session env selections' },
       patch: { role: ROLES.MEMBER, action: 'modify session env selections' },
+    },
+    requireAuth
+  );
+
+  // ============================================================================
+  // Session initialization
+  //
+  // Session creation and browser file upload remain separate because uploads
+  // are multipart and require a durable session id. This route owns the
+  // remaining orchestration: commit MCP/environment setup atomically, then use
+  // the normal prompt admission path. If admission fails, the configured blank
+  // session remains usable and the browser can put the prompt in its ordinary
+  // composer without retaining a second retry protocol.
+  // ============================================================================
+
+  registerLongAuthenticatedRoute(
+    app,
+    '/sessions/:id/initialize',
+    {
+      async create(data: SessionInitializationRequest, params: RouteParams) {
+        const id = params.route?.id;
+        if (!id) throw new BadRequest('Session ID required');
+        if (!data || typeof data !== 'object') {
+          throw new BadRequest('Session initialization data required');
+        }
+        if (typeof data.expectedUserId !== 'string' || !data.expectedUserId) {
+          throw new BadRequest('expectedUserId required');
+        }
+        if (data.prompt !== undefined && typeof data.prompt !== 'string') {
+          throw new BadRequest('prompt must be a string');
+        }
+        const callerId = params.user?.user_id;
+        if (!callerId || data?.expectedUserId !== callerId) {
+          throw new Forbidden('Session initialization caller changed');
+        }
+        const session = await inCurrentTenantDatabaseScope(() =>
+          authorizeAndLoadSessionForMcpConfig(id, params)
+        );
+        let configuredMcpServerIds: MCPServerID[] | undefined;
+        let configuredEnvVarNames: string[] | undefined;
+
+        if (data.mcpServerIds !== undefined) {
+          if (
+            !Array.isArray(data.mcpServerIds) ||
+            !data.mcpServerIds.every((serverId) => typeof serverId === 'string' && serverId)
+          ) {
+            throw new BadRequest('mcpServerIds must contain non-empty strings');
+          }
+          configuredMcpServerIds = [...new Set(data.mcpServerIds)] as MCPServerID[];
+        }
+
+        if (data.envVarNames !== undefined) {
+          configuredEnvVarNames = normalizeEnvVarNames(data.envVarNames);
+        }
+
+        const prompt = data.prompt?.trim();
+        const task = await runSessionInitializationStages({
+          db,
+          mcpServerIds: configuredMcpServerIds,
+          envVarNames: configuredEnvVarNames,
+          setMcpServers: async (serverIds) => {
+            try {
+              await sessionMCPServersService.setServers(session.session_id, serverIds, params);
+            } catch (error) {
+              if (error instanceof MCPServerNotUsableError) {
+                throw new Forbidden('An MCP server is private to another user');
+              }
+              throw error;
+            }
+          },
+          setEnvVarNames: (envVarNames) =>
+            sessionEnvSelectionsService.setAll(session.session_id, envVarNames, params),
+          publishMcpServersChanged: (serverIds) =>
+            emitServiceEvent(app, {
+              path: 'session-mcp-servers',
+              event: 'patched',
+              data: { session_id: session.session_id, mcp_server_ids: serverIds },
+              params,
+            }),
+          publishEnvVarNamesChanged: (envVarNames) =>
+            emitServiceEvent(app, {
+              path: 'session-env-selections',
+              event: 'patched',
+              data: { session_id: session.session_id, env_var_names: envVarNames },
+              params,
+            }),
+          admitPrompt: prompt
+            ? () =>
+                app.service('/sessions/:id/prompt').create(
+                  {
+                    prompt: data.prompt,
+                    permissionMode: data.permissionMode,
+                  },
+                  { ...params, route: { id: session.session_id } }
+                )
+            : undefined,
+        });
+
+        return { sessionId: session.session_id, task };
+      },
+      // biome-ignore lint/suspicious/noExplicitAny: Service type not compatible with Express
+    } as any,
+    {
+      create: { role: ROLES.MEMBER, action: 'initialize sessions' },
     },
     requireAuth
   );

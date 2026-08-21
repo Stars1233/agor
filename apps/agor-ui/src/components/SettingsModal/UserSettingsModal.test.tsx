@@ -1028,6 +1028,39 @@ describe('UserSettingsModal', { timeout: 60_000 }, () => {
     }, ASYNC);
   });
 
+  it('shows and saves the primary coding agent from Preferences', async () => {
+    const user = makeUser({ primary_agentic_tool: 'codex' });
+    const onUpdate = vi.fn(async () => {});
+
+    renderWithApp(
+      <UserSettingsModal
+        open
+        onClose={vi.fn()}
+        user={user}
+        currentUser={user}
+        client={null as AgorClient | null}
+        onUpdate={onUpdate}
+        initialTab="preferences"
+      />
+    );
+
+    const picker = await screen.findByRole('combobox', { name: 'Primary coding agent' });
+    fireEvent.mouseDown(picker);
+    const geminiOption = (await screen.findAllByText('Gemini')).find((element) =>
+      element.closest('.ant-select-item-option')
+    );
+    expect(geminiOption).toBeDefined();
+    fireEvent.click(geminiOption as HTMLElement);
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledWith(
+        user.user_id,
+        expect.objectContaining({ primary_agentic_tool: 'gemini' })
+      );
+    }, ASYNC);
+  });
+
   it('opens a provider search hit on its own sub-tab (Session defaults, not Authentication)', async () => {
     const user = makeUser();
     renderWithApp(
@@ -1244,6 +1277,100 @@ describe('UserSettingsModal', { timeout: 60_000 }, () => {
     const heading = await screen.findByRole('heading', { name: 'OpenCode' });
     expect(heading.parentElement).toHaveTextContent('Available');
     expect(modelFind).toHaveBeenCalled();
+  });
+
+  it('groups Primary Assistant within Preferences for the signed-in user', async () => {
+    // Caller-scoped: the picker reads the signed-in user's primary teammate via
+    // the users service. A null result leaves the select ready for a choice —
+    // enough to prove the Preferences assistant section mounts the picker.
+    const getPrimaryTeammate = vi.fn(async () => null);
+    const getPrimaryTeammateCandidates = vi.fn(async () => []);
+    const client = {
+      service: (name: string) => {
+        if (name === 'users') {
+          return { getPrimaryTeammate, getPrimaryTeammateCandidates };
+        }
+        return { findAll: vi.fn(async () => []), find: vi.fn(async () => ({ data: [] })) };
+      },
+    } as unknown as AgorClient;
+
+    const user = makeUser();
+    renderWithApp(
+      <UserSettingsModal
+        open
+        onClose={vi.fn()}
+        user={user}
+        currentUser={user}
+        client={client}
+        onUpdate={vi.fn()}
+      />
+    );
+
+    expect(screen.queryByRole('menuitem', { name: /primary assistant/i })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText('Search settings'), {
+      target: { value: 'primary assistant' },
+    });
+    fireEvent.click(await screen.findByRole('menuitem', { name: /primary assistant/i }));
+
+    await screen.findByRole('heading', { name: 'Preferences' });
+    expect(screen.getByRole('heading', { name: 'Assistant' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Notifications' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Developer tools' })).toBeInTheDocument();
+    expect(screen.getByText('Primary assistant')).toBeInTheDocument();
+    expect(await screen.findByText('Select a primary assistant')).toBeInTheDocument();
+    expect(getPrimaryTeammate).toHaveBeenCalled();
+  });
+
+  it('redirects the former Primary Assistant deep link to Preferences', async () => {
+    const getPrimaryTeammate = vi.fn(async () => null);
+    const getPrimaryTeammateCandidates = vi.fn(async () => []);
+    const client = {
+      service: (name: string) => {
+        if (name === 'users') {
+          return { getPrimaryTeammate, getPrimaryTeammateCandidates };
+        }
+        return { findAll: vi.fn(async () => []), find: vi.fn(async () => ({ data: [] })) };
+      },
+    } as unknown as AgorClient;
+    const user = makeUser();
+
+    renderWithApp(
+      <UserSettingsModal
+        open
+        onClose={vi.fn()}
+        user={user}
+        currentUser={user}
+        client={client}
+        onUpdate={vi.fn()}
+        initialTab="primary-teammate"
+      />
+    );
+
+    await screen.findByRole('heading', { name: 'Preferences' });
+    expect(await screen.findByText('Select a primary assistant')).toBeInTheDocument();
+  });
+
+  it('hides the caller-scoped Primary Assistant preference when an admin edits another user', async () => {
+    const admin = makeUser({ user_id: 'admin-1', name: 'Ada', role: 'admin' });
+    const target = makeUser({ user_id: 'user-2', name: 'Bob', role: 'member' });
+
+    renderWithApp(
+      <UserSettingsModal
+        open
+        onClose={vi.fn()}
+        user={target}
+        currentUser={admin}
+        client={null as AgorClient | null}
+        onUpdate={vi.fn()}
+      />
+    );
+
+    await screen.findByRole('heading', { name: 'Profile' });
+    expect(screen.queryByRole('menuitem', { name: /primary assistant/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('menuitem', { name: /preferences/i }));
+    await screen.findByRole('heading', { name: 'Preferences' });
+    expect(screen.queryByText('Primary assistant')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Assistant' })).not.toBeInTheDocument();
   });
 });
 
