@@ -9,7 +9,12 @@
  */
 
 import { TOOL_API_KEY_NAMES } from '@agor/agentic-tools';
-import { type AgorConfig, type ApiKeyName, resolveApiKey } from '@agor/core/config';
+import {
+  type AgorConfig,
+  type ApiKeyName,
+  hasExactUserExecutorCredentialHome,
+  resolveApiKey,
+} from '@agor/core/config';
 import { runWithTenantDatabaseScope, type TenantScopeAwareDatabase } from '@agor/core/db';
 import { type Application, BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import type {
@@ -21,6 +26,10 @@ import type {
   UserID,
 } from '@agor/core/types';
 import jwt from 'jsonwebtoken';
+import {
+  resolveExecutionCredentialHome,
+  sameExecutionCredentialHome,
+} from './credential-home-identity.js';
 import type { SessionTokenService } from './session-token-service.js';
 
 const RESOLVABLE_API_KEY_NAMES: Record<ApiKeyName, true> = {
@@ -238,11 +247,15 @@ export class ConfigService {
       (tenantDb) => resolveApiKey(keyName, { userId, db: tenantDb, tool })
     );
     if (result.useNativeAuth) {
-      if (this.config.multi_tenancy?.mode === 'required_from_auth') {
+      if (
+        this.config.multi_tenancy?.mode === 'required_from_auth' &&
+        !(tool === 'codex' && hasExactUserExecutorCredentialHome(this.config))
+      ) {
         throw new BadRequest(
           'Shared machine subscription authentication is unavailable in hosted multitenant mode'
         );
       }
+      await this.assertNativeAuthHomeMatchesSession(tool, userId, sessionId, internalParams);
     }
 
     // Map KeyResolutionResult to service response type
@@ -253,6 +266,62 @@ export class ConfigService {
       useNativeAuth: result.useNativeAuth,
       ...(result.decryptionFailed && { decryptionFailed: true }),
     };
+  }
+
+  /**
+   * Native auth resolves from the task creator, while the filesystem sandbox
+   * mounts the session owner's home. Refuse a mismatch rather than borrowing
+   * the owner's credential or silently missing the prompter's login.
+   */
+  private async assertNativeAuthHomeMatchesSession(
+    tool: AgenticToolName | undefined,
+    promptingUserId: UserID | undefined,
+    sessionId: string | undefined,
+    internalParams: AuthenticatedParams
+  ): Promise<void> {
+    if (!promptingUserId) return;
+
+    const tenantId = internalParams.tenant?.tenant_id;
+    const homeOf = (userId: UserID) =>
+      resolveExecutionCredentialHome({
+        userId,
+        tenantId,
+        config: this.config,
+        withTenantDatabase: (work) => runWithTenantDatabaseScope(this.db, tenantId, work),
+      });
+    const requireCanonicalCodexHome = tool === 'codex' && this.config.deployment?.mode === 'ha';
+    let prompterHome = requireCanonicalCodexHome ? await homeOf(promptingUserId) : undefined;
+    if (prompterHome?.homeStoreSource === 'override') {
+      throw new BadRequest(
+        'HA Codex subscription auth requires Agor’s canonical tenant/user home. ' +
+          'Remove the filesystem_home override for this account or use an API key.'
+      );
+    }
+
+    if (!sessionId) return;
+    const sessionsService = this.app?.service('sessions');
+    if (!sessionsService) return;
+    const session = (await sessionsService.get(sessionId, internalParams)) as
+      | { created_by?: string }
+      | undefined;
+    const ownerUserId = session?.created_by;
+    if (!ownerUserId || ownerUserId === promptingUserId) return;
+
+    prompterHome ??= await homeOf(promptingUserId);
+    const ownerHome = await homeOf(ownerUserId as UserID);
+    if (requireCanonicalCodexHome && ownerHome.homeStoreSource === 'override') {
+      throw new BadRequest(
+        'HA Codex subscription auth requires the session owner’s canonical tenant/user home. ' +
+          'Remove the filesystem_home override or use an API key.'
+      );
+    }
+    if (sameExecutionCredentialHome(prompterHome, ownerHome)) return;
+
+    throw new Forbidden(
+      'Subscription sign-in belongs to a different execution home than this session runs in. ' +
+        "The session executes in its owner's home, so the prompting user's on-disk login is not " +
+        'visible to it. Prompt a session you own, or configure an API key.'
+    );
   }
 }
 

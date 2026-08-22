@@ -266,23 +266,35 @@ export async function lockRowForUpdate(
   // SQLite: no-op — implicit locking via transaction
 }
 
-/**
- * Raw SQL query result type
- */
-export type RawQueryResult = {
-  rows?: unknown[];
-  rowCount?: number;
-};
+/** Normalize driver-specific raw-query rows without leaking array/result shapes. */
+export function rawRows<T extends Record<string, unknown> = Record<string, unknown>>(
+  result: unknown
+): T[] {
+  if (Array.isArray(result)) return result as T[];
+  const rows = (result as { rows?: unknown[] } | undefined)?.rows;
+  return Array.isArray(rows) ? (rows as T[]) : [];
+}
+
+/** Normalize mutation counts returned by postgres.js, Drizzle, and LibSQL. */
+export function rawRowsAffected(result: unknown): number {
+  const candidate =
+    (result as { rowCount?: unknown } | undefined)?.rowCount ??
+    (result as { rowsAffected?: unknown } | undefined)?.rowsAffected ??
+    (result as { count?: unknown } | undefined)?.count;
+  const count = Number(candidate);
+  if (Number.isSafeInteger(count) && count >= 0) return count;
+  return Array.isArray(result) ? result.length : 0;
+}
 
 /**
  * Execute a raw SQL query on any database
  */
-export async function executeRaw(db: Database, query: SQL): Promise<RawQueryResult> {
+export async function executeRaw(db: Database, query: SQL): Promise<unknown> {
   if (isSQLiteDatabase(db)) {
-    return (await db.run(query)) as RawQueryResult;
+    return db.run(query);
   } else {
     // PostgreSQL uses execute for raw SQL
-    return (await db.execute(query)) as RawQueryResult;
+    return db.execute(query);
   }
 }
 
