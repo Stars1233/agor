@@ -11,6 +11,7 @@ import { getTeammateConfig, isTeammate, PermissionScope } from '@agor-live/clien
 import { Alert, Spin } from 'antd';
 import { useParams } from 'react-router-dom';
 import { getSessionDisplayTitle } from '../../utils/sessionTitle';
+import { resolveSessionFromShortIdPure } from '../../utils/urlResolution';
 import { ConversationView } from '../ConversationView';
 import { MobileHeader } from './MobileHeader';
 import { MobilePromptInput } from './MobilePromptInput';
@@ -42,7 +43,12 @@ export const SessionPage: React.FC<SessionPageProps> = ({
 }) => {
   const { sessionId } = useParams<{ sessionId: string }>();
 
-  const session = sessionId ? sessionById.get(sessionId) : undefined;
+  const resolvedSessionId = sessionId
+    ? sessionById.has(sessionId)
+      ? sessionId
+      : (resolveSessionFromShortIdPure(sessionId, sessionById) ?? undefined)
+    : undefined;
+  const session = resolvedSessionId ? sessionById.get(resolvedSessionId) : undefined;
   const branch = session?.branch_id ? branchById.get(session.branch_id) || null : null;
 
   if (!sessionId) {
@@ -68,7 +74,11 @@ export const SessionPage: React.FC<SessionPageProps> = ({
     );
   }
 
-  const handleSendPrompt = (prompt: string) => onSendPrompt?.(sessionId, prompt);
+  // Responsive cold navigation may preserve a canonical short token in the
+  // route until data arrives. Once resolved, all mutations and draft storage
+  // must use the full durable ID rather than creating a second short-ID key.
+  const canonicalSessionId = session.session_id;
+  const handleSendPrompt = (prompt: string) => onSendPrompt?.(canonicalSessionId, prompt);
 
   const handlePermissionDecision = async (
     _sessionId: string,
@@ -108,7 +118,10 @@ export const SessionPage: React.FC<SessionPageProps> = ({
         style={{
           flex: 1,
           overflowY: 'auto',
+          minWidth: 0,
+          paddingInline: 8,
           paddingBottom: 80, // Space for fixed input
+          boxSizing: 'border-box',
         }}
       >
         <ConversationView
@@ -126,16 +139,17 @@ export const SessionPage: React.FC<SessionPageProps> = ({
           teammateEmoji={
             branch && isTeammate(branch) ? getTeammateConfig(branch)?.emoji : undefined
           }
+          compact
         />
       </div>
       <MobilePromptInput
-        key={`${currentUser?.user_id ?? 'anonymous'}:${sessionId}`}
+        key={`${currentUser?.user_id ?? 'anonymous'}:${canonicalSessionId}`}
         onSend={handleSendPrompt}
         disabled={session.status === 'running'}
         placeholder={session.status === 'running' ? 'Agent is working...' : 'Send a prompt...'}
         currentUserId={currentUser?.user_id}
         client={client}
-        sessionId={(sessionId as SessionID) || null}
+        sessionId={canonicalSessionId as SessionID}
         userById={userById}
       />
     </div>

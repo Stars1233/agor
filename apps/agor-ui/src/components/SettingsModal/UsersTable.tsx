@@ -22,7 +22,6 @@ import {
   Checkbox,
   Form,
   Input,
-  Modal,
   Popconfirm,
   Select,
   Space,
@@ -38,6 +37,8 @@ import { isIdentityCapabilityAvailable, useAuthConfig } from '../../hooks/useAut
 import { useThemedMessage } from '../../utils/message';
 import { HighlightMatch } from '../HighlightMatch';
 import { UserIdentityAvatar } from '../UserIdentityAvatar';
+import { AdaptiveSettingsModal } from './AdaptiveSettingsModal';
+import { ResponsiveSettingsHeader } from './ResponsiveSettingsHeader';
 import { SettingsActionGroup } from './SettingsActionGroup';
 import { UserAvatarsTab } from './UserAvatarsTab';
 import { UserSettingsModal } from './UserSettingsModal';
@@ -287,34 +288,33 @@ export const UsersTable: React.FC<UsersTableProps> = ({
 
   const usersTable = (
     <div>
-      <div
-        style={{
-          marginBottom: 16,
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-        }}
-      >
-        <Typography.Text type="secondary">
-          {externallyManaged
+      <ResponsiveSettingsHeader
+        description={
+          externallyManaged
             ? 'User accounts and roles are managed by your identity provider.'
-            : 'Manage user accounts and permissions.'}
-        </Typography.Text>
-        <Space>
-          <Input
-            allowClear
-            placeholder="Search name, email, username, role, or groups"
-            value={searchTerm}
-            onChange={(event) => setSearchTerm(event.target.value)}
-            style={{ width: 320 }}
-          />
-          {canCreateUsers && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalOpen(true)}>
-              New User
-            </Button>
-          )}
-        </Space>
-      </div>
+            : 'Manage user accounts and permissions.'
+        }
+        actions={(compact) => (
+          <Space wrap style={{ width: compact ? '100%' : undefined }}>
+            <Input
+              allowClear
+              placeholder="Search name, email, username, role, or groups"
+              value={searchTerm}
+              onChange={(event) => setSearchTerm(event.target.value)}
+              style={{ width: compact ? '100%' : 320, flex: compact ? '1 1 100%' : undefined }}
+            />
+            {canCreateUsers && (
+              <Button
+                type="primary"
+                icon={<PlusOutlined />}
+                onClick={() => setCreateModalOpen(true)}
+              >
+                New User
+              </Button>
+            )}
+          </Space>
+        )}
+      />
 
       <Table
         dataSource={users}
@@ -322,11 +322,12 @@ export const UsersTable: React.FC<UsersTableProps> = ({
         rowKey="user_id"
         pagination={false}
         size="small"
+        scroll={{ x: 900 }}
       />
 
       {/* Create User Modal */}
       {canCreateUsers && (
-        <Modal
+        <AdaptiveSettingsModal
           title="Create User"
           open={createModalOpen}
           onOk={handleCreate}
@@ -399,7 +400,7 @@ export const UsersTable: React.FC<UsersTableProps> = ({
               <Checkbox>Force password change on first login</Checkbox>
             </Form.Item>
           </Form>
-        </Modal>
+        </AdaptiveSettingsModal>
       )}
 
       {/* Edit User Modal - reuses UserSettingsModal */}

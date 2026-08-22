@@ -44,7 +44,10 @@ import {
   Checkbox,
   ConfigProvider,
   Divider,
+  Drawer,
+  Flex,
   Form,
+  Grid,
   Input,
   Layout,
   Menu,
@@ -260,6 +263,8 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
 }) => {
   const { token } = theme.useToken();
   const { config: authConfig, identityContractState } = useAuthConfig();
+  const screens = Grid.useBreakpoint();
+  const compact = !screens.md;
 
   // Entity maps are read from the store rather than drilled through props so
   // the App shell doesn't have to forward them into every modal.
@@ -2153,6 +2158,93 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
         </Button>,
       ];
 
+  const mobileSectionOptions = navGroups.flatMap((group) =>
+    group.children.map((child) => ({
+      label: `${group.label} · ${child.title}`,
+      value: child.key,
+    }))
+  );
+
+  const hiddenForms = (
+    <div hidden aria-hidden="true">
+      {!MAIN_FORM_KEYS.includes(activeKey as (typeof MAIN_FORM_KEYS)[number]) && (
+        <Form component={false} form={form} />
+      )}
+      {activeKey !== 'preferences' && <Form component={false} form={audioForm} />}
+      {visibleAgenticToolTabs.map((tool) =>
+        activeTool === tool ? null : (
+          <Form key={tool} component={false} form={agenticFormByTool[tool]} />
+        )
+      )}
+    </div>
+  );
+
+  if (compact) {
+    return (
+      <Drawer
+        open={open}
+        onClose={handleClose}
+        title={null}
+        aria-label="User settings"
+        closable={false}
+        placement="bottom"
+        size="94dvh"
+        footer={<Space style={{ width: '100%', justifyContent: 'flex-end' }}>{footer}</Space>}
+        styles={{ body: { padding: 0, overflow: 'hidden' } }}
+      >
+        {hiddenForms}
+        <ConfigProvider theme={scopedTheme}>
+          <Layout style={{ height: '100%', background: token.colorBgContainer }}>
+            <Flex
+              vertical
+              gap={token.marginSM}
+              style={{
+                padding: `${token.paddingSM}px ${token.paddingMD}px`,
+                borderBottom: `1px solid ${token.colorBorderSecondary}`,
+                background: token.colorBgElevated,
+                flex: '0 0 auto',
+              }}
+            >
+              <Flex align="center" justify="space-between" gap={token.marginSM}>
+                <div style={{ minWidth: 0 }}>{siderTitle}</div>
+                <Button
+                  type="text"
+                  icon={<CloseOutlined />}
+                  aria-label="Close user settings"
+                  onClick={handleClose}
+                />
+              </Flex>
+              <Select
+                aria-label="User settings section"
+                showSearch
+                optionFilterProp="label"
+                value={activeInNav ? activeKey : undefined}
+                placeholder="Choose a settings section"
+                options={mobileSectionOptions}
+                onChange={setActiveKey}
+                style={{ width: '100%' }}
+                size="large"
+              />
+            </Flex>
+            <Content
+              style={{
+                padding: `${token.paddingLG}px ${token.paddingMD}px ${token.paddingXL}px`,
+                overflowY: 'auto',
+                overflowX: 'hidden',
+                minWidth: 0,
+                width: '100%',
+                maxWidth: '100%',
+                boxSizing: 'border-box',
+              }}
+            >
+              <div style={{ minWidth: 0, width: '100%', maxWidth: '100%' }}>{renderContent()}</div>
+            </Content>
+          </Layout>
+        </ConfigProvider>
+      </Drawer>
+    );
+  }
+
   return (
     <Modal
       open={open}
@@ -2165,7 +2257,8 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
       footer={footer}
       closable
       closeIcon={<CloseOutlined />}
-      width="min(1050px, calc(100vw - 32px))"
+      width={compact ? 'calc(100vw - 16px)' : 'min(1050px, calc(100vw - 32px))'}
+      style={{ top: compact ? 8 : undefined }}
       styles={{
         // Zero the card's default 20px 24px frame and clip to the rounded
         // corners so the inner Layout fills the card edge-to-edge — the Sider
@@ -2176,9 +2269,9 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
         header: { display: 'none' },
         body: {
           padding: 0,
-          height: 'calc(100vh - 280px)',
-          minHeight: 450,
-          maxHeight: 650,
+          height: compact ? 'calc(100dvh - 88px)' : 'calc(100vh - 280px)',
+          minHeight: compact ? 0 : 450,
+          maxHeight: compact ? 'none' : 650,
         },
         // With the card frame gone, the footer supplies its own padding and a
         // top divider so it reads as one bar across the bottom of the card.
@@ -2193,26 +2286,25 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
       {/* Keep inactive form instances connected to Ant Form. Without these
           lightweight hidden connectors, calling form methods while switching
           panels can produce noisy "useForm is not connected" console warnings. */}
-      <div hidden aria-hidden="true">
-        {!MAIN_FORM_KEYS.includes(activeKey as (typeof MAIN_FORM_KEYS)[number]) && (
-          <Form component={false} form={form} />
-        )}
-        {activeKey !== 'preferences' && <Form component={false} form={audioForm} />}
-        {visibleAgenticToolTabs.map((tool) =>
-          activeTool === tool ? null : (
-            <Form key={tool} component={false} form={agenticFormByTool[tool]} />
-          )
-        )}
-      </div>
+      {hiddenForms}
       <ConfigProvider theme={scopedTheme}>
-        <Layout style={{ height: '100%', background: token.colorBgContainer }}>
+        <Layout
+          style={{
+            height: '100%',
+            background: token.colorBgContainer,
+            flexDirection: compact ? 'column' : 'row',
+          }}
+        >
           <Sider
-            width={220}
+            width={compact ? '100%' : 220}
             style={{
               background: token.colorBgElevated,
-              borderRight: `1px solid ${token.colorBorderSecondary}`,
+              borderRight: compact ? 0 : `1px solid ${token.colorBorderSecondary}`,
+              borderBottom: compact ? `1px solid ${token.colorBorderSecondary}` : 0,
               overflow: 'auto',
-              padding: `20px ${token.marginSM}px`,
+              maxHeight: compact ? 240 : undefined,
+              flex: compact ? '0 0 auto' : undefined,
+              padding: compact ? `${token.paddingSM}px` : `20px ${token.marginSM}px`,
             }}
           >
             <div style={{ padding: `0 ${token.marginXXS}px ${token.marginMD}px` }}>

@@ -15,6 +15,12 @@ interface MobilePromptInputProps {
   userById: Map<string, User>;
 }
 
+// iOS Safari (and Chrome on iOS) zooms the visual viewport in when a form
+// control smaller than 16px takes focus, and never zooms back out on blur —
+// the page is left wider than the screen until the user pinches out. antd's
+// default token.fontSize is 14px, so the composer has to opt out explicitly.
+const IOS_NO_AUTOZOOM_FONT_SIZE = 16;
+
 export const MobilePromptInput: React.FC<MobilePromptInputProps> = ({
   onSend,
   disabled = false,
@@ -89,7 +95,7 @@ export const MobilePromptInput: React.FC<MobilePromptInputProps> = ({
         zIndex: 1000,
         display: 'flex',
         gap: '8px',
-        alignItems: 'flex-end',
+        alignItems: 'center',
       }}
     >
       <div style={{ flex: 1 }}>
@@ -102,16 +108,23 @@ export const MobilePromptInput: React.FC<MobilePromptInputProps> = ({
           sessionId={sessionId}
           userById={userById}
           autoSize={{ minRows: 1, maxRows: 4 }}
+          textareaStyle={{
+            minHeight: 40,
+            paddingBlock: 8,
+            fontSize: IOS_NO_AUTOZOOM_FONT_SIZE,
+          }}
           enableKnowledgeMentions
           kbLinkTarget="absolute-route"
         />
       </div>
       <Button
         type="primary"
+        aria-label="Send prompt"
         icon={<SendOutlined />}
         onClick={() => void handleSend()}
         disabled={disabled || !prompt.trim()}
         size="large"
+        style={{ width: 40, height: 40, flex: '0 0 40px', padding: 0 }}
       />
     </div>
   );
