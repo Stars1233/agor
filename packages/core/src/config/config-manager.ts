@@ -14,6 +14,7 @@ import { type InstallableAgenticTool, isInstallableAgenticTool } from '../agenti
 import { EXECUTOR_RESPONSE_PROTOCOL } from '../executor-protocol';
 import type { AgenticToolName } from '../types';
 import { normalizeHttpBaseUrl } from '../utils/url';
+import { ensureAgorHome, ensureAgorHomeSync, getAgorHome, getConfigPath } from './agor-home';
 import { getDefaultAnalyticsConfig } from './analytics-defaults.js';
 import { DAEMON, MCP_TOKEN } from './constants';
 import { validateRedisKeyPrefix, validateRedisUrl } from './deployment';
@@ -230,31 +231,8 @@ function parseAndValidateConfig(content: string): AgorConfig {
   return finalConfig;
 }
 
-/**
- * Get Agor home directory (~/.agor)
- */
-export function getAgorHome(): string {
-  return path.join(os.homedir(), '.agor');
-}
-
-/**
- * Get config file path (~/.agor/config.yaml)
- */
-export function getConfigPath(): string {
-  return path.join(getAgorHome(), 'config.yaml');
-}
-
-/**
- * Ensure ~/.agor directory exists
- */
-async function ensureAgorHome(): Promise<void> {
-  const agorHome = getAgorHome();
-  try {
-    await fs.access(agorHome);
-  } catch {
-    await fs.mkdir(agorHome, { recursive: true });
-  }
-}
+/** Shared state-home paths and creation policy. */
+export { ensureAgorHome, ensureAgorHomeSync, getAgorHome, getConfigPath };
 
 /**
  * Validate config and throw helpful errors for deprecated/invalid settings
@@ -1182,8 +1160,12 @@ export async function migrateConfigDeploymentId(
   const tempPath = `${filePath}.rewrite-${process.pid}-${randomUUID()}`;
   let handle: fs.FileHandle | undefined;
   try {
-    handle = await fs.open(tempPath, 'wx', stat.mode & 0o7777);
+    handle = await fs.open(tempPath, 'wx', 0o600);
     await handle.writeFile(yaml.dump(parsed, { indent: 2, lineWidth: 120, noRefs: true }), 'utf-8');
+    // open(2)'s requested mode is filtered by the process umask. Apply the
+    // original operator-selected bits through the already-open inode before
+    // publishing the replacement.
+    await handle.chmod(stat.mode & 0o7777);
     await handle.sync();
     await handle.close();
     handle = undefined;
@@ -1245,7 +1227,9 @@ async function syncContainingDirectory(filePath: string): Promise<void> {
  */
 export async function createInitialConfig(config: AgorConfig = getDefaultConfig()): Promise<void> {
   validateConfig(config);
-  await ensureAgorHome();
+  // Create a missing state home privately, but preserve any pre-created
+  // operator-managed directory, bind mount, group/ACL policy, or symlink.
+  await ensureAgorHome(getAgorHome());
   const configPath = getConfigPath();
   const content = [
     '# Agor operator configuration',
@@ -1267,6 +1251,9 @@ export async function createInitialConfig(config: AgorConfig = getDefaultConfig(
   try {
     handle = await fs.open(tempPath, 'wx', 0o600);
     await handle.writeFile(content, 'utf-8');
+    // Guarantee the documented mode even when the process has an unusually
+    // restrictive umask. The descriptor pins the inode we are publishing.
+    await handle.chmod(0o600);
     await handle.sync();
     await handle.close();
     handle = undefined;
@@ -1311,8 +1298,11 @@ async function rewriteConfigFile(
   const content = yaml.dump(config, { indent: 2, lineWidth: 120, noRefs: true });
   let handle: fs.FileHandle | undefined;
   try {
-    handle = await fs.open(tempPath, 'wx', stat.mode & 0o7777);
+    handle = await fs.open(tempPath, 'wx', 0o600);
     await handle.writeFile(content, 'utf-8');
+    // Preserve the existing operator-selected mode exactly; open(2) alone
+    // cannot do so because the ambient umask filters its mode argument.
+    await handle.chmod(stat.mode & 0o7777);
     await handle.sync();
     await handle.close();
     handle = undefined;
