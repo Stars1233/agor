@@ -16,6 +16,7 @@ import {
   resolveBranchStorageConfig,
   resolveIdentityAuthority,
   resolveMultiTenancyConfig,
+  resolvePasswordPolicyRequirements,
   resolveSdkWatchdogConfig,
   resolveTeammateFrameworkRepoUrl,
   resolveTenantContext,
@@ -99,7 +100,11 @@ import {
   RUNTIME_JWT_AUDIENCE,
   RUNTIME_JWT_ISSUER,
 } from './auth/runtime-tokens.js';
-import { authTokenIssuedAtClaim } from './auth/token-invalidation.js';
+import {
+  assertAuthenticationUserAuthMetadata,
+  authCredentialGenerationClaim,
+  authTokenIssuedAtClaim,
+} from './auth/token-invalidation.js';
 import type {
   BoardsServiceImpl,
   BranchesServiceImpl,
@@ -236,7 +241,22 @@ export class AgorLocalStrategy extends LocalStrategy {
     // so freshly issued tokens can be bumped past a just-written invalidation
     // marker. The authentication hook redacts the metadata before returning.
     markAuthenticationUserLookup(params);
-    return super.getEntity(result, params);
+    const current = (await super.getEntity(result, params)) as {
+      credential_generation?: unknown;
+    };
+    const verified = result as { credential_generation?: unknown };
+    const verifiedGeneration =
+      typeof verified.credential_generation === 'number' ? verified.credential_generation : 0;
+    const currentGeneration =
+      typeof current.credential_generation === 'number' ? current.credential_generation : 0;
+
+    // The password comparison ran against `result`. If a password update won
+    // while bcrypt was in flight, never mint claims from the re-fetched row as
+    // though the newly stored credential had been verified.
+    if (verifiedGeneration !== currentGeneration) {
+      throw new NotAuthenticated('Invalid login');
+    }
+    return current;
   }
 }
 
@@ -815,6 +835,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       } catch {
         throw new NotFound(`User not found: ${data.user_id}`);
       }
+      assertAuthenticationUserAuthMetadata(targetUser);
 
       // 8. Compute expiry (default 1h, capped at 1h)
       const configuredMax =
@@ -834,6 +855,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           impersonated_by: caller.user_id,
           is_impersonated: true,
           jti,
+          ...authCredentialGenerationClaim(targetUser),
           ...authTokenIssuedAtClaim(Date.now(), targetUser),
         },
         jwtSecret,
@@ -4594,6 +4616,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   app.use('/health', {
     async find(params?: AuthenticatedParams) {
       const identityAuthority = resolveIdentityAuthority(config);
+      const passwordPolicy = identityAuthority.capabilities.users.passwordWrite
+        ? resolvePasswordPolicyRequirements(config.identity?.password_policy)
+        : undefined;
       // `/health` stays 200 always (pre-login UI fetches must not throw), so the
       // DB signal rides on `status`: ok | degraded. /readyz is the one that 503s.
       // Only { ok, latencyMs } is public; the raw error is authenticated-only below.
@@ -4622,6 +4647,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           requireAuth: true,
           externalLaunch: publicLaunchAuth,
           identity: identityAuthority,
+          passwordPolicy,
         },
         instance: {
           label: config.daemon?.instanceLabel,

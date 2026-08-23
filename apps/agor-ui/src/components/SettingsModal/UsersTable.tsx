@@ -32,6 +32,11 @@ import {
 } from 'antd';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { mapToSortedArray } from '@/utils/mapHelpers';
+import {
+  passwordPolicyHelp,
+  passwordPolicyRequirements,
+  passwordRules,
+} from '@/utils/passwordPolicy';
 import { filterBySettingsSearch } from '@/utils/settingsSearch';
 import { isIdentityCapabilityAvailable, useAuthConfig } from '../../hooks/useAuthConfig';
 import { useThemedMessage } from '../../utils/message';
@@ -48,8 +53,8 @@ interface UsersTableProps {
   gatewayChannelById?: Map<string, GatewayChannel>;
   client: AgorClient | null;
   currentUser?: User | null;
-  onCreate?: (data: CreateUserInput) => void;
-  onUpdate?: (userId: string, updates: UpdateUserInput) => void;
+  onCreate?: (data: CreateUserInput) => Promise<void>;
+  onUpdate?: (userId: string, updates: UpdateUserInput) => Promise<void>;
   onDelete?: (userId: string) => void;
 }
 
@@ -76,6 +81,7 @@ export const UsersTable: React.FC<UsersTableProps> = ({
   const canCreateUsers =
     isAdmin && isIdentityCapabilityAvailable(authConfig, identityContractState, 'create');
   const canDeleteUsers = isIdentityCapabilityAvailable(authConfig, identityContractState, 'delete');
+  const passwordRequirements = passwordPolicyRequirements(authConfig?.passwordPolicy);
   const canManageAvatarSettings =
     isAdmin &&
     isIdentityCapabilityAvailable(authConfig, identityContractState, 'avatarSettingsWrite');
@@ -152,24 +158,32 @@ export const UsersTable: React.FC<UsersTableProps> = ({
     onDelete?.(userId);
   };
 
-  const handleCreate = () => {
-    form
-      .validateFields()
-      .then((values) => {
-        onCreate?.({
-          email: values.email,
-          password: values.password,
-          name: values.name,
-          role: values.role || ROLES.MEMBER,
-          unix_username: values.unix_username,
-          must_change_password: values.must_change_password || false,
-        });
-        form.resetFields();
-        setCreateModalOpen(false);
-      })
-      .catch(() => {
-        // Form validation failed - Ant Design will show field errors automatically
+  const handleCreate = async () => {
+    try {
+      const values = await form.validateFields();
+      await onCreate?.({
+        email: values.email,
+        password: values.password,
+        name: values.name,
+        role: values.role || ROLES.MEMBER,
+        unix_username: values.unix_username,
+        must_change_password: values.must_change_password || false,
       });
+      form.resetFields();
+      setCreateModalOpen(false);
+    } catch (error) {
+      const code = (error as { data?: { code?: unknown } } | undefined)?.data?.code;
+      if (typeof code === 'string' && code.startsWith('PASSWORD_')) {
+        form.setFields([
+          {
+            name: 'password',
+            errors: [error instanceof Error ? error.message : 'Password was rejected'],
+          },
+        ]);
+      }
+      // Client-side validation already renders field errors. Server failures
+      // are toasted by the owning handler; keep the modal and values intact.
+    }
   };
 
   const getRoleColor = (role: User['role']) => {
@@ -373,12 +387,10 @@ export const UsersTable: React.FC<UsersTableProps> = ({
             <Form.Item
               label="Password"
               name="password"
-              rules={[
-                { required: true, message: 'Please enter a password' },
-                { min: 8, message: 'Password must be at least 8 characters' },
-              ]}
+              extra={passwordPolicyHelp(passwordRequirements)}
+              rules={passwordRules(passwordRequirements, { required: true })}
             >
-              <Input.Password placeholder="••••••••" />
+              <Input.Password placeholder="••••••••" autoComplete="new-password" />
             </Form.Item>
 
             <Form.Item

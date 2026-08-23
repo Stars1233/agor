@@ -1,6 +1,6 @@
 import type { SignOptions } from 'jsonwebtoken';
 import { issueRuntimeTokenPair, runtimeTenantClaims } from './runtime-tokens.js';
-import { authTokenIssuedAtClaim } from './token-invalidation.js';
+import { authCredentialGenerationClaim, authTokenIssuedAtClaim } from './token-invalidation.js';
 import { redactUserAuthMetadata } from './user-redaction.js';
 
 /**
@@ -14,6 +14,7 @@ export interface IssueBrowserTokensHookOptions {
   accessTokenTtl: SignOptions['expiresIn'];
   refreshTokenTtl: SignOptions['expiresIn'];
   tenantClaim: string;
+  now?: () => number;
   debug?: (...args: unknown[]) => void;
 }
 
@@ -32,7 +33,14 @@ export interface IssueBrowserTokensHookOptions {
  * User redaction applies on every path that returns a user.
  */
 export function createIssueBrowserTokensHook(options: IssueBrowserTokensHookOptions) {
-  const { jwtSecret, accessTokenTtl, refreshTokenTtl, tenantClaim, debug } = options;
+  const {
+    jwtSecret,
+    accessTokenTtl,
+    refreshTokenTtl,
+    tenantClaim,
+    now = Date.now,
+    debug,
+  } = options;
 
   // biome-ignore lint/suspicious/noExplicitAny: FeathersJS context type not fully typed
   return async (context: any) => {
@@ -62,7 +70,8 @@ export function createIssueBrowserTokensHook(options: IssueBrowserTokensHookOpti
       accessTokenTtl,
       refreshTokenTtl,
       {
-        ...authTokenIssuedAtClaim(Date.now(), context.result.user),
+        ...authCredentialGenerationClaim(context.result.user),
+        ...authTokenIssuedAtClaim(now(), context.result.user),
         ...runtimeTenantClaims(tenantId, tenantClaim),
       }
     );

@@ -16,11 +16,14 @@ import {
   AgorRoleAuthority,
   AgorUserLifecycleAuthority,
   assertInlineAgenticConfigurationAllowed,
+  assertSecurePassword,
   assertV05Scope,
   getEnvVarBlockReason,
   AgorIdentityCapability as IdentityCapability,
   isEnvVarAllowed,
   normalizeStoredEnvMap,
+  PasswordPolicyError,
+  PasswordValidationCode,
   type ResolvedIdentityAuthority,
   resolveIdentityAuthority,
   resolveUserEnvironment,
@@ -35,7 +38,7 @@ import {
   encryptApiKey,
   eq,
   generateId,
-  hash,
+  hashLocalPassword,
   insert,
   isExecutionHomeKeyAvailable,
   isNull,
@@ -359,6 +362,17 @@ function assertSingleUserMutation(data: unknown): void {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new BadRequest('Bulk user mutations are not supported');
   }
+  if (Object.hasOwn(data, 'password_hash') || Object.hasOwn(data, 'passwordHash')) {
+    throw new BadRequest('Password hashes cannot be assigned through the users service.', {
+      code: PasswordValidationCode.HASH_NOT_ACCEPTED,
+    });
+  }
+  if (Object.hasOwn(data, 'credential_generation') || Object.hasOwn(data, 'tokens_valid_after')) {
+    throw new BadRequest(
+      'Password credential metadata cannot be assigned through the users service.',
+      { code: PasswordValidationCode.CREDENTIAL_METADATA_NOT_ACCEPTED }
+    );
+  }
 }
 
 function assertTrustedMutationFields(
@@ -376,6 +390,21 @@ function assertValidExecutionHomeKeyWrite(value: string | undefined): void {
   throw new BadRequest(
     'Execution home key must start with a lowercase letter or underscore, contain only lowercase letters, numbers, hyphens, or underscores, and be at most 32 characters.'
   );
+}
+
+function validatedAssignedPassword(password: unknown, email?: string): string {
+  try {
+    assertSecurePassword(password, { email });
+    return password;
+  } catch (error) {
+    if (!(error instanceof PasswordPolicyError)) throw error;
+    throw new BadRequest(error.message, {
+      code: error.code,
+      policy: error.requirements.profile,
+      min_length: error.requirements.min_length,
+      max_utf8_bytes: error.requirements.max_utf8_bytes,
+    });
+  }
 }
 
 /**
@@ -446,7 +475,7 @@ export class UsersService {
     }
 
     if (
-      (data.password !== undefined || data.must_change_password !== undefined) &&
+      (Object.hasOwn(data, 'password') || data.must_change_password !== undefined) &&
       !this.identityAuthority.capabilities.users.passwordWrite
     ) {
       this.externallyManaged(
@@ -741,6 +770,7 @@ export class UsersService {
     if (Object.hasOwn(data, 'role')) data.role = canonicalizeRoleWrite(data.role);
     await lockUserAuthorityMutation(this.db, params);
     await this.authorizeCreate(data, params);
+    const assignedPassword = validatedAssignedPassword(data.password, data.email);
     // Check if email already exists
     const existing = await select(this.db)
       .from(users)
@@ -752,7 +782,7 @@ export class UsersService {
     }
 
     // Hash password
-    const hashedPassword = await hash(data.password, 10);
+    const hashedPassword = await hashLocalPassword(assignedPassword);
 
     // Create user
     const now = new Date();
@@ -811,6 +841,10 @@ export class UsersService {
     }
     await lockUserAuthorityMutation(this.db, params);
     const authority = await this.authorizePatch(id, data, params);
+    const hasPasswordWrite = Object.hasOwn(data, 'password');
+    const assignedPassword = hasPasswordWrite
+      ? validatedAssignedPassword(data.password, data.email ?? authority.target.email)
+      : undefined;
     if (
       Object.hasOwn(data, 'role') &&
       data.role !== undefined &&
@@ -823,11 +857,12 @@ export class UsersService {
     const updates: Record<string, unknown> = { updated_at: now };
 
     // Handle password separately (needs hashing)
-    if (data.password) {
-      updates.password = await hash(data.password, 10);
-      // Any password change requires fresh browser authentication; previously
-      // issued access and refresh tokens are rejected after this marker.
-      updates.tokens_valid_after = now;
+    if (assignedPassword !== undefined) {
+      updates.password = await hashLocalPassword(assignedPassword);
+      // Increment in the same SQL UPDATE as the hash. Interactive tokens carry
+      // this generation, so racing login/refresh responses minted from an old
+      // credential snapshot remain invalid regardless of replica clock skew.
+      updates.credential_generation = sql`${users.credential_generation} + 1`;
       // Auto-clear must_change_password when password is changed,
       // UNLESS explicitly set in the same request (admin reset + force change scenario)
       // e.g., `user update --password newpass --force-password-change` should keep flag true
@@ -1076,6 +1111,15 @@ export class UsersService {
         default_agentic_selection: nextDefaultAgenticSelection,
         default_mcp_server_ids: data.default_mcp_server_ids ?? current.default_mcp_server_ids,
       };
+    }
+
+    if (assignedPassword !== undefined) {
+      // Retain the timestamp marker for backward-compatible invalidation of
+      // pre-generation tokens. Capture it immediately before the authoritative
+      // write rather than before bcrypt or the other awaited preparation work.
+      const credentialUpdatedAt = new Date();
+      updates.updated_at = credentialUpdatedAt;
+      updates.tokens_valid_after = credentialUpdatedAt;
     }
 
     const authorityActorPredicate = this.actorStillCurrentPredicate(authority.actor, params);
@@ -1592,8 +1636,11 @@ export class UsersService {
       default_mcp_server_ids: data.default_mcp_server_ids,
     };
 
-    if (includeAuthMetadata && row.tokens_valid_after) {
-      (user as InternalUser).tokens_valid_after = new Date(row.tokens_valid_after);
+    if (includeAuthMetadata) {
+      (user as InternalUser).credential_generation = row.credential_generation;
+      if (row.tokens_valid_after) {
+        (user as InternalUser).tokens_valid_after = new Date(row.tokens_valid_after);
+      }
     }
     if (includeAuthMetadata && 'tenant_id' in row) {
       (user as InternalUser).tenant_id = row.tenant_id;
@@ -1668,6 +1715,7 @@ class UsersServiceWithAuth extends UsersService {
       preferences: data.preferences,
       onboarding_completed: !!row.onboarding_completed,
       must_change_password: !!row.must_change_password,
+      credential_generation: row.credential_generation,
       tokens_valid_after: row.tokens_valid_after ? new Date(row.tokens_valid_after) : undefined,
       created_at: row.created_at,
       updated_at: row.updated_at ?? undefined,
