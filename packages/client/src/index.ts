@@ -3,7 +3,9 @@
  *
  * Usage:
  *   import { createClient } from '@agor-live/client';
- *   const client = createClient('http://localhost:3030');
+ *   const client = createClient('http://localhost:3030', true, {
+ *     socketAuthentication: { accessToken }
+ *   });
  */
 
 import {
@@ -61,6 +63,12 @@ export type {
 } from '@agor/core/client';
 export * from '@agor/core/client';
 
+// Derive this public alias from the function we wrap instead of asking the DTS
+// bundler to resolve the same named type through @agor/core's source and
+// declaration export conditions. This keeps clean packaged builds deterministic
+// while preserving the exact core client contract.
+export type AuthenticatedAgorClient = Awaited<ReturnType<typeof createCoreRestClient>>;
+
 // Preserve the published client contract while keeping registry values package-owned.
 export const TOOL_API_KEY_NAMES: Partial<Record<AgenticToolName, ApiKeyName>> =
   PRIVATE_TOOL_API_KEY_NAMES;
@@ -99,7 +107,7 @@ export function createClient(...args: Parameters<typeof createCoreClient>): Reac
 
 export async function createRestClient(
   ...args: Parameters<typeof createCoreRestClient>
-): Promise<CoreAgorClient> {
+): Promise<AuthenticatedAgorClient> {
   return createCoreRestClient(...args);
 }
 

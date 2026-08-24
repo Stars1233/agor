@@ -8,13 +8,16 @@ import {
   assertTenantWritable,
   enqueueAfterTenantDatabaseCommit,
   enqueueTenantDatabasePostCommitCallback,
+  getCurrentTenantDatabaseScope,
   getCurrentTenantId,
+  isTenantWriteMethodName,
   runWithoutTenantDatabaseScope,
   runWithTenantContext,
   runWithTenantDatabaseScope,
   type TenantScopeAwareDatabase,
+  TenantWriteGateActiveError,
 } from '@agor/core/db';
-import { NotAuthenticated } from '@agor/core/feathers';
+import { NotAuthenticated, Unavailable } from '@agor/core/feathers';
 import type { HookContext, TenantContext, TenantID } from '@agor/core/types';
 import jwt from 'jsonwebtoken';
 import { RUNTIME_JWT_AUDIENCE, RUNTIME_JWT_ISSUER } from '../auth/runtime-tokens.js';
@@ -44,6 +47,67 @@ function readHeaderValue(
 type TenantScopedParams = { tenant?: Pick<TenantContext, 'tenant_id'> } | undefined;
 
 export type TenantDatabaseRunner = <T>(work: () => Promise<T>) => Promise<T>;
+
+/**
+ * Enforce the tenant freeze gate inside an already-open tenant transaction.
+ * Shared by ordinary Feathers services and custom authenticated routes so a
+ * route registered after `registerHooks()` cannot silently miss the gate.
+ */
+export async function enforceTenantWriteGateForHook(
+  db: TenantScopeAwareDatabase,
+  context: HookContext
+): Promise<HookContext> {
+  if (!isTenantWriteMethodName(context.method)) return context;
+  const tenantId = context.params.tenant?.tenant_id;
+  if (!tenantId || !getCurrentTenantDatabaseScope()) return context;
+  try {
+    await assertTenantWritable(db, tenantId);
+  } catch (error) {
+    if (error instanceof TenantWriteGateActiveError) {
+      throw new Unavailable(error.message);
+    }
+    throw error;
+  }
+  return context;
+}
+
+/** Around-hook adapter for custom routes whose inner handler performs writes. */
+export function createTenantWriteGateAroundHook(db: TenantScopeAwareDatabase) {
+  return async (context: HookContext, next: () => Promise<void>): Promise<void> => {
+    await enforceTenantWriteGateForHook(db, context);
+    await next();
+  };
+}
+
+/**
+ * Admission-only write-gate check for authenticated routes that perform long
+ * process/network orchestration.
+ *
+ * Unlike {@link createTenantWriteGateAroundHook}, this helper does not expect
+ * the route to retain a database transaction while `next()` runs. It opens one
+ * short tenant write unit, checks the gate, commits it, and only then enters
+ * the long handler. Repository/service writes inside the handler retain their
+ * own gate checks; this admission check prevents external side effects from
+ * starting while a tenant freeze is already active.
+ */
+export function createTenantWriteAdmissionAroundHook(db: TenantScopeAwareDatabase) {
+  return async (context: HookContext, next: () => Promise<void>): Promise<void> => {
+    if (isTenantWriteMethodName(context.method)) {
+      const tenantId = context.params.tenant?.tenant_id ?? getCurrentTenantId();
+      if (tenantId) {
+        try {
+          await createFreshTenantWriteDatabaseRunner(db, tenantId)(async () => undefined);
+        } catch (error) {
+          if (error instanceof TenantWriteGateActiveError) {
+            throw new Unavailable(error.message);
+          }
+          throw error;
+        }
+      }
+    }
+    await next();
+  };
+}
 
 export function resolveTenantIdForDeferredScope(params?: unknown): string | undefined {
   const scopedParams = params as TenantScopedParams;

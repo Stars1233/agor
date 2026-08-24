@@ -50,7 +50,13 @@ import {
   update,
   users,
 } from '@agor/core/db';
-import { type Application, BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
+import {
+  type Application,
+  BadRequest,
+  Forbidden,
+  NotAuthenticated,
+  NotFound,
+} from '@agor/core/feathers';
 import { isLikelyGitToken } from '@agor/core/git/pure';
 import { isInvalidModelConfigError } from '@agor/core/models';
 import type {
@@ -748,7 +754,7 @@ export class UsersService {
       .one();
 
     if (!row) {
-      throw new Error(`User not found: ${id}`);
+      throw new NotFound(`User not found: ${id}`);
     }
 
     const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
@@ -1294,8 +1300,8 @@ export class UsersService {
    * Feathers RPC so per-user credentials flow through the daemon's auth
    * boundary instead of being baked into spawn payloads.
    *
-   * Auth: service-account JWTs may fetch any user's env (executor is trusted).
-   * User JWTs may only fetch their own env.
+   * Auth: explicit daemon service JWTs may fetch any user's env. Delegated
+   * executors and ordinary user JWTs may fetch only their own env.
    */
   async getGitEnvironment(
     data: { userId: string },
@@ -1304,8 +1310,8 @@ export class UsersService {
     const userId = data.userId as UserID;
     const caller = (params as AuthenticatedParams | undefined)?.user;
 
-    // Auth check: service accounts can fetch any user's env;
-    // regular users can only fetch their own.
+    // Auth check: explicit daemon service accounts can fetch any user's env;
+    // delegated executors and other user identities can fetch only their own.
     if (params?.provider) {
       if (!caller) {
         throw new NotAuthenticated('Authentication required');
@@ -1675,7 +1681,7 @@ class UsersServiceWithAuth extends UsersService {
     const row = await select(this.db).from(users).where(eq(users.user_id, id)).one();
 
     if (!row) {
-      throw new Error(`User not found: ${id}`);
+      throw new NotFound(`User not found: ${id}`);
     }
 
     const data = row.data as {

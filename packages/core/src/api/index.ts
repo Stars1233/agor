@@ -8,8 +8,11 @@ import type {
   AgenticToolName,
   AgenticToolPreset,
   Artifact,
-  AuthenticationResult,
   Board,
+  BoardComment,
+  BoardCommentCreate,
+  BoardCommentPatch,
+  BoardCommentReposition,
   BoardExportBlob,
   BoardGroupGrantWithGroup,
   Branch,
@@ -71,7 +74,7 @@ import type {
   UserID,
   UUID,
 } from '@agor/core/types';
-import authentication from '@feathersjs/authentication-client';
+import authentication, { type AuthenticationClient } from '@feathersjs/authentication-client';
 import type { Application, Paginated, Params } from '@feathersjs/feathers';
 import { feathers } from '@feathersjs/feathers';
 import socketio from '@feathersjs/socketio-client';
@@ -204,6 +207,7 @@ export interface TemplatesService {
 export interface ServiceTypes {
   sessions: Session;
   tasks: Task;
+  'board-comments': BoardComment;
   boards: Board;
   repos: Repo;
   'repos/clone': Repo;
@@ -449,6 +453,17 @@ export type MessagesService = Omit<
 > & {
   patch(id: string, data: ClientInput<MessagePatch>, params?: Params): Promise<Message>;
 };
+
+/** Public comment CRUD surface; spatial movement and reactions use custom routes. */
+export type BoardCommentsService = Omit<
+  AgorService<BoardComment, ClientInput<BoardCommentCreate>, never, ClientInput<BoardCommentPatch>>,
+  'update'
+>;
+
+/** Dedicated comment-position command; the URL supplies the comment identity. */
+export interface BoardCommentRepositionService {
+  create(data: ClientInput<BoardCommentReposition>, params?: Params): Promise<BoardComment>;
+}
 
 /**
  * Repos service with branch management
@@ -708,7 +723,23 @@ export interface BranchesService extends AgorService<Branch> {
 /**
  * Agor client with socket.io connection exposed for lifecycle management
  */
-export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
+type AuthenticationClientSurface = {
+  authentication: AuthenticationClient;
+  authenticate: AuthenticationClient['authenticate'];
+  reAuthenticate: AuthenticationClient['reAuthenticate'];
+  logout: AuthenticationClient['logout'];
+};
+
+/**
+ * Common Agor service client surface. Socket clients intentionally exclude
+ * Feathers' live authentication methods; REST clients add them through
+ * {@link AuthenticatedAgorClient}.
+ */
+export interface AgorClient
+  extends Omit<
+    Application<ServiceTypes>,
+    'service' | 'authentication' | 'authenticate' | 'reAuthenticate' | 'logout'
+  > {
   io: Socket;
   sessions: SessionsClientHelpers;
   tasks: TasksClientHelpers;
@@ -717,6 +748,7 @@ export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
   service(path: 'sessions'): SessionsService;
   service(path: 'tasks'): TasksService;
   service(path: 'messages'): MessagesService;
+  service(path: 'board-comments'): BoardCommentsService;
   service(path: 'repos'): ReposService;
   service(path: 'repos/clone'): ReposCloneService;
   service(path: 'repos/local'): ReposLocalService;
@@ -731,6 +763,7 @@ export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
   service(path: 'agentic-tool-presets'): AgenticToolPresetsService;
   service(path: 'opencode-auth'): OpenCodeAuthService;
   service(path: 'opencode-models'): OpenCodeModelsService;
+  service(path: `board-comments/${string}/reposition`): BoardCommentRepositionService;
 
   // Standard services (CRUD only)
   service(path: 'cards'): AgorService<CardWithType>;
@@ -745,17 +778,10 @@ export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
   // Generic fallback for custom routes and dynamic paths
   service<K extends keyof ServiceTypes>(path: K): AgorService<ServiceTypes[K]>;
   service(path: string): AgorService<unknown>;
-
-  // Authentication methods (from @feathersjs/authentication-client)
-  authenticate(credentials?: {
-    strategy?: string;
-    email?: string;
-    password?: string;
-    accessToken?: string;
-  }): Promise<AuthenticationResult>;
-  logout(): Promise<AuthenticationResult | null>;
-  reAuthenticate(force?: boolean): Promise<AuthenticationResult>;
 }
+
+/** REST-capable client with the normal Feathers authentication API. */
+export type AuthenticatedAgorClient = AgorClient & AuthenticationClientSurface;
 
 type BoardsServiceInternal = AgorService<Board> &
   Partial<BoardsService> & {
@@ -1315,14 +1341,6 @@ function extendTasksHelpers(client: AgorClient): void {
 }
 
 /**
- * Create Feathers client connected to agor-daemon
- *
- * @param url - Daemon URL
- * @param autoConnect - Auto-connect socket (default: true for CLI, false for React)
- * @param options - Additional options
- * @returns Feathers client instance with socket exposed
- */
-/**
  * Check if an AGOR_API_KEY environment variable is set.
  * Returns the key if valid format, null otherwise.
  */
@@ -1346,8 +1364,8 @@ export function getApiKeyFromEnv(): string | null {
 export async function createRestClient(
   url: string = DEFAULT_DAEMON_URL,
   apiKey?: string
-): Promise<AgorClient> {
-  const client = feathers<ServiceTypes>() as AgorClient;
+): Promise<AuthenticatedAgorClient> {
+  const client = feathers<ServiceTypes>() as AuthenticatedAgorClient;
   const fetchImpl = globalThis.fetch.bind(globalThis);
 
   // Lazy-load REST client (only imported when needed, not in browser bundles)
@@ -1428,6 +1446,30 @@ export async function createRestClient(
   return client;
 }
 
+export interface SocketConnectionAuthentication {
+  /**
+   * Access token presented in every Socket.IO namespace handshake. A getter
+   * lets long-lived browser clients rotate the credential without recreating
+   * the Feathers client; the next automatic or controlled reconnect reads the
+   * latest value.
+   */
+  accessToken: string | (() => string | null | undefined);
+}
+
+/**
+ * Create a Socket.IO-backed Feathers client connected to agor-daemon.
+ *
+ * The daemon authenticates every namespace handshake before accepting the
+ * connection, so callers must either provide `socketAuthentication` here or
+ * set an equivalent Socket.IO auth object before connecting. Calling the
+ * Feathers `authenticate()` method after connection is not a supported socket
+ * identity transition.
+ *
+ * @param url - Daemon URL
+ * @param autoConnect - Whether Socket.IO connects immediately (default: true)
+ * @param options - Transport and handshake options
+ * @returns Feathers client instance with its Socket.IO socket exposed
+ */
 export function createClient(
   url: string = DEFAULT_DAEMON_URL,
   autoConnect: boolean = true,
@@ -1438,12 +1480,8 @@ export function createClient(
     reconnectionAttempts?: number;
     /** Reject acknowledged service calls when Socket.IO does not receive an acknowledgement. */
     ackTimeout?: number;
-    /** Explicit authentication storage for non-browser clients. */
-    authStorage?: {
-      getItem(key: string): string | null | Promise<string | null>;
-      setItem(key: string, value: string): void | Promise<void>;
-      removeItem(key: string): void | Promise<void>;
-    };
+    /** Authenticate each Socket.IO connection before the server accepts it. */
+    socketAuthentication?: SocketConnectionAuthentication;
   }
 ): AgorClient {
   // Detect if running in browser vs Node.js (CLI)
@@ -1451,6 +1489,7 @@ export function createClient(
   const isBrowser = typeof globalThis !== 'undefined' && 'window' in globalThis;
 
   // Configure socket.io with better defaults for React StrictMode and reconnection
+  const socketAuthentication = options?.socketAuthentication;
   const socket = io(url, {
     // Auto-connect by default for CLI, manual control for React hooks
     autoConnect,
@@ -1468,6 +1507,15 @@ export function createClient(
     transports: ['websocket', 'polling'],
     // Connection lifecycle settings
     closeOnBeforeunload: true, // Close socket when page unloads
+    ...(socketAuthentication
+      ? {
+          auth: (authorize: (data: Record<string, string>) => void) => {
+            const configured = socketAuthentication.accessToken;
+            const accessToken = typeof configured === 'function' ? configured() : configured;
+            authorize(accessToken ? { token: accessToken } : {});
+          },
+        }
+      : {}),
   });
 
   // Add connection monitoring if verbose mode enabled
@@ -1492,23 +1540,18 @@ export function createClient(
     });
   }
 
-  const client = feathers<ServiceTypes>() as AgorClient;
+  // The typed helper surfaces (`sessions` and `tasks`) are installed below as
+  // part of client construction. Cross through `unknown` deliberately rather
+  // than claiming that a bare Feathers application already satisfies the
+  // completed AgorClient contract.
+  const client = feathers<ServiceTypes>() as unknown as AgorClient;
 
   client.configure(socketio(socket));
-
-  // Configure authentication with localStorage if available (browser only).
-  // Node 25 exposes a `localStorage` global that is NOT a working Storage —
-  // it has no `setItem` method, so the Feathers auth client throws
-  // `_a.setItem is not a function` on first authenticate(). Guard against
-  // that by also requiring a callable setItem before treating it as Storage.
-  const _ls = (globalThis as { localStorage?: unknown }).localStorage as
-    | (Storage & { setItem?: unknown })
-    | undefined;
-  const storage =
-    options?.authStorage ??
-    (_ls && typeof _ls.setItem === 'function' ? (_ls as Storage) : undefined);
-
-  client.configure(authentication({ storage }));
+  // Socket identity is established exclusively by the namespace handshake.
+  // Deliberately do not configure Feathers' authentication client here: once
+  // its `authenticate()` method has run it automatically reauthenticates after
+  // reconnect, which would introduce a second, post-connect identity
+  // transition. REST clients retain the normal Feathers authentication API.
   client.io = socket;
 
   extendServiceFactory(client);
@@ -1537,10 +1580,3 @@ export async function isDaemonRunning(url: string = DEFAULT_DAEMON_URL): Promise
     return false;
   }
 }
-
-/**
- * Re-export Feathers authentication client for use in executor
- * This allows the executor to import authentication client through @agor/core
- * instead of having it as a direct dependency
- */
-export { default as authenticationClient } from '@feathersjs/authentication-client';

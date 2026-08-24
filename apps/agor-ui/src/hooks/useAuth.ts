@@ -104,7 +104,12 @@ export function useAuth(): UseAuthReturn {
   const noteAuthenticatedUser = useCallback(
     (user: User) => {
       const nextUserId = user.user_id;
-      if (activeUserIdRef.current && activeUserIdRef.current !== nextUserId) {
+      // The generation identifies a committed authenticated authority, not
+      // merely an explicit logout/login operation. The first null -> user
+      // commit and a live A -> B replacement must both retire work owned by
+      // the preceding authority. A routine token refresh for the same user
+      // deliberately preserves the generation (and therefore the socket).
+      if (activeUserIdRef.current !== nextUserId) {
         advanceAuthenticationGeneration();
       }
       activeUserIdRef.current = nextUserId;
@@ -460,8 +465,8 @@ export function useAuth(): UseAuthReturn {
   }, [state.authenticated, state.accessToken, noteUnauthenticated]);
 
   // When the single-flight refresh helper completes from a non-React path
-  // (e.g. the socket-client 401-retry hook, or a concurrent refresh in
-  // useAgorClient), sync our React state so the next render uses the fresh
+  // (e.g. rejected-handshake recovery or a concurrent visibility refresh),
+  // sync our React state so the next render uses the fresh
   // token and the auto-refresh effect re-schedules around the new `exp`.
   useEffect(() => {
     const handleRefreshed = (event: Event) => {
@@ -483,9 +488,8 @@ export function useAuth(): UseAuthReturn {
   // When the single-flight refresh helper determines the refresh token is
   // permanently dead (e.g. the server returned 401 / NotAuthenticated from
   // the refresh endpoint), clear tokens and flip to unauthenticated. Without
-  // this, the socket around-hook and connect-handler would each re-throw
-  // the original auth error without cleanup, and a page reload would be the
-  // only way to escape the resulting refresh/reconnect loop.
+  // this, repeated rejected handshakes could leave the app disconnected
+  // without clearing a session that can no longer authenticate.
   useEffect(() => {
     const handleUnrecoverable = () => {
       clearTokens();
@@ -511,7 +515,15 @@ export function useAuth(): UseAuthReturn {
     // Invalidate caller-owned work synchronously, including a same-user
     // logout/login or explicit re-login.
     invalidateAuthentication();
-    setState((prev) => ({ ...prev, loading: true, error: null }));
+    // Do not keep exposing the preceding user's access token under the newly
+    // advanced generation while the replacement login is in flight.
+    setState({
+      user: null,
+      accessToken: null,
+      authenticated: false,
+      loading: true,
+      error: null,
+    });
 
     try {
       const client = await createRestClient(getDaemonUrl());

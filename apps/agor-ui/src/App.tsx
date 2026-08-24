@@ -400,6 +400,7 @@ function AppContent() {
     retryConnection,
   } = useAgorClient({
     accessToken: authenticated ? accessToken : null,
+    authorityGeneration: authenticationGeneration,
   });
   const pendingEnvironmentToastsRef = useRef<Map<string, PendingEnvironmentToast>>(new Map());
 
@@ -1853,9 +1854,7 @@ function AppContent() {
     try {
       await client.service('board-comments').create({
         board_id: boardId,
-        created_by: user?.user_id || 'unknown',
         content,
-        content_preview: content.slice(0, 200),
       });
     } catch (error) {
       showError(
@@ -1896,7 +1895,6 @@ function AppContent() {
       // Use the custom route for creating replies
       await client.service(`board-comments/${parentId}/reply`).create({
         content,
-        created_by: user?.user_id || 'unknown',
       });
     } catch (error) {
       showError(`Failed to send reply: ${error instanceof Error ? error.message : String(error)}`);

@@ -23,6 +23,8 @@ import {
 } from '@agor/core/config';
 import {
   assertTenantWritable,
+  BoardCommentsRepository,
+  BoardRepository,
   BranchRepository,
   bindRepositoryToTenantUnitOfWork,
   generateId,
@@ -59,6 +61,8 @@ import {
 } from '@agor/core/mcp';
 import type {
   AuthenticatedParams,
+  BoardComment,
+  BoardCommentReposition,
   BranchArchiveOrDeleteOptions,
   HookContext,
   MCPMemberPolicy,
@@ -80,6 +84,7 @@ import type {
   UUID,
 } from '@agor/core/types';
 import {
+  boardCommentZoneParentObjectKey,
   hasMinimumRole,
   isBranchArchiveOrDeleteOptions,
   isTaskPendingDispatch,
@@ -89,9 +94,19 @@ import {
   SessionStatus,
   TaskStatus,
 } from '@agor/core/types';
-import { NotFoundError } from '@agor/core/utils/errors';
+import { isNotFoundError } from '@agor/core/utils/errors';
 import type { NextFunction, Request, Response } from 'express';
 import { rateLimit } from 'express-rate-limit';
+import {
+  gatewaySlackUploadExecutorCommandId,
+  uploadMaterializeExecutorCommandId,
+} from './auth/executor-command-ids.js';
+import { getOrCreateExecutorConnectionRevocationFence } from './auth/executor-connection-admission.js';
+import {
+  authenticatedTaskExecutorRuntimeScope,
+  matchesExecutorCommandRuntimeScope,
+  matchesTaskExecutorRuntimeScope,
+} from './auth/executor-runtime-scope.js';
 import { createIssueBrowserTokensHook } from './auth/issue-browser-tokens-hook.js';
 import { createLaunchAuthService, resolvePublicLaunchAuthSettings } from './auth/launch-auth.js';
 import { createRefreshTokenService } from './auth/refresh-token-service.js';
@@ -128,6 +143,7 @@ import {
   deliverPermissionDecision,
   type PermissionDecisionSubmission,
 } from './permissions/deliver-permission-decision.js';
+import { publicBoardCommentRepositionInput } from './services/board-comments.js';
 import type { GatewayService } from './services/gateway.js';
 import { createMCPCatalogConnectService } from './services/mcp-catalog-connect.js';
 import {
@@ -172,6 +188,7 @@ import {
   shouldExposeMCPServerSecrets,
 } from './utils/mcp-header-secrets.js';
 import { canConfigureMcpServers } from './utils/mcp-server-authorization.js';
+import { patchUnlessRemoved } from './utils/patch-unless-removed.js';
 import {
   buildPromptTaskMetadata,
   type InternalPromptTaskMetadataInput,
@@ -200,6 +217,8 @@ import { isAgenticToolEnabledForTenant } from './utils/tenant-agentic-tool-valid
 import {
   createFreshTenantWriteDatabaseRunner,
   createTenantDatabaseScopeAroundHook,
+  createTenantWriteAdmissionAroundHook,
+  createTenantWriteGateAroundHook,
   deferWithTenantContext,
 } from './utils/tenant-db-scope.js';
 import {
@@ -282,6 +301,21 @@ export function rejectRemovedClaudeCliRestart(): never {
 
 function isServiceAccountRoute(params: RouteParams): boolean {
   return (params.user as { _isServiceAccount?: boolean } | undefined)?._isServiceAccount === true;
+}
+
+export function requireStreamingPublisherCapability(
+  params: RouteParams,
+  eventData: Record<string, unknown>
+): void {
+  if (isServiceAccountRoute(params)) return;
+
+  const scope = authenticatedTaskExecutorRuntimeScope(params);
+  if (!scope?.taskId || eventData.task_id !== scope.taskId) {
+    throw new Forbidden('Streaming events require an executor-scoped token');
+  }
+  if (!matchesTaskExecutorRuntimeScope(scope, eventData)) {
+    throw new Forbidden('Streaming event session does not match executor scope');
+  }
 }
 
 /**
@@ -374,6 +408,127 @@ export function createRequiredTenantDatabaseRunner(db: TenantScopeAwareDatabase)
 }
 
 /**
+ * Register an authenticated custom route with the same tenant transaction and
+ * write-freeze gate as ordinary tenant-owned Feathers services. Custom routes
+ * are installed after `registerHooks()`, so this registrar—not a static path
+ * list—is their authoritative database boundary.
+ */
+export function createTenantScopedAuthenticatedRouteRegistrar(options: {
+  db: TenantScopeAwareDatabase;
+  config: AgorConfig;
+  jwtSecret: string;
+}): typeof registerAuthenticatedRouteBase {
+  const tenantDatabaseScopeAround = createTenantDatabaseScopeAroundHook(options);
+  const tenantWriteGateAround = createTenantWriteGateAroundHook(options.db);
+  return (routeApp, path, service, authConfig, routeRequireAuth, routeOptions = {}) =>
+    registerAuthenticatedRouteBase(routeApp, path, service, authConfig, routeRequireAuth, {
+      ...routeOptions,
+      around: [tenantDatabaseScopeAround, tenantWriteGateAround, ...(routeOptions.around ?? [])],
+    });
+}
+
+type BoardCommentRouteParams = Pick<AuthenticatedParams, 'provider' | 'user'>;
+
+/**
+ * Authorize one custom board-comment route without trusting its route id as an
+ * access decision. PostgreSQL RLS handles tenant isolation; board RBAC handles
+ * same-tenant private-board access. Missing, foreign-tenant, and inaccessible
+ * comments intentionally produce the same result.
+ */
+export async function authorizeBoardCommentRouteAccess(input: {
+  commentId: string;
+  params: BoardCommentRouteParams;
+  findComment: (commentId: string) => Promise<BoardComment | null>;
+  findVisibleComment: (commentId: string, userId: UUID) => Promise<BoardComment | null>;
+}): Promise<BoardComment> {
+  const user = input.params.user;
+  if (!user) throw new NotAuthenticated('Authentication required');
+  const privileged = user._isServiceAccount || hasMinimumRole(user.role, ROLES.ADMIN);
+  const comment = privileged
+    ? await input.findComment(input.commentId)
+    : await input.findVisibleComment(input.commentId, user.user_id as UUID);
+  if (!comment) throw new NotFound('Board comment not found');
+  return comment;
+}
+
+/** Caller-owned reaction identity; a submitted user_id is never authoritative. */
+export function boardCommentReactionInput(
+  data: { emoji?: unknown },
+  params: BoardCommentRouteParams
+): { user_id: string; emoji: string } {
+  const userId = params.user?.user_id;
+  if (!userId) throw new NotAuthenticated('Authentication required');
+  if (typeof data.emoji !== 'string' || !data.emoji) throw new BadRequest('emoji required');
+  return { user_id: userId, emoji: data.emoji };
+}
+
+/**
+ * Replies inherit board/attachment authority from their parent. Project the
+ * request onto the supported fields so callers cannot smuggle ownership,
+ * reactions, resolution state, or a different parent/board reference.
+ */
+export function boardCommentReplyInput(
+  data: Partial<BoardComment>,
+  params: BoardCommentRouteParams
+): Partial<BoardComment> {
+  const userId = params.user?.user_id;
+  if (!userId) throw new NotAuthenticated('Authentication required');
+  if (typeof data.content !== 'string' || !data.content) {
+    throw new BadRequest('content required');
+  }
+  return {
+    content: data.content,
+    created_by: userId as UserID,
+    ...(Array.isArray(data.mentions) ? { mentions: data.mentions } : {}),
+  };
+}
+
+/**
+ * Authorize spatial movement without turning it into an audience mutation.
+ * Branch/session attachment anchors remain immutable; relative parent IDs are
+ * checked against those anchors, and zone IDs must belong to the same board.
+ */
+export async function authorizeBoardCommentReposition(input: {
+  comment: BoardComment;
+  data: BoardCommentReposition;
+  params: BoardCommentRouteParams;
+  findBoard: (boardId: string) => Promise<import('@agor/core/types').Board | null>;
+  findVisibleBoard: (
+    userId: UUID,
+    boardId: string
+  ) => Promise<import('@agor/core/types').Board | null>;
+}): Promise<void> {
+  const user = input.params.user;
+  if (!user) throw new NotAuthenticated('Authentication required');
+  const privileged = user._isServiceAccount || hasMinimumRole(user.role, ROLES.ADMIN);
+  if (!privileged && input.comment.created_by !== user.user_id) {
+    throw new Forbidden('Only the comment author may reposition this board comment');
+  }
+
+  const expectedBranchId = input.comment.branch_id ?? null;
+  if (input.data.branch_id !== expectedBranchId) {
+    throw new Forbidden('Board comment attachments cannot be changed while repositioning');
+  }
+
+  const relative = input.data.position.relative;
+  if (!relative) return;
+  if (relative.parent_type === 'branch' && relative.parent_id !== input.comment.branch_id) {
+    throw new Forbidden('Board comment branch position does not match its attachment');
+  }
+  if (relative.parent_type === 'session' && relative.parent_id !== input.comment.session_id) {
+    throw new Forbidden('Board comment session position does not match its attachment');
+  }
+  if (relative.parent_type === 'zone') {
+    const board = privileged
+      ? await input.findBoard(input.comment.board_id)
+      : await input.findVisibleBoard(user.user_id as UUID, input.comment.board_id);
+    if (board?.objects?.[boardCommentZoneParentObjectKey(relative.parent_id)]?.type !== 'zone') {
+      throw new NotFound('Board resource not found');
+    }
+  }
+}
+
+/**
  * Build the catalog-connect service exactly as the production route registers it.
  * Kept as a named boundary so PostgreSQL integration coverage can exercise the
  * authenticated tenant-scoped grant lookup instead of substituting a test
@@ -397,6 +552,48 @@ export function createRegisteredMCPCatalogConnectService(
   });
 }
 
+interface BearerHttpAuthenticationService {
+  create(
+    data: { strategy: 'jwt'; accessToken: string },
+    params: AuthenticatedParams
+  ): Promise<{ user?: User; authentication?: { payload?: unknown } }>;
+}
+
+/**
+ * Authenticate one raw HTTP bearer at the same tenant-aware boundary used by
+ * Feathers REST middleware. The mutable params object passed into the strategy
+ * is reused in the result so verified tenant context cannot be lost between
+ * user lookup and the route's authorization checks.
+ */
+export async function authenticateBearerHttpRequest(input: {
+  authentication: BearerHttpAuthenticationService;
+  multiTenancy: ReturnType<typeof resolveMultiTenancyConfig>;
+  headers: Record<string, unknown>;
+  token: string;
+}): Promise<AuthenticatedParams> {
+  const authParams: AuthenticatedParams = { headers: input.headers };
+  const result = await input.authentication.create(
+    { strategy: 'jwt', accessToken: input.token },
+    authParams
+  );
+  return {
+    ...authParams,
+    user: result.user,
+    provider: 'rest',
+    authentication: result.authentication,
+    tenant:
+      authParams.tenant ??
+      resolveTenantContext(input.multiTenancy, {
+        params: {
+          authentication: result.authentication,
+          headers: input.headers,
+        },
+        authPayload: result.authentication?.payload,
+        headers: input.headers,
+      }),
+  };
+}
+
 export function createUploadAuthMiddleware(input: {
   authentication: {
     create(
@@ -415,30 +612,12 @@ export function createUploadAuthMiddleware(input: {
         return res.status(401).json({ error: 'Authentication required' });
       }
 
-      const authParams: AuthenticatedParams = { headers: req.headers };
-      const result = await input.authentication.create(
-        { strategy: 'jwt', accessToken: token },
-        authParams
-      );
-      const authenticatedParams = {
-        user: result.user,
-        provider: 'rest',
-        authentication: result.authentication,
+      req.feathers = await authenticateBearerHttpRequest({
+        authentication: input.authentication,
+        multiTenancy: input.multiTenancy,
         headers: req.headers,
-      };
-      req.feathers = {
-        ...authenticatedParams,
-        tenant:
-          authParams.tenant ??
-          resolveTenantContext(input.multiTenancy, {
-            params: {
-              authentication: result.authentication,
-              headers: req.headers,
-            },
-            authPayload: result.authentication?.payload,
-            headers: req.headers,
-          }),
-      };
+        token,
+      });
       next();
     } catch (error) {
       console.error('❌ [Upload Auth] Authentication failed:', error);
@@ -532,13 +711,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   const usersService = app.service('users');
   const tasksService = app.service('tasks') as unknown as TasksServiceImpl;
   const reposService = app.service('repos') as unknown as ReposServiceImpl;
-  const tenantDatabaseScopeAround = createTenantDatabaseScopeAroundHook({ db, config, jwtSecret });
   const tenantIdentityAround = createTenantDatabaseScopeAroundHook({
     db,
     config,
     jwtSecret,
     transaction: false,
   });
+  const tenantWriteAdmissionAround = createTenantWriteAdmissionAroundHook(db);
   const inTenantDatabaseScope = <T>(hook: (context: HookContext) => T) =>
     async function scopedHook(context: HookContext): Promise<Awaited<T>> {
       return runWithTenantDatabaseScope(db, context.params.tenant?.tenant_id, async () =>
@@ -552,18 +731,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     deferWithTenantContext(params, fn);
   }
 
-  const registerAuthenticatedRoute: typeof registerAuthenticatedRouteBase = (
-    routeApp,
-    path,
-    service,
-    authConfig,
-    routeRequireAuth,
-    options = {}
-  ) =>
-    registerAuthenticatedRouteBase(routeApp, path, service, authConfig, routeRequireAuth, {
-      ...options,
-      around: [tenantDatabaseScopeAround, ...(options.around ?? [])],
-    });
+  const registerAuthenticatedRoute = createTenantScopedAuthenticatedRouteRegistrar({
+    db,
+    config,
+    jwtSecret,
+  });
 
   const registerLongAuthenticatedRoute: typeof registerAuthenticatedRouteBase = (
     routeApp,
@@ -575,12 +747,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   ) =>
     registerAuthenticatedRouteBase(routeApp, path, service, authConfig, routeRequireAuth, {
       ...options,
-      around: [tenantIdentityAround, ...(options.around ?? [])],
+      around: [tenantIdentityAround, tenantWriteAdmissionAround, ...(options.around ?? [])],
     });
 
   // Long routes carry tenant identity without holding a route-wide database
-  // transaction. Bind direct repository dependencies to short units of work;
-  // hooked service calls establish their own scopes.
+  // transaction. Admission checks the write gate in one short unit before
+  // orchestration begins; direct repositories and hooked services re-check it
+  // at their own short write boundaries.
   const stopRouteRepositories = bindStopRouteRepositories(db, {
     taskRepo: new TaskRepository(db),
     branchRepo: branchRepository,
@@ -608,9 +781,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   const authStrategiesArray = ['api-key', 'jwt', 'local'];
   const multiTenancy = resolveMultiTenancyConfig(config);
   const tenantTokenClaim = multiTenancy.auth_claim ?? 'tenant_id';
-  if (sessionTokenService) {
-    authStrategiesArray.push('session-token');
-  }
 
   // Access token TTL — short by design. The /authentication/refresh route
   // (and the after-hook below) issues a 30-day refresh token so users stay
@@ -643,11 +813,18 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Configure authentication
   const authentication = new AuthenticationService(app);
 
-  // Import custom JWT strategy that handles service tokens
-  const { ServiceJWTStrategy } = await import('./auth/service-jwt-strategy.js');
+  // Register the runtime JWT strategy for user, executor, terminal, and daemon credentials.
+  const { RuntimeJWTStrategy } = await import('./auth/runtime-jwt-strategy.js');
 
   // Register authentication strategies
-  authentication.register('jwt', new ServiceJWTStrategy(sessionTokenService, tenantTokenClaim));
+  authentication.register(
+    'jwt',
+    new RuntimeJWTStrategy({
+      sessionTokenService,
+      executorRevocationFence: getOrCreateExecutorConnectionRevocationFence(app),
+      multiTenancy,
+    })
+  );
   authentication.register('local', new AgorLocalStrategy());
 
   // Register API key authentication strategy
@@ -908,6 +1085,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         },
         params: RouteParams
       ) {
+        requireStreamingPublisherCapability(params, data.data);
         app.service('messages').emit(data.event, data.data);
         if (isServiceAccountRoute(params)) {
           const gatewayStreamingEvent =
@@ -946,6 +1124,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         },
         params: RouteParams
       ) {
+        requireStreamingPublisherCapability(params, data.data);
         app.service('tasks').emit(data.event, data.data);
         if (isServiceAccountRoute(params) && data.event === 'tool:start') {
           const sessionId =
@@ -1112,31 +1291,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
    * dispatch fence in PostgreSQL are authoritative across daemons.
    */
   const sessionTurnLocks: SessionTurnLocks = new Map();
-
-  /**
-   * Helper: Safely patch an entity, returning false if it was deleted mid-execution
-   */
-  async function safePatch<T>(
-    serviceName: string,
-    id: string,
-    data: Partial<T>,
-    entityType: string,
-    params?: RouteParams
-  ): Promise<boolean> {
-    try {
-      await app.service(serviceName).patch(id, data, params || {});
-      return true;
-    } catch (error) {
-      if (
-        error instanceof NotFoundError ||
-        (error instanceof Error && error.message.includes('No record found'))
-      ) {
-        console.log(`⚠️  ${entityType} ${shortId(id)} was deleted mid-execution - skipping update`);
-        return false;
-      }
-      throw error;
-    }
-  }
 
   async function reconcileSessionPromptStateIfStuck(
     session: Session,
@@ -1528,7 +1682,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           `❌ [Daemon] Executor spawn failed for session=${shortId(sessionId)} task=${shortId(taskId)} agent=${session.agentic_tool} unix_username=${session.unix_username ?? 'null'}: ${errorMessage}`,
           error
         );
-        await safePatch(
+        await patchUnlessRemoved(
+          app,
           'tasks',
           taskId,
           {
@@ -2192,9 +2347,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   const uploadRepo = new UploadRepository(db);
   const uploadMiddleware = createUploadMiddleware(getUploadStagingStore());
 
-  // Executor-only data plane for staged upload materialization. The scoped
-  // service token stays in the Authorization header (never URL/query/logs) and
-  // binds exactly one tenant + session + upload handle.
+  // Executor-only data plane for staged upload materialization. The bounded
+  // delegated-user command token stays in the Authorization header (never
+  // URL/query/logs) and binds exactly one tenant + branch + session + handle.
   // biome-ignore lint/suspicious/noExplicitAny: Express route method not on FeathersJS Application type
   (app as any).get('/executor/uploads/:uploadRef/content', async (req: any, res: any) => {
     try {
@@ -2202,27 +2357,34 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       if (typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Authentication required' });
       }
-      const result = await app.service('authentication').create({
-        strategy: 'jwt',
-        accessToken: authHeader.slice(7),
+      const params = await authenticateBearerHttpRequest({
+        authentication: app.service('authentication'),
+        multiTenancy,
+        headers: req.headers,
+        token: authHeader.slice(7),
       });
-      const claims = result.authentication?.payload as Record<string, unknown> | undefined;
+      const claims = params.authentication?.payload as Record<string, unknown> | undefined;
       const uploadRef = req.params.uploadRef;
+      const sessionId = String(req.headers['x-agor-session-id'] ?? '');
+      const branchId = claims?.branch_id;
+      const tenant = params.tenant;
       if (
-        claims?.type !== 'service' ||
-        claims.executor_action !== 'upload.materialize' ||
-        claims.executor_upload_ref !== uploadRef ||
-        typeof claims.executor_session_id !== 'string' ||
-        typeof claims.executor_branch_id !== 'string' ||
-        typeof claims.tenant_id !== 'string'
+        typeof branchId !== 'string' ||
+        !tenant?.tenant_id ||
+        !sessionId ||
+        !matchesExecutorCommandRuntimeScope(
+          params,
+          uploadMaterializeExecutorCommandId(sessionId, uploadRef),
+          branchId
+        )
       ) {
         return res.status(403).json({ error: 'Upload transfer capability denied' });
       }
       const store = getUploadStagingStore();
       const owner = {
-        tenantId: claims.tenant_id as import('@agor/core/types').TenantID,
-        sessionId: claims.executor_session_id as SessionID,
-        branchId: claims.executor_branch_id as import('@agor/core/types').BranchID,
+        tenantId: tenant.tenant_id,
+        sessionId: sessionId as SessionID,
+        branchId: branchId as import('@agor/core/types').BranchID,
         ref: uploadRef as import('@agor/core/types').UploadRef,
       };
       const metadata = await store.inspect(owner);
@@ -2256,39 +2418,30 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       if (typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Authentication required' });
       }
-      const result = await app.service('authentication').create({
-        strategy: 'jwt',
-        accessToken: authHeader.slice(7),
+      const params = await authenticateBearerHttpRequest({
+        authentication: app.service('authentication'),
+        multiTenancy,
+        headers: req.headers,
+        token: authHeader.slice(7),
       });
-      const claims = result.authentication?.payload as Record<string, unknown> | undefined;
+      const claims = params.authentication?.payload as Record<string, unknown> | undefined;
       const gatewayChannelId = String(req.headers['x-agor-gateway-channel-id'] ?? '');
       const channel = String(req.headers['x-agor-slack-channel-id'] ?? '');
       const size = Number.parseInt(String(req.headers['content-length'] ?? ''), 10);
+      const branchId = claims?.branch_id;
       if (
-        claims?.type !== 'service' ||
-        claims.executor_action !== 'gateway.slack-file-upload' ||
-        claims.executor_gateway_channel_id !== gatewayChannelId ||
-        claims.executor_slack_channel_id !== channel ||
+        typeof branchId !== 'string' ||
+        !matchesExecutorCommandRuntimeScope(
+          params,
+          gatewaySlackUploadExecutorCommandId(gatewayChannelId, channel),
+          branchId
+        ) ||
         !Number.isSafeInteger(size) ||
         size < 0 ||
         size > getUploadLimits().maxFileBytes
       ) {
         return res.status(403).json({ error: 'Slack upload capability denied' });
       }
-      const authParams = {
-        user: result.user,
-        provider: 'rest',
-        authentication: result.authentication,
-        headers: req.headers,
-      };
-      const params = {
-        ...authParams,
-        tenant: resolveTenantContext(multiTenancy, {
-          params: authParams,
-          authPayload: result.authentication?.payload,
-          headers: req.headers,
-        }),
-      } as AuthenticatedParams;
       let received = 0;
       const limiter = new Transform({
         transform(chunk: Buffer, _encoding, callback) {
@@ -2849,7 +3002,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
                   try {
                     return await app.service('tasks').get(taskId, params);
                   } catch (error) {
-                    if ((error as { code?: number }).code === 404) return undefined;
+                    if (isNotFoundError(error)) return undefined;
                     throw error;
                   }
                 },
@@ -3476,6 +3629,16 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Board comments custom routes (threading + reactions)
   // ============================================================================
 
+  const boardCommentRouteRepository = new BoardCommentsRepository(db);
+  const boardCommentBoardRepository = new BoardRepository(db);
+  const authorizeBoardCommentRoute = (id: string, params: RouteParams) =>
+    authorizeBoardCommentRouteAccess({
+      commentId: id,
+      params,
+      findComment: (commentId) => boardCommentRouteRepository.findById(commentId),
+      findVisibleComment: (commentId, userId) =>
+        boardCommentRouteRepository.findVisibleById(userId, commentId),
+    });
   const boardCommentsService = safeService('board-comments') as unknown as {
     toggleReaction: (
       id: string,
@@ -3487,6 +3650,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       data: Partial<import('@agor/core/types').BoardComment>,
       params?: unknown
     ) => Promise<import('@agor/core/types').BoardComment>;
+    reposition: (
+      id: string,
+      data: BoardCommentReposition,
+      params?: unknown
+    ) => Promise<import('@agor/core/types').BoardComment>;
   };
 
   if (boardCommentsService)
@@ -3494,17 +3662,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       app,
       '/board-comments/:id/toggle-reaction',
       {
-        async create(data: { emoji: string }, params: RouteParams) {
+        async create(data: { user_id?: string; emoji?: string }, params: RouteParams) {
           const id = params.route?.id;
           if (!id) throw new Error('Comment ID required');
-          if (!data.emoji) throw new Error('emoji required');
-          // Derive the reactor from the authenticated caller; never trust a
-          // client-supplied user_id (previously spoofable: react as any user).
-          const userId = params.user?.user_id as string | undefined;
-          if (!userId) throw new Error('Authentication required');
+          const comment = await authorizeBoardCommentRoute(id, params);
           const updated = await boardCommentsService.toggleReaction(
-            id,
-            { user_id: userId, emoji: data.emoji },
+            comment.comment_id,
+            boardCommentReactionInput(data, params),
             params
           );
           emitServiceEvent(app, {
@@ -3531,14 +3695,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         async create(data: Partial<import('@agor/core/types').BoardComment>, params: RouteParams) {
           const id = params.route?.id;
           if (!id) throw new Error('Comment ID required');
-          if (!data.content) throw new Error('content required');
-          // Always attribute the reply to the authenticated caller — never trust
-          // a client-supplied `created_by`. `requireAuth` upstream guarantees
-          // `params.user.user_id`.
-          const callerId = (params as { user?: { user_id?: string } }).user?.user_id;
-          if (!callerId) throw new Error('Authentication required');
-          data.created_by = callerId as import('@agor/core/types').UserID;
-          const reply = await boardCommentsService.createReply(id, data, params);
+          const parent = await authorizeBoardCommentRoute(id, params);
+          const reply = await boardCommentsService.createReply(
+            parent.comment_id,
+            boardCommentReplyInput(data, params),
+            params
+          );
           emitServiceEvent(app, {
             path: 'board-comments',
             event: 'created',
@@ -3551,6 +3713,45 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       },
       {
         create: { role: ROLES.MEMBER, action: 'reply to board comments' },
+      },
+      requireAuth
+    );
+
+  if (boardCommentsService)
+    registerAuthenticatedRoute(
+      app,
+      '/board-comments/:id/reposition',
+      {
+        async create(data: unknown, params: RouteParams) {
+          const id = params.route?.id;
+          if (!id) throw new Error('Comment ID required');
+          const comment = await authorizeBoardCommentRoute(id, params);
+          const reposition = publicBoardCommentRepositionInput(data);
+          await authorizeBoardCommentReposition({
+            comment,
+            data: reposition,
+            params,
+            findBoard: (boardId) => boardCommentBoardRepository.findById(boardId),
+            findVisibleBoard: (userId, boardId) =>
+              boardCommentBoardRepository.findVisibleById(userId, boardId),
+          });
+          const updated = await boardCommentsService.reposition(
+            comment.comment_id,
+            reposition,
+            params
+          );
+          emitServiceEvent(app, {
+            path: 'board-comments',
+            event: 'patched',
+            data: updated,
+            params,
+            id: updated.comment_id,
+          });
+          return updated;
+        },
+      },
+      {
+        create: { role: ROLES.MEMBER, action: 'reposition board comments' },
       },
       requireAuth
     );
@@ -4041,16 +4242,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         const mcpService = app.service('mcp-servers');
         const queryForUserId =
           typeof params.query?.forUserId === 'string' ? params.query.forUserId : undefined;
-        const authPayloadType = (
-          params as RouteParams & { authentication?: { payload?: { type?: unknown } } }
-        ).authentication?.payload?.type;
         const routeUser = params.user as
           | (NonNullable<RouteParams['user']> & { _isServiceAccount?: boolean })
           | undefined;
         const userId = resolveForUserIdWithGate({
           queryForUserId,
           isServiceAccount: routeUser?._isServiceAccount,
-          authPayloadType,
           callerUserId: params.user?.user_id,
         });
         const rawLookupParams = {
@@ -4679,7 +4876,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           // Resolved branch storage policy. The daemon still enforces this at
           // create time; the UI uses it to pick the right default and disable
           // unavailable storage modes before submit.
-          branchStorage: resolveBranchStorageConfig(),
+          branchStorage: resolveBranchStorageConfig(config),
           uploadPolicy: getUploadLimits(),
         },
       };
