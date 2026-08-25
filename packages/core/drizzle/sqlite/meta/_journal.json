@@ -666,6 +666,13 @@
       "when": 1787529600000,
       "tag": "0096_scheduler_poison_recovery",
       "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "6",
+      "when": 1787662889950,
+      "tag": "0097_discord_gateway_hybrid",
+      "breakpoints": true
     }
   ]
 }
