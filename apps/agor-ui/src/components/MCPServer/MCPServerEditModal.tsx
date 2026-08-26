@@ -5,8 +5,9 @@ import type {
   MCPTransport,
   UpdateMCPServerInput,
 } from '@agor-live/client';
-import { Button, Form, Modal, Space, Tooltip } from 'antd';
-import { useEffect, useState } from 'react';
+import { Alert, Button, Form, Modal, Space, Tooltip } from 'antd';
+import { useEffect, useRef, useState } from 'react';
+import { useAuthorityOperationGuard } from '@/hooks/useAuthorityOperationGuard';
 import { useThemedMessage } from '@/utils/message';
 import { MCPServerFormFields } from './MCPServerFormFields';
 import {
@@ -16,12 +17,19 @@ import {
   useFormRevision,
 } from './mcp-form-requirements';
 import { buildAuthFromValues, parseEnvJSON, parseHeadersJSON } from './mcp-oauth-utils';
+import { useOAuthBrowserEventAttempt } from './useOAuthBrowserEventAttempt';
 
 export interface MCPServerEditModalProps {
   /** The server being edited. Modal opens when this is non-null and `open` is true. */
   server: MCPServer | null;
   open: boolean;
   client: AgorClient | null;
+  /** Authenticated identity that owns the form contents and selected server. */
+  identityKey: string | null;
+  /** Successful socket-auth generation used to scope compatibility events. */
+  authGeneration: number;
+  /** Current identity/role/auth generation, null while authority is unavailable. */
+  authorityKey: string | null;
   /**
    * The transports this editor may switch to. Omit to offer all of them — a
    * caller that knows the user is held to remote transports passes those, so
@@ -30,6 +38,9 @@ export interface MCPServerEditModalProps {
   offeredTransports?: MCPTransport[];
   /** The scopes this editor may switch to, on the same terms. */
   offeredScopes?: MCPScope[];
+  /** Current server-side capability/connection decision from the owner. */
+  mutationAllowed: boolean;
+  mutationBlockedReason?: string;
   onClose: () => void;
   /** Runs after the portal has finished closing (for example, to restore focus). */
   afterClose?: () => void;
@@ -56,12 +67,17 @@ interface TestResult {
  * both `MCPServersTable` (settings) and `SessionMcpFooterControl` (admin
  * shortcut).
  */
-export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
+const MCPServerEditModalForIdentity: React.FC<MCPServerEditModalProps> = ({
   server,
   open,
   client,
+  identityKey,
+  authGeneration,
+  authorityKey,
   offeredTransports,
   offeredScopes,
+  mutationAllowed,
+  mutationBlockedReason = 'You can no longer change this MCP server.',
   onClose,
   afterClose,
   focusTriggerAfterClose,
@@ -80,6 +96,15 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
   // animates in.
   const [formHydrated, setFormHydrated] = useState(false);
   const [formRevision, bumpFormRevision] = useFormRevision();
+  const operationGuard = useAuthorityOperationGuard(
+    authorityKey && mutationAllowed ? [authorityKey, client, mutationAllowed] : null
+  );
+  const oauthBrowserEvents = useOAuthBrowserEventAttempt({
+    client,
+    currentUserId: identityKey,
+    authGeneration,
+    authorityGuard: operationGuard,
+  });
 
   // Only ask the form once it is rendered and filled — an unmounted instance
   // warns, and a half-hydrated one would flash Save disabled.
@@ -87,7 +112,9 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
     open && formHydrated
       ? missingMCPFieldLabels(form.getFieldsValue(true), { mode: 'edit', transport, authType })
       : [];
-  const saveBlocked = missingRequiredFields.length > 0;
+  const saveBlocked = !mutationAllowed || missingRequiredFields.length > 0;
+  const mutationStateRef = useRef({ allowed: mutationAllowed, reason: mutationBlockedReason });
+  mutationStateRef.current = { allowed: mutationAllowed, reason: mutationBlockedReason };
 
   // Hydrate the form when the modal opens or the user swaps to a different
   // server. Intentionally NOT keyed on `server` itself — that would clobber
@@ -173,6 +200,8 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
   };
 
   const handleTestConnection = async () => {
+    const operation = operationGuard.begin();
+    if (!operation.isCurrent()) return;
     if (!client || !server) {
       // Pre-flight failure — no inline result UI yet, so a toast is the
       // only signal we have. Result-bearing failures below set testResult
@@ -191,17 +220,24 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
       showError('Connection test is not available for stdio transport');
       return;
     }
+    let browserAttempt: Awaited<ReturnType<typeof oauthBrowserEvents.begin>> = null;
     try {
       await form.validateFields(['headers']);
     } catch {
+      if (!operation.isCurrent()) return;
       showError('Please fix custom HTTP headers before testing');
       return;
     }
-
-    setTesting(true);
-    setTestResult(null);
+    if (!operation.isCurrent()) return;
 
     try {
+      setTesting(true);
+      setTestResult(null);
+      browserAttempt = await oauthBrowserEvents.begin({
+        operation: 'discover',
+        mcpServerId: server.mcp_server_id,
+      });
+      if (!operation.isCurrent()) return;
       const data = (await client.service('mcp-servers/discover').create({
         mcp_server_id: server.mcp_server_id,
         url: values.url,
@@ -212,6 +248,7 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
           preserveAbsentGrantType,
         }),
         headers: parseHeadersJSON(values.headers),
+        ...(browserAttempt ? { oauth_browser_event: browserAttempt.request } : {}),
       })) as {
         success: boolean;
         error?: string;
@@ -220,6 +257,8 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
         resources?: Array<{ name: string; uri: string; mimeType?: string }>;
         prompts?: Array<{ name: string; description: string }>;
       };
+
+      if (!operation.isCurrent()) return;
 
       if (data.success && data.capabilities) {
         setTestResult({
@@ -241,6 +280,7 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
         });
       }
     } catch (error) {
+      if (!operation.isCurrent()) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       setTestResult({
         success: false,
@@ -250,15 +290,27 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
         error: errorMessage,
       });
     } finally {
-      setTesting(false);
+      browserAttempt?.cleanup();
+      if (operation.isCurrent()) setTesting(false);
     }
   };
 
-  const saveFormValues = async (): Promise<boolean> => {
-    if (!server || !client) return false;
+  const saveFormValues = async (
+    operation: ReturnType<typeof operationGuard.begin>
+  ): Promise<boolean> => {
+    if (!server || !client || !operation.isCurrent()) return false;
+    if (!mutationStateRef.current.allowed) {
+      showError(mutationStateRef.current.reason);
+      return false;
+    }
 
     try {
       await form.validateFields();
+      if (!operation.isCurrent()) return false;
+      if (!mutationStateRef.current.allowed) {
+        showError(mutationStateRef.current.reason);
+        return false;
+      }
       const values = form.getFieldsValue(true);
 
       const updates: UpdateMCPServerInput = {
@@ -286,9 +338,15 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
         preserveAbsentGrantType,
       });
 
+      if (!operation.isCurrent()) return false;
+      if (!mutationStateRef.current.allowed) {
+        showError(mutationStateRef.current.reason);
+        return false;
+      }
       await client.service('mcp-servers').patch(server.mcp_server_id, updates);
-      return true;
+      return operation.isCurrent();
     } catch (error) {
+      if (!operation.isCurrent()) return false;
       // Name the field, rather than letting a rejected validation surface as
       // the generic message its non-Error shape would produce.
       const errorMessage =
@@ -300,14 +358,17 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
   };
 
   const handleSave = async () => {
-    if (await saveFormValues()) {
+    const operation = operationGuard.begin();
+    if (await saveFormValues(operation)) {
+      if (!operation.isCurrent()) return;
       showSuccess('MCP server updated successfully');
       closeAndReset();
     }
   };
 
   const prepareOAuthStart = async (): Promise<string | null> => {
-    if (!(await saveFormValues())) return null;
+    const operation = operationGuard.begin();
+    if (!(await saveFormValues(operation)) || !operation.isCurrent()) return null;
     return server?.mcp_server_id ?? null;
   };
 
@@ -324,7 +385,15 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
         <Space>
           <Button onClick={closeAndReset}>Cancel</Button>
           {/* A disabled button can't host a tooltip of its own — hence the span. */}
-          <Tooltip title={saveBlocked ? describeMissingForSave(missingRequiredFields) : undefined}>
+          <Tooltip
+            title={
+              !mutationAllowed
+                ? mutationBlockedReason
+                : saveBlocked
+                  ? describeMissingForSave(missingRequiredFields)
+                  : undefined
+            }
+          >
             <span>
               <Button type="primary" disabled={saveBlocked} onClick={handleSave}>
                 Save
@@ -334,6 +403,15 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
         </Space>
       }
     >
+      {!mutationAllowed && (
+        <Alert
+          type="warning"
+          showIcon
+          title="MCP server changes are unavailable"
+          description={mutationBlockedReason}
+          style={{ marginTop: 16 }}
+        />
+      )}
       <Form
         form={form}
         layout="vertical"
@@ -357,11 +435,14 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
           onAuthTypeChange={setAuthType}
           form={form}
           client={client}
+          authorityKey={authorityKey}
           serverId={server?.mcp_server_id}
           onTestConnection={handleTestConnection}
           testing={testing}
           testResult={testResult}
           onPrepareOAuthStart={prepareOAuthStart}
+          mutationAllowed={mutationAllowed}
+          mutationBlockedReason={mutationBlockedReason}
           formRevision={formRevision}
           managedOAuthCompatibilityMode={
             server?.oauth_compatibility_policy?.managed_by_catalog &&
@@ -375,3 +456,17 @@ export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = ({
     </Modal>
   );
 };
+
+/**
+ * The form can contain raw OAuth/JWT/bearer credentials. Remount its entire
+ * state owner when the authenticated identity changes so another same-role
+ * caller cannot inherit a selected row or any registered Ant Form value.
+ * `authorityKey` remains a finer mutation gate; it intentionally does not key
+ * this owner, preserving same-user reconnect and token-refresh edits.
+ */
+export const MCPServerEditModal: React.FC<MCPServerEditModalProps> = (props) => (
+  <MCPServerEditModalForIdentity
+    key={props.identityKey ?? '__no-authenticated-user__'}
+    {...props}
+  />
+);

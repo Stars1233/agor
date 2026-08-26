@@ -12,7 +12,17 @@
 import type { Branch, MCPCatalogCredentialRequirement, MCPCatalogEntry } from '@agor/core/types';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import { type MCPServerCapabilityContext, POLICY_LOADING_HINT } from '../MCPServer/memberPolicy';
 import { CatalogDetailDrawer } from './CatalogDetailDrawer';
+
+const ALLOWED: MCPServerCapabilityContext = {
+  connectionReady: true,
+  role: 'admin',
+  isAdmin: true,
+  policy: 'allow_crud',
+  userId: 'user-admin',
+  canConfigure: true,
+};
 
 const DEEPWIKI = {
   name: 'com.deepwiki/mcp',
@@ -36,9 +46,14 @@ const LINEAR = {
 
 const BRANCHES = [{ branch_id: 'branch-1', name: 'mkt-slice' }] as unknown as Branch[];
 
-function renderDrawer(entry: MCPCatalogEntry) {
+function renderDrawer(
+  entry: MCPCatalogEntry,
+  options: { capability?: MCPServerCapabilityContext; policyPending?: boolean } = {}
+) {
+  const { capability = ALLOWED, policyPending = false } = options;
   const view = render(
     <CatalogDetailDrawer
+      identityKey={capability.userId ?? null}
       entry={entry}
       open
       onClose={vi.fn()}
@@ -48,12 +63,16 @@ function renderDrawer(entry: MCPCatalogEntry) {
       defaultBranchId="branch-1"
       connecting={false}
       connectError={null}
+      connectCapability={capability}
+      policyPending={policyPending}
+      policyPendingHint={POLICY_LOADING_HINT}
       onConnect={vi.fn()}
     />
   );
   const show = (next: MCPCatalogEntry) =>
     view.rerender(
       <CatalogDetailDrawer
+        identityKey={capability.userId ?? null}
         entry={next}
         open
         onClose={vi.fn()}
@@ -63,6 +82,9 @@ function renderDrawer(entry: MCPCatalogEntry) {
         defaultBranchId="branch-1"
         connecting={false}
         connectError={null}
+        connectCapability={capability}
+        policyPending={policyPending}
+        policyPendingHint={POLICY_LOADING_HINT}
         onConnect={vi.fn()}
       />
     );
@@ -117,6 +139,73 @@ describe('CatalogDetailDrawer consent', () => {
   });
 });
 
+describe('CatalogDetailDrawer connect capability', () => {
+  const VIEWER: MCPServerCapabilityContext = {
+    connectionReady: true,
+    role: 'viewer',
+    isAdmin: false,
+    policy: 'allow_crud',
+    userId: 'user-viewer',
+    canConfigure: false,
+  };
+  const RESTRICTED_MEMBER: MCPServerCapabilityContext = {
+    connectionReady: true,
+    role: 'member',
+    isAdmin: false,
+    policy: 'use_existing_only',
+    userId: 'user-member',
+    canConfigure: false,
+  };
+
+  it('refuses a viewer at the action and explains the role restriction', () => {
+    renderDrawer(DEEPWIKI, { capability: VIEWER });
+    fireEvent.click(screen.getByRole('checkbox'));
+
+    expect(connectButton()).toBeDisabled();
+    expect(screen.getByText(/read-only access/i)).toBeInTheDocument();
+  });
+
+  it('refuses a member when the workspace policy forbids new servers', () => {
+    renderDrawer(DEEPWIKI, { capability: RESTRICTED_MEMBER });
+    fireEvent.click(screen.getByRole('checkbox'));
+
+    expect(connectButton()).toBeDisabled();
+    expect(screen.getByText(/Use existing servers only/)).toBeInTheDocument();
+  });
+
+  it('enables the action for a member with server-provided capability', () => {
+    renderDrawer(DEEPWIKI, {
+      capability: { ...RESTRICTED_MEMBER, policy: 'allow_crud', canConfigure: true },
+    });
+    fireEvent.click(screen.getByRole('checkbox'));
+
+    expect(connectButton()).toBeEnabled();
+  });
+
+  it('fails closed during disconnect grace even with a previously granted capability', () => {
+    renderDrawer(DEEPWIKI, {
+      capability: {
+        ...RESTRICTED_MEMBER,
+        connectionReady: false,
+        policy: 'allow_crud',
+        canConfigure: true,
+      },
+    });
+    fireEvent.click(screen.getByRole('checkbox'));
+
+    expect(connectButton()).toBeDisabled();
+  });
+
+  it('fails closed without inventing a workspace policy while the read is pending', () => {
+    renderDrawer(DEEPWIKI, { policyPending: true });
+    fireEvent.click(screen.getByRole('checkbox'));
+
+    expect(connectButton()).toBeDisabled();
+    expect(screen.getByText(POLICY_LOADING_HINT)).toBeInTheDocument();
+    expect(screen.queryByText(/does not let you add/i)).not.toBeInTheDocument();
+  });
+});
+
 /**
  * The API-key field.
  *
@@ -155,8 +244,10 @@ function renderWithConnect(entry: MCPCatalogEntry) {
   const props = (
     shown: MCPCatalogEntry,
     open = true,
-    credentialRequirement: MCPCatalogCredentialRequirement | null = null
+    credentialRequirement: MCPCatalogCredentialRequirement | null = null,
+    identityKey = ALLOWED.userId ?? null
   ) => ({
+    identityKey,
     entry: shown,
     open,
     onClose: vi.fn(),
@@ -167,6 +258,9 @@ function renderWithConnect(entry: MCPCatalogEntry) {
     connecting: false,
     connectError: null,
     credentialRequirement,
+    connectCapability: { ...ALLOWED, userId: identityKey ?? undefined },
+    policyPending: false,
+    policyPendingHint: POLICY_LOADING_HINT,
     onConnect,
   });
   const view = render(<CatalogDetailDrawer {...props(entry)} />);
@@ -180,12 +274,29 @@ function renderWithConnect(entry: MCPCatalogEntry) {
     /** What `CatalogTab` does after a refusal that named a requirement. */
     answerFromEndpoint: (requirement: MCPCatalogCredentialRequirement) =>
       view.rerender(<CatalogDetailDrawer {...props(entry, true, requirement)} />),
+    replaceIdentity: (identityKey: string) =>
+      view.rerender(<CatalogDetailDrawer {...props(entry, true, null, identityKey)} />),
   };
 }
 
 const keyField = () => screen.queryByPlaceholderText(/Paste your .* bearer access token/);
 
 describe('CatalogDetailDrawer API key', () => {
+  it('erases same-entry consent and the pasted key on same-role identity replacement', () => {
+    const { onConnect, replaceIdentity } = renderWithConnect(DATADOG);
+    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.change(keyField() as HTMLElement, { target: { value: 'admin-a-private-key' } });
+    expect(connectButton()).toBeEnabled();
+
+    replaceIdentity('user-admin-b');
+
+    expect(screen.getByRole('checkbox')).not.toBeChecked();
+    expect(keyField()).toHaveValue('');
+    expect(connectButton()).toBeDisabled();
+    fireEvent.click(connectButton());
+    expect(onConnect).not.toHaveBeenCalled();
+  });
+
   it('offers a key field for an entry that needs one, and gates connect on it', () => {
     renderWithConnect(DATADOG);
     fireEvent.click(screen.getByRole('checkbox'));

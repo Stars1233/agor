@@ -13,15 +13,18 @@ import type {
   MCPCatalogEntry,
 } from '@agor/core/types';
 import { readCredentialRequirement } from '@agor/core/types';
-import type { AgorClient } from '@agor-live/client';
-import { sessionPath } from '@agor-live/client';
+import type { AgorClient, User } from '@agor-live/client';
+import { hasMinimumRole, ROLES, sessionPath } from '@agor-live/client';
 import { Alert, Button, Col, Empty, Flex, Pagination, Row, Skeleton, theme } from 'antd';
 import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useAuthorityOperationGuard } from '@/hooks/useAuthorityOperationGuard';
+import { useMcpMemberPolicy } from '../../hooks/useMcpMemberPolicy';
 import { useAgorStore } from '../../store/agorStore';
 import { selectUserAuthenticatedMcpServerIds } from '../../store/selectors';
 import { mcpServerNeedsAuth } from '../../utils/mcpAuth';
 import { savePromptDraft } from '../../utils/promptDrafts';
+import { type MCPServerCapabilityContext, policyPendingState } from '../MCPServer/memberPolicy';
 import { CatalogCard } from './CatalogCard';
 import { CatalogDetailDrawer } from './CatalogDetailDrawer';
 import { CatalogToolbar } from './CatalogToolbar';
@@ -87,12 +90,23 @@ const CatalogGrid = memo<{
 
 export interface CatalogTabProps {
   client: AgorClient | null;
-  currentUserId?: string;
   /** The socket has connected and authenticated, so reads will be answered. */
   connected: boolean;
+  /** Disconnect grace or in-place token authentication is underway. */
+  connecting: boolean;
+  /** Successful socket-auth generation; stable client identity is insufficient. */
+  authGeneration: number;
+  /** Whose server-provided capability decides whether Connect is offered. */
+  currentUser?: User | null;
 }
 
-export const CatalogTab: React.FC<CatalogTabProps> = ({ client, connected, currentUserId }) => {
+const CatalogTabForIdentity: React.FC<CatalogTabProps> = ({
+  client,
+  connected,
+  connecting: connectionPending,
+  authGeneration,
+  currentUser,
+}) => {
   const { token } = theme.useToken();
   const navigate = useNavigate();
   // Same set the session panel reads, so "is this install finished?" is one
@@ -127,6 +141,46 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({ client, connected, curre
     loading: branchesLoading,
     error: branchesError,
   } = useConnectTargets(client, connected && selected !== null);
+  // `connected` deliberately stays true during disconnect grace, while a token
+  // replacement keeps the same client object. Neither may preserve an enabled
+  // action: capability reads are scoped to the authenticated generation and
+  // connectionReady closes synchronously for both transitions.
+  const connectionReady = connected && !connectionPending;
+  const memberPolicy = useMcpMemberPolicy(client, {
+    connectionReady,
+    currentUser,
+    authGeneration,
+  });
+  const { pending: policyPending, hint: policyPendingHint } = policyPendingState(memberPolicy);
+  const connectCapability = useMemo<MCPServerCapabilityContext>(
+    () => ({
+      role: currentUser?.role,
+      isAdmin: hasMinimumRole(currentUser?.role, ROLES.ADMIN),
+      connectionReady,
+      policy: memberPolicy.policy,
+      userId: currentUser?.user_id,
+      canConfigure: memberPolicy.canConfigure,
+    }),
+    [
+      connectionReady,
+      currentUser?.role,
+      currentUser?.user_id,
+      memberPolicy.policy,
+      memberPolicy.canConfigure,
+    ]
+  );
+  const operationGuard = useAuthorityOperationGuard(
+    connectionReady && currentUser?.user_id && currentUser.role && !policyPending
+      ? [
+          currentUser.user_id,
+          currentUser.role,
+          authGeneration,
+          client,
+          memberPolicy.policy,
+          memberPolicy.canConfigure,
+        ]
+      : null
+  );
 
   // Any narrowing invalidates the current offset — page 4 of an unfiltered
   // catalog is usually past the end of a filtered one.
@@ -184,7 +238,8 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({ client, connected, curre
       acknowledgedDisclosure: string;
       bearerToken?: string;
     }) => {
-      if (!selected || !client) return;
+      const operation = operationGuard.begin();
+      if (!selected || !client || !operation.isCurrent()) return;
       setConnecting(true);
       setConnectError(null);
       try {
@@ -199,7 +254,8 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({ client, connected, curre
           // empty arrived.
           ...(bearerToken ? { bearer_token: bearerToken } : {}),
         });
-        rememberConnectBranchId(branchId);
+        if (!operation.isCurrent()) return;
+        rememberConnectBranchId(currentUser?.user_id, branchId);
         // A starter prompt is written to exercise the server it ships with, so
         // it is only worth arming the composer with once that server can answer
         // it. A new OAuth install with no reusable grant lands without
@@ -212,11 +268,12 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({ client, connected, curre
           result.starter_prompt &&
           !mcpServerNeedsAuth(result.mcp_server, userAuthenticatedMcpServerIds)
         ) {
-          savePromptDraft(currentUserId, result.session.session_id, result.starter_prompt);
+          savePromptDraft(currentUser?.user_id, result.session.session_id, result.starter_prompt);
         }
         setSelected(null);
         navigate(sessionPath(result.session.session_id));
       } catch (err: unknown) {
+        if (!operation.isCurrent()) return;
         setConnectError(err instanceof Error ? err.message : 'Could not connect this server');
         // The catalog file is presentational; the endpoint decides. When those
         // disagree the daemon says so on the refusal, and taking it here is
@@ -227,10 +284,17 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({ client, connected, curre
         const requirement = readCredentialRequirement(err);
         if (requirement) setKeyRequirement(requirement);
       } finally {
-        setConnecting(false);
+        if (operation.isCurrent()) setConnecting(false);
       }
     },
-    [client, currentUserId, navigate, selected, userAuthenticatedMcpServerIds]
+    [
+      client,
+      currentUser?.user_id,
+      navigate,
+      operationGuard,
+      selected,
+      userAuthenticatedMcpServerIds,
+    ]
   );
 
   return (
@@ -309,18 +373,35 @@ export const CatalogTab: React.FC<CatalogTabProps> = ({ client, connected, curre
       )}
 
       <CatalogDetailDrawer
+        identityKey={currentUser?.user_id ?? null}
         entry={selected}
         open={selected !== null}
         onClose={closeDrawer}
         branches={branches}
         branchesLoading={branchesLoading}
         branchesError={branchesError}
-        defaultBranchId={getLastConnectBranchId()}
+        defaultBranchId={getLastConnectBranchId(currentUser?.user_id)}
         connecting={connecting}
         connectError={connectError}
         credentialRequirement={keyRequirement}
+        connectCapability={connectCapability}
+        policyPending={policyPending}
+        policyPendingHint={policyPendingHint}
         onConnect={handleConnect}
       />
     </Flex>
   );
 };
+
+/**
+ * The catalog grid itself is public workspace data, but its active drawer,
+ * refusal/error state, endpoint requirement, and in-flight interaction all
+ * belong to the authenticated caller. Replacing A with B remounts that state
+ * owner synchronously; same-user reconnects and token rotations retain it.
+ */
+export const CatalogTab: React.FC<CatalogTabProps> = (props) => (
+  <CatalogTabForIdentity
+    key={props.currentUser?.user_id ?? '__no-authenticated-user__'}
+    {...props}
+  />
+);

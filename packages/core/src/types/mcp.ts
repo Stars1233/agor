@@ -200,7 +200,48 @@ export const MCP_MEMBER_POLICIES = [
 
 export type MCPMemberPolicy = (typeof MCP_MEMBER_POLICIES)[number];
 
+export const MCP_OAUTH_BROWSER_OPERATIONS = ['discover', 'test-oauth'] as const;
+export type MCPOAuthBrowserOperation = (typeof MCP_OAUTH_BROWSER_OPERATIONS)[number];
+
+/**
+ * Request/response contract for a short-lived browser-event reservation.
+ *
+ * The request names only what the caller intends to do. The opaque token in
+ * the response is minted by the daemon and bound there to the authenticated
+ * tenant, caller, socket, operation and saved server (when present).
+ */
+export interface MCPOAuthBrowserReservationRequest {
+  operation: MCPOAuthBrowserOperation;
+  mcp_server_id?: MCPServerID;
+}
+
+export interface MCPOAuthBrowserReservation {
+  reservation_token: string;
+  expires_at: number;
+}
+
+/** One-shot reservation presented to blocking discovery/test. */
+export interface MCPOAuthBrowserEventRequest {
+  reservation_token: string;
+}
+
+export interface MCPOAuthOpenBrowserEvent extends MCPOAuthBrowserEventRequest {
+  authUrl: string;
+  attempt_id: MCPOAuthAttemptID;
+  caller_user_id: UserID;
+}
+
 export const DEFAULT_MCP_MEMBER_POLICY: MCPMemberPolicy = 'use_existing_only';
+
+/**
+ * Realtime invalidation emitted on the tenant-scoped `mcp-servers` service
+ * after an administrator changes the member policy.
+ *
+ * The event deliberately carries no policy value: `can_configure` is derived
+ * for the authenticated caller, so every browser must refetch its own answer
+ * from `mcp-member-policy` rather than accepting another caller's payload.
+ */
+export const MCP_MEMBER_POLICY_CHANGED_EVENT = 'member-policy:changed' as const;
 
 /**
  * The payload of the `mcp-member-policy` endpoint, read and written.

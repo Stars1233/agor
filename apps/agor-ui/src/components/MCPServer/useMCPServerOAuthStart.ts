@@ -1,6 +1,7 @@
 import type { MCPOAuthDCRDiagnostic, MCPOAuthStartFailure } from '@agor/core/types';
 import type { AgorClient } from '@agor-live/client';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useAuthorityOperationGuard } from '@/hooks/useAuthorityOperationGuard';
 import {
   oauthAttemptFailureMessage,
   refetchMCPOAuthDurableState,
@@ -21,20 +22,28 @@ interface OAuthStartSuccess {
 
 interface UseMCPServerOAuthStartOptions {
   client: AgorClient | null;
+  /** Opaque identity + role + successful-auth generation, null while disconnected. */
+  authorityKey: string | null;
   onPrepareOAuthStart: () => Promise<string | null>;
   onOAuthSucceeded?: () => void;
   showError: (message: string) => void;
   showInfo: (message: string) => void;
   showSuccess: (message: string) => void;
+  /** Current authority to persist/start this OAuth configuration. */
+  startAllowed?: boolean;
+  startBlockedReason?: string;
 }
 
 export function useMCPServerOAuthStart({
   client,
+  authorityKey,
   onPrepareOAuthStart,
   onOAuthSucceeded,
   showError,
   showInfo,
   showSuccess,
+  startAllowed = true,
+  startBlockedReason = 'You can no longer change this MCP server.',
 }: UseMCPServerOAuthStartOptions) {
   const [startingOAuthFlow, setStartingOAuthFlow] = useState(false);
   const [oauthFailure, setOauthFailure] = useState<MCPServerOAuthFailure | null>(null);
@@ -42,6 +51,15 @@ export function useMCPServerOAuthStart({
   const oauthStartInFlightRef = useRef(false);
   const oauthStartGenerationRef = useRef(0);
   const oauthCompletedCleanupRef = useRef<(() => void) | null>(null);
+  const startAllowedRef = useRef(startAllowed);
+  startAllowedRef.current = startAllowed;
+  const authorityKeyRef = useRef(authorityKey);
+  authorityKeyRef.current = authorityKey;
+  const clientRef = useRef(client);
+  clientRef.current = client;
+  const operationGuard = useAuthorityOperationGuard(
+    authorityKey && startAllowed ? [authorityKey, client, startAllowed] : null
+  );
 
   const invalidateOAuthStart = useCallback(() => {
     oauthStartGenerationRef.current += 1;
@@ -49,9 +67,24 @@ export function useMCPServerOAuthStart({
     oauthCompletedCleanupRef.current?.();
   }, []);
 
+  // A long-lived socket client can survive identity, role, and token
+  // replacement. Abort the previous wait on any authority/client transition;
+  // render-time refs below close the window before this passive cleanup runs.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: authority/client changes intentionally run cleanup
+  useEffect(
+    () => () => {
+      invalidateOAuthStart();
+    },
+    [authorityKey, client, invalidateOAuthStart]
+  );
+
   useEffect(() => {
-    return invalidateOAuthStart;
-  }, [invalidateOAuthStart]);
+    if (!startAllowed || !authorityKey || !client) {
+      invalidateOAuthStart();
+      setOauthCallbackModalVisible(false);
+      setStartingOAuthFlow(false);
+    }
+  }, [authorityKey, client, invalidateOAuthStart, startAllowed]);
 
   const clearOAuthFailure = useCallback(() => setOauthFailure(null), []);
 
@@ -67,10 +100,23 @@ export function useMCPServerOAuthStart({
       showError('Client not available');
       return;
     }
+    const startAuthorityKey = authorityKeyRef.current;
+    if (!startAllowedRef.current || !startAuthorityKey) {
+      showError(startBlockedReason);
+      return;
+    }
 
+    const startClient = client;
+    const authorityOperation = operationGuard.begin();
+    if (!authorityOperation.isCurrent()) return;
     oauthStartInFlightRef.current = true;
     const startGeneration = ++oauthStartGenerationRef.current;
-    const isCurrentStart = () => oauthStartGenerationRef.current === startGeneration;
+    const isCurrentStart = () =>
+      oauthStartGenerationRef.current === startGeneration &&
+      authorityOperation.isCurrent() &&
+      startAllowedRef.current &&
+      authorityKeyRef.current === startAuthorityKey &&
+      clientRef.current === startClient;
     setStartingOAuthFlow(true);
     setOauthFailure(null);
 
@@ -78,6 +124,10 @@ export function useMCPServerOAuthStart({
       const targetServerId = await onPrepareOAuthStart();
       if (!isCurrentStart()) return;
       if (!targetServerId) return;
+      if (!startAllowedRef.current) {
+        showError(startBlockedReason);
+        return;
+      }
 
       showInfo('Starting OAuth authentication flow...');
       if (!isCurrentStart()) return;
@@ -104,7 +154,7 @@ export function useMCPServerOAuthStart({
             if (!isCurrentStart()) return;
             if (attempt.status === 'succeeded') {
               try {
-                await refetchMCPOAuthDurableState(client, targetServerId);
+                await refetchMCPOAuthDurableState(client, targetServerId, isCurrentStart);
                 if (!isCurrentStart()) return;
               } catch {
                 if (isCurrentStart()) console.warn('[OAuth] Durable completion refetch failed');
@@ -151,7 +201,16 @@ export function useMCPServerOAuthStart({
         setStartingOAuthFlow(false);
       }
     }
-  }, [client, onOAuthSucceeded, onPrepareOAuthStart, showError, showInfo, showSuccess]);
+  }, [
+    client,
+    onOAuthSucceeded,
+    onPrepareOAuthStart,
+    operationGuard,
+    showError,
+    showInfo,
+    showSuccess,
+    startBlockedReason,
+  ]);
 
   return {
     cancelOAuthWait,

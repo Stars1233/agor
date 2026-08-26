@@ -63,7 +63,19 @@ export interface SafeOutboundFetchOptions extends Omit<RequestInit, 'redirect' |
   maxResponseBytes?: number;
   /** Exact localhost/loopback HTTP exception for standalone development. */
   allowLocalhostHttp?: boolean;
+  /**
+   * Optional caller-owned authority fence for credential-bearing requests.
+   * Checked around every physical dispatch, response/error, and redirect hop.
+   */
+  assertCurrent?: () => void;
+  /** Injectable DNS boundary for deterministic authority-race tests. */
+  resolveDns?: OutboundDnsLookup;
 }
+
+export type OutboundDnsLookup = (
+  hostname: string,
+  options: { all: true; verbatim: true }
+) => Promise<Array<{ address: string; family: number }>>;
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_TIMER_MS = 2_147_483_647;
@@ -150,14 +162,15 @@ function assertSafeParsedUrl(url: URL, allowLocalhostHttp: boolean): void {
 async function resolvePinnedAddress(
   url: URL,
   allowLocalhostHttp: boolean,
-  signal: AbortSignal
+  signal: AbortSignal,
+  resolveDns: OutboundDnsLookup
 ): Promise<{ address: string; family: 4 | 6 }> {
   throwIfAborted(signal);
   const hostname = normalizedHostname(url);
   const literalFamily = isIP(hostname);
   const addresses = literalFamily
     ? [{ address: hostname, family: literalFamily as 4 | 6 }]
-    : await withAbort(lookup(hostname, { all: true, verbatim: true }), signal);
+    : await withAbort(resolveDns(hostname, { all: true, verbatim: true }), signal);
   throwIfAborted(signal);
   if (addresses.length === 0) throw new UnsafeOutboundUrlError('OAuth destination did not resolve');
   for (const candidate of addresses) {
@@ -213,7 +226,12 @@ async function requestOnce(
 ): Promise<Response> {
   throwIfAborted(signal);
   assertSafeParsedUrl(url, options.allowLocalhostHttp === true);
-  const pinned = await resolvePinnedAddress(url, options.allowLocalhostHttp === true, signal);
+  const pinned = await resolvePinnedAddress(
+    url,
+    options.allowLocalhostHttp === true,
+    signal,
+    options.resolveDns ?? lookup
+  );
   const body = requestBody(options.body);
   const headers = new Headers(options.headers);
   if (body != null && !headers.has('content-length')) {
@@ -223,6 +241,10 @@ async function requestOnce(
   const maxBytes = options.maxResponseBytes ?? 1024 * 1024;
   const pinnedLookup = createPinnedLookup(pinned);
 
+  // DNS validation may itself have awaited. Re-ask immediately before opening
+  // the socket so a caller cannot lose authority during lookup and still send
+  // the captured headers/body.
+  options.assertCurrent?.();
   return new Promise<Response>((resolve, reject) => {
     let settled = false;
     let responseStream: http.IncomingMessage | undefined;
@@ -315,7 +337,20 @@ export async function safeOutboundFetch(
     const redirectMode = options.redirect ?? 'error';
     const maxRedirects = options.maxRedirects ?? 3;
     for (let hop = 0; ; hop += 1) {
-      const response = await requestOnce(url, options, deadline.signal);
+      // This assertion is intentionally per hop rather than only around the
+      // aggregate fetch. Redirect handling is an internal request loop, and
+      // each destination is a distinct external side effect.
+      options.assertCurrent?.();
+      let response: Response;
+      try {
+        response = await requestOnce(url, options, deadline.signal);
+      } catch (error) {
+        // Authority/expiry wins over a simultaneous network error and prevents
+        // callers from treating it as a retryable provider failure.
+        options.assertCurrent?.();
+        throw error;
+      }
+      options.assertCurrent?.();
       if (![301, 302, 303, 307, 308].includes(response.status)) return response;
       if (redirectMode !== 'follow' || hop >= maxRedirects) {
         throw new UnsafeOutboundUrlError('Outbound OAuth redirect is not allowed');

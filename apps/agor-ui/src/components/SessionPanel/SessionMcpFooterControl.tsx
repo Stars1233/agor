@@ -1,7 +1,11 @@
 import type { AgorClient, MCPServer } from '@agor-live/client';
+import { ROLES } from '@agor-live/client';
 import { ApiOutlined } from '@ant-design/icons';
 import { Tag as AntTag, Space, Typography, theme } from 'antd';
 import React from 'react';
+import { useConnectionState } from '@/contexts/ConnectionContext';
+import { useAuthorityOperationGuard } from '@/hooks/useAuthorityOperationGuard';
+import { usePermissions } from '@/hooks/usePermissions';
 import { mcpServerNeedsAuth } from '../../utils/mcpAuth';
 import { useThemedMessage } from '../../utils/message';
 import { updateSessionMcpServers } from '../../utils/sessionMcpServers';
@@ -12,14 +16,16 @@ import { Tag } from '../Tag';
 
 export interface SessionMcpFooterControlProps {
   client: AgorClient | null;
+  currentUserId?: string;
   sessionId: string;
   sessionMcpServerIds: string[];
   mcpServerById: Map<string, MCPServer>;
   userAuthenticatedMcpServerIds: Set<string>;
 }
 
-export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = ({
+const SessionMcpFooterControlForIdentity: React.FC<SessionMcpFooterControlProps> = ({
   client,
+  currentUserId,
   sessionId,
   sessionMcpServerIds,
   mcpServerById,
@@ -27,10 +33,45 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
 }) => {
   const { token } = theme.useToken();
   const { showSuccess, showError } = useThemedMessage();
+  const { hasRole, isAdmin, role } = usePermissions();
+  const { connected, connecting, authGeneration } = useConnectionState();
+  const connectionReady = connected && !connecting;
+  const identityRoleKey = currentUserId && role ? `${currentUserId}:${role}` : null;
+  const establishedAuthorityRef = React.useRef<{
+    client: AgorClient;
+    identityRoleKey: string;
+    authGeneration: number;
+  } | null>(null);
+  const establishedAuthority = establishedAuthorityRef.current;
+  const authorityMatchesEstablished =
+    !!establishedAuthority &&
+    establishedAuthority.client === client &&
+    establishedAuthority.identityRoleKey === identityRoleKey &&
+    authGeneration >= establishedAuthority.authGeneration;
+  const authorityHasNewAuthentication =
+    !establishedAuthority || authGeneration > establishedAuthority.authGeneration;
+  const callerAuthorityReady =
+    !!client &&
+    connectionReady &&
+    !!identityRoleKey &&
+    (authorityMatchesEstablished || authorityHasNewAuthentication);
+  React.useLayoutEffect(() => {
+    if (!callerAuthorityReady || !client || !identityRoleKey) return;
+    establishedAuthorityRef.current = { client, identityRoleKey, authGeneration };
+  }, [authGeneration, callerAuthorityReady, client, identityRoleKey]);
+  const oauthActionAllowed = callerAuthorityReady && hasRole(ROLES.MEMBER);
+  const durableAuthorityKey =
+    client && oauthActionAllowed && currentUserId && role
+      ? `${currentUserId}:${role}:${authGeneration}`
+      : null;
+  const editMutationAllowed = isAdmin && callerAuthorityReady;
   const [saving, setSaving] = React.useState(false);
   const [open, setOpen] = React.useState(false);
   const [editingServer, setEditingServer] = React.useState<MCPServer | null>(null);
   const [editModalOpen, setEditModalOpen] = React.useState(false);
+  const operationGuard = useAuthorityOperationGuard(
+    durableAuthorityKey ? [durableAuthorityKey, client, editMutationAllowed] : null
+  );
   const rootRef = React.useRef<HTMLDivElement>(null);
   const triggerRef = React.useRef<HTMLButtonElement>(null);
   const popupRef = React.useRef<HTMLDivElement>(null);
@@ -80,6 +121,17 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
     triggerRef.current?.focus();
   }, []);
 
+  React.useEffect(() => {
+    if (!editingServer) return;
+    const updatedServer = mcpServerById.get(editingServer.mcp_server_id);
+    if (!updatedServer) {
+      setEditModalOpen(false);
+      setEditingServer(null);
+    } else if (updatedServer !== editingServer) {
+      setEditingServer(updatedServer);
+    }
+  }, [editingServer, mcpServerById]);
+
   const summary = React.useMemo(
     () =>
       summarizeSessionMcpServers(sessionMcpServerIds, mcpServerById, userAuthenticatedMcpServerIds),
@@ -109,17 +161,20 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
   const badgeAccessibleName = `MCP servers. ${badgeTitle}`;
 
   const handleChange = async (nextIds: string[]) => {
-    if (!client) return;
+    const operation = operationGuard.begin();
+    if (!client || !operation.isCurrent()) return;
     setSaving(true);
     try {
       await updateSessionMcpServers(client, sessionId, sessionMcpServerIds, nextIds);
+      if (!operation.isCurrent()) return;
       showSuccess('Session MCP servers updated');
     } catch (err) {
+      if (!operation.isCurrent()) return;
       showError(
         `Failed to update MCP servers: ${err instanceof Error ? err.message : String(err)}`
       );
     } finally {
-      setSaving(false);
+      if (operation.isCurrent()) setSaving(false);
     }
   };
 
@@ -143,6 +198,13 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
                 server={server}
                 needsAuth={mcpServerNeedsAuth(server, userAuthenticatedMcpServerIds)}
                 client={client}
+                authorityKey={durableAuthorityKey}
+                actionAllowed={oauthActionAllowed}
+                actionBlockedReason={
+                  !connectionReady
+                    ? 'Reconnect to the Agor daemon before changing OAuth credentials.'
+                    : 'Your account can no longer change OAuth credentials.'
+                }
                 onEdit={handleEditServer}
               />
             ))}
@@ -266,6 +328,15 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
           server={editingServer}
           open={editModalOpen}
           client={client}
+          identityKey={currentUserId ?? null}
+          authGeneration={authGeneration}
+          authorityKey={durableAuthorityKey}
+          mutationAllowed={editMutationAllowed}
+          mutationBlockedReason={
+            !connected || connecting
+              ? 'Reconnect to the Agor daemon before changing this MCP server.'
+              : 'Your account can no longer change this MCP server.'
+          }
           onClose={() => setEditModalOpen(false)}
           afterClose={finishEditModalClose}
           focusTriggerAfterClose={false}
@@ -274,3 +345,16 @@ export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (
     </div>
   );
 };
+
+/**
+ * #2482 keeps the portaled editor owned outside the disclosure. Key that whole
+ * owner by identity rather than moving the modal back into the popup: A -> B
+ * closes and destroys both overlays and their form state, while same-user
+ * reconnects preserve the established lifecycle and focus behavior.
+ */
+export const SessionMcpFooterControl: React.FC<SessionMcpFooterControlProps> = (props) => (
+  <SessionMcpFooterControlForIdentity
+    key={props.currentUserId ?? '__no-authenticated-user__'}
+    {...props}
+  />
+);

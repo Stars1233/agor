@@ -19,7 +19,8 @@ import {
   Tooltip,
   Typography,
 } from 'antd';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
+import { useAuthorityOperationGuard } from '@/hooks/useAuthorityOperationGuard';
 import { useThemedMessage } from '@/utils/message';
 import { MCPOAuthRecoveryAlert } from './MCPOAuthRecoveryAlert';
 import { describeMissingForOAuth, missingMCPFieldLabels } from './mcp-form-requirements';
@@ -63,6 +64,8 @@ export interface MCPServerFormFieldsProps {
   onAuthTypeChange?: (authType: 'none' | 'bearer' | 'jwt' | 'oauth') => void;
   form: FormInstance;
   client: AgorClient | null;
+  /** Current identity/role/auth generation, null while authority is unavailable. */
+  authorityKey: string | null;
   serverId?: string;
   onTestConnection?: () => Promise<void>;
   testing?: boolean;
@@ -78,6 +81,9 @@ export interface MCPServerFormFieldsProps {
   } | null;
   /** Persist current settings and return the authoritative server ID before every OAuth start. */
   onPrepareOAuthStart: () => Promise<string | null>;
+  /** Whether persistent mutations/OAuth preparation remain authorized. */
+  mutationAllowed?: boolean;
+  mutationBlockedReason?: string;
   /**
    * Changes whenever the owner's form values do. The connection actions read
    * the form store directly, so they need a reason to re-render — see
@@ -110,11 +116,14 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
   onAuthTypeChange,
   form,
   client,
+  authorityKey,
   serverId,
   onTestConnection,
   testing = false,
   testResult,
   onPrepareOAuthStart,
+  mutationAllowed = true,
+  mutationBlockedReason = 'You can no longer change this MCP server.',
   // Consumed by re-rendering, not by reading — see `formRevision` above.
   formRevision: _formRevision,
   managedOAuthCompatibilityMode,
@@ -125,6 +134,10 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
   const [oauthAdvancedOpen, setOauthAdvancedOpen] = useState(false);
 
   const [disconnectingOAuth, setDisconnectingOAuth] = useState(false);
+  const oauthStartAllowed = mutationAllowed && authorityKey !== null;
+  const operationGuard = useAuthorityOperationGuard(
+    oauthStartAllowed ? [authorityKey, client, mutationAllowed] : null
+  );
 
   // `Start OAuth Flow` writes the server row before it redirects, so it needs
   // everything a save needs — not just the URL it puts in the request. Read
@@ -144,27 +157,15 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
     startingOAuthFlow,
   } = useMCPServerOAuthStart({
     client,
+    authorityKey,
     onPrepareOAuthStart,
     onOAuthSucceeded: () => setOauthBrowserFlowAvailable(false),
     showError,
     showInfo,
     showSuccess,
+    startAllowed: oauthStartAllowed,
+    startBlockedReason: mutationBlockedReason,
   });
-
-  useEffect(() => {
-    if (!client) return;
-    // Blocking discover/test endpoints cannot return the authorization URL
-    // before their callback. The daemon sends this compatibility hint only to
-    // this exact initiating socket; durable attempt/status refetch remains the
-    // completion authority.
-    const openBrowserForBlockingFlow = ({ authUrl }: { authUrl?: string }) => {
-      if (authUrl) window.open(authUrl, '_blank', 'noopener,noreferrer');
-    };
-    client.io.on('oauth:open_browser', openBrowserForBlockingFlow);
-    return () => {
-      client.io.off('oauth:open_browser', openBrowserForBlockingFlow);
-    };
-  }, [client]);
 
   // Watch advanced OAuth field values so we can show a "customized" dot on
   // the Advanced collapse header when any of them has a non-default value.
@@ -196,6 +197,12 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
     (typeof watchedDcrMode === 'string' && watchedDcrMode !== 'advertised');
 
   const handleDisconnectOAuth = async () => {
+    const operation = operationGuard.begin();
+    if (!operation.isCurrent()) return;
+    if (!mutationAllowed) {
+      showError(mutationBlockedReason);
+      return;
+    }
     if (!client) {
       showError('Client not available');
       return;
@@ -210,6 +217,7 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
       const data = (await client.service('mcp-servers/oauth-disconnect').create({
         mcp_server_id: serverId,
       })) as { success: boolean; message?: string; error?: string };
+      if (!operation.isCurrent()) return;
 
       if (data.success) {
         showSuccess(data.message || 'OAuth connection removed');
@@ -218,13 +226,16 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
         showError(data.error || 'Failed to disconnect OAuth');
       }
     } catch (error) {
+      if (!operation.isCurrent()) return;
       showError(`Disconnect error: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
-      setDisconnectingOAuth(false);
+      if (operation.isCurrent()) setDisconnectingOAuth(false);
     }
   };
 
   const handleTestAuth = async () => {
+    const operation = operationGuard.begin();
+    if (!operation.isCurrent()) return;
     if (!client) {
       showError('Client not available');
       return;
@@ -251,6 +262,7 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
           api_token: apiToken,
           api_secret: apiSecret,
         })) as { success: boolean; error?: string };
+        if (!operation.isCurrent()) return;
 
         if (data.success) {
           showSuccess('JWT authentication successful - token received');
@@ -284,6 +296,7 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
           hint?: string;
           debugInfo?: unknown;
         };
+        if (!operation.isCurrent()) return;
 
         if (data.success) {
           if (data.requiresBrowserFlow) {
@@ -323,10 +336,11 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
         showInfo('No authentication required - ready to use');
       }
     } catch (error) {
+      if (!operation.isCurrent()) return;
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       showError(`Connection test failed: ${errorMessage}`);
     } finally {
-      setTestingAuth(false);
+      if (operation.isCurrent()) setTestingAuth(false);
     }
   };
 
@@ -568,11 +582,17 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
             )}
             {authType === 'oauth' &&
               oauthBrowserFlowAvailable &&
-              (missingRequiredFields.length > 0 ? (
+              (!oauthStartAllowed || missingRequiredFields.length > 0 ? (
                 // Disabled rather than hidden: the user has already earned this
                 // button with a successful auth test, so it has to say what is
                 // still holding it back.
-                <Tooltip title={describeMissingForOAuth(missingRequiredFields)}>
+                <Tooltip
+                  title={
+                    !oauthStartAllowed
+                      ? mutationBlockedReason
+                      : describeMissingForOAuth(missingRequiredFields)
+                  }
+                >
                   <span>
                     <Button type="primary" disabled>
                       {oauthStartLabel}
@@ -589,6 +609,7 @@ export const MCPServerFormFields: React.FC<MCPServerFormFieldsProps> = ({
                 type="default"
                 danger
                 loading={disconnectingOAuth}
+                disabled={!mutationAllowed}
                 onClick={handleDisconnectOAuth}
               >
                 Disconnect OAuth
