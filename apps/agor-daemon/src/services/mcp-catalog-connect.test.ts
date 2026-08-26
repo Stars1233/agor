@@ -1145,6 +1145,7 @@ describe('mcp-catalog/connect — endpoints that sign the user in', () => {
 
       expect(result.reuse_kind).toBe('catalog_install');
       expect((patched.at(-1)!.data.auth as MCPAuth).oauth_compatibility_mode).toBe(mode);
+      expect(patched.at(-1)!.data.replace_auth).toBe(true);
       expect(result.mcp_server.auth?.oauth_compatibility_mode).toBe(mode);
       expect(result.effective_oauth_policy).toEqual({
         effective_mode: mode,
@@ -1208,6 +1209,7 @@ describe('mcp-catalog/connect — endpoints that sign the user in', () => {
         type: 'oauth',
         oauth_mode: 'per_user',
       });
+      expect(patched.at(-1)!.data.replace_auth).toBe(true);
     }
   );
 
@@ -2091,7 +2093,10 @@ describe('mcp-catalog/connect — reusing a key-bearing install', () => {
     const result = await createMCPCatalogConnectService(app).create(keyRequest, params);
 
     expect(patched).toEqual([
-      { id: 'server-existing', data: { auth: { type: 'bearer', token: NEW_KEY } } },
+      {
+        id: 'server-existing',
+        data: { auth: { type: 'bearer', token: NEW_KEY }, replace_auth: true },
+      },
     ]);
     expect(generationClaims).toEqual([{ ownerUserId: ALICE, catalogEntryName: LINEAR, value: 1 }]);
     expect(generationFinalizations).toEqual([
@@ -2125,7 +2130,10 @@ describe('mcp-catalog/connect — reusing a key-bearing install', () => {
     ]);
     expect(patched.at(-1)).toEqual({
       id: 'server-1',
-      data: { auth: { type: 'bearer', token: 'fake-new-key-2222' } },
+      data: {
+        auth: { type: 'bearer', token: 'fake-new-key-2222' },
+        replace_auth: true,
+      },
     });
   });
 
@@ -2217,7 +2225,10 @@ describe('mcp-catalog/connect — reusing a key-bearing install', () => {
     // fence. The important boundary is that Alice's new row, not Bob's
     // existing credential row, is the target.
     expect(patched).toEqual([
-      { id: 'server-1', data: { auth: { type: 'bearer', token: NEW_KEY } } },
+      {
+        id: 'server-1',
+        data: { auth: { type: 'bearer', token: NEW_KEY }, replace_auth: true },
+      },
     ]);
     expect(generationFinalizations).toEqual([
       { id: 'server-1', ownerUserId: ALICE, catalogEntryName: LINEAR, value: 1 },
@@ -2473,16 +2484,20 @@ describe('mcp-catalog/connect — what a failed connect leaves behind', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { app, created } = buildApp(CURATED);
     attachOf(app).create.mockRejectedValue(new Error('forbidden'));
-    sessionsOf(app).remove.mockRejectedValue(new Error('cleanup exploded'));
+    sessionsOf(app).remove.mockRejectedValue(
+      new Error('cleanup exploded SENTINEL_CATALOG_CLEANUP')
+    );
 
     await expect(createMCPCatalogConnectService(app).create(request, params)).rejects.toThrow(
       /forbidden/
     );
 
     expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining('Left session session-1 behind'),
-      expect.anything()
+      expect.stringContaining(
+        'compensation_failed resource=session session_id=session-1 category=unknown type=Error'
+      )
     );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('SENTINEL_CATALOG_CLEANUP');
     // Honest about the residual: the session really is still there.
     expect(created.sessions).toHaveLength(1);
     warn.mockRestore();

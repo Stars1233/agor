@@ -31,6 +31,7 @@ import type {
   MCPMemberPolicy,
   MCPServer,
   User,
+  UserID,
   UserRole,
 } from '@agor/core/types';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -79,7 +80,11 @@ const CONNECT_REQUEST = {
  * puts it there. That second claim is asserted separately at the bottom of
  * this file, against the production registration itself.
  */
-async function buildDaemon(policy: MCPMemberPolicy, role: UserRole = 'member') {
+async function buildDaemon(
+  policy: MCPMemberPolicy,
+  role: UserRole = 'member',
+  catalogEntry: MCPCatalogEntry = CURATED
+) {
   const rawDb = await createDatabaseAsync({ dialect: 'sqlite', url: ':memory:' });
   const db = rawDb as unknown as TenantScopeAwareDatabase;
   await runMigrations(rawDb);
@@ -97,7 +102,7 @@ async function buildDaemon(policy: MCPMemberPolicy, role: UserRole = 'member') {
   } as never);
   app.use('mcp-catalog', {
     async get() {
-      return CURATED;
+      return catalogEntry;
     },
   } as never);
   app.use('sessions', {
@@ -134,11 +139,14 @@ async function buildDaemon(policy: MCPMemberPolicy, role: UserRole = 'member') {
       paramsFor(caller, callerRole)
     );
   const connect = () => connectAs(user, role);
-  const installedServers = () => new MCPServerRepository(rawDb).findAll({});
+  const serverRepository = new MCPServerRepository(rawDb);
+  const installedServers = () => serverRepository.findAll({});
+  const seedServer = (server: Parameters<MCPServerRepository['create']>[0]) =>
+    serverRepository.create(server);
   const addUser = (email: string, addedRole: UserRole) =>
     users.create({ email, name: email, role: addedRole }) as Promise<User>;
 
-  return { user, connect, connectAs, addUser, installedServers };
+  return { user, connect, connectAs, addUser, installedServers, seedServer };
 }
 
 describe('marketplace install, as it lands in the database', () => {
@@ -240,6 +248,52 @@ describe('marketplace install, as it lands in the database', () => {
     expect(servers).toHaveLength(1);
     expect(servers[0]?.owner_user_id).toBe(user.user_id);
   });
+
+  it('authoritatively replaces stale same-type OAuth fields on a reused catalog install', async () => {
+    const oauthEntry = { ...CURATED, auth_type: 'oauth' } as MCPCatalogEntry;
+    const { user, connect, installedServers, seedServer } = await buildDaemon(
+      'allow_crud',
+      'member',
+      oauthEntry
+    );
+    await seedServer({
+      name: 'deepwiki',
+      display_name: 'DeepWiki',
+      transport: 'http',
+      url: CURATED.remote_url,
+      auth: {
+        type: 'oauth',
+        oauth_mode: 'per_user',
+        oauth_authorization_url: 'https://stale.example/authorize',
+        oauth_token_url: 'https://stale.example/token',
+        oauth_client_secret: 'stale-client-secret',
+        oauth_scope: 'stale:read stale:write',
+        // This is the one catalog reconciliation override the operator chose
+        // explicitly and is allowed to retain.
+        oauth_compatibility_mode: 'legacy',
+      },
+      scope: 'session',
+      source: 'catalog',
+      catalog_entry_name: DEEPWIKI,
+      owner_user_id: user.user_id as UserID,
+      enabled: true,
+    });
+    probeRemoteAuthType.mockResolvedValueOnce('oauth');
+
+    const result = (await connect()) as {
+      reused_existing_server: boolean;
+      mcp_server: MCPServer;
+    };
+
+    expect(result.reused_existing_server).toBe(true);
+    const [stored] = await installedServers();
+    expect(stored?.auth).toEqual({
+      type: 'oauth',
+      oauth_mode: 'per_user',
+      oauth_compatibility_mode: 'legacy',
+    });
+    expect(JSON.stringify(stored)).not.toContain('stale-client-secret');
+  });
 });
 
 /**
@@ -335,12 +389,27 @@ describe('the write hook this seam depends on', () => {
       name: 'Mallory',
       role: 'member',
     })) as User;
+    const patchTarget = await new MCPServerRepository(rawDb).create({
+      name: 'registered-hook-patch-target',
+      transport: 'http',
+      url: 'https://mcp.example.test',
+      scope: 'global',
+      owner_user_id: bob.user_id as UserID,
+      source: 'user',
+    });
 
     const registeredHooks = captureRegisteredMcpServerCreateHooks(db);
     const createAs = async (caller: User, data: Record<string, unknown>) => {
       const context = {
         method: 'create',
-        data,
+        data: {
+          name: 'registered-hook-test',
+          transport: 'http',
+          url: 'https://mcp.example.test',
+          scope: 'global',
+          enabled: true,
+          ...data,
+        },
         params: {
           provider: 'rest',
           user: { user_id: caller.user_id, role: 'member' },
@@ -353,7 +422,7 @@ describe('the write hook this seam depends on', () => {
     const patchAs = async (caller: User, data: Record<string, unknown>) => {
       const context = {
         method: 'patch',
-        id: '01900000-0000-7000-8000-000000000099',
+        id: patchTarget.mcp_server_id,
         data,
         params: {
           provider: 'rest',
@@ -388,7 +457,7 @@ describe('the write hook this seam depends on', () => {
   });
 
   it.each(['marketplace', 'future-mode'])(
-    'rejects public create and patch compatibility mode %s before authorization',
+    'rejects public create and patch compatibility mode %s at the authorized write boundary',
     async (mode) => {
       const { bob, createAs, patchAs } = await standUpDaemonHooks();
       const data = {
