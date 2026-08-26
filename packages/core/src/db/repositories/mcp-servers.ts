@@ -13,7 +13,7 @@ import type {
   UpdateMCPServerInput,
   UserID,
 } from '@agor/core/types';
-import { and, eq, isNull, like, or } from 'drizzle-orm';
+import { and, eq, isNull, like, or, sql } from 'drizzle-orm';
 import { generateId } from '../../lib/ids';
 import { restoreRedactedMCPAuthSecrets } from '../../tools/mcp/auth-secrets';
 import { restoreRedactedMCPEnvSecrets } from '../../tools/mcp/env-secrets';
@@ -26,6 +26,8 @@ import type { Database } from '../client';
 import {
   deleteFrom,
   insert,
+  isPostgresDatabase,
+  isSQLiteDatabase,
   lockRowForUpdate,
   runDatabaseTransaction,
   select,
@@ -169,13 +171,85 @@ export class MCPServerRepository
    */
   private async resolveId(id: string): Promise<string> {
     return resolveByShortIdPrefix(id, 'MCPServer', async (pattern) => {
-      const rows = await select(this.db)
+      const rows = await select(this.db, { mcp_server_id: mcpServers.mcp_server_id })
         .from(mcpServers)
         .where(like(mcpServers.mcp_server_id, pattern))
         .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
         .all();
       return rows.map((r: { mcp_server_id: string }) => r.mcp_server_id);
     });
+  }
+
+  /**
+   * Materialized columns sufficient for the daemon's write authorizer. This is
+   * intentionally not `findById`: deciding ownership/policy must not hydrate
+   * bearer tokens, OAuth client secrets, headers, or environment values.
+   */
+  async getWriteAuthorityProjection(
+    id: string
+  ): Promise<Pick<MCPServer, 'mcp_server_id' | 'owner_user_id' | 'transport' | 'scope'> | null> {
+    try {
+      const fullId = await this.resolveId(id);
+      const row = await select(this.db, {
+        mcp_server_id: mcpServers.mcp_server_id,
+        owner_user_id: mcpServers.owner_user_id,
+        transport: mcpServers.transport,
+        scope: mcpServers.scope,
+      })
+        .from(mcpServers)
+        .where(eq(mcpServers.mcp_server_id, fullId))
+        .one();
+      if (!row) return null;
+      return {
+        mcp_server_id: row.mcp_server_id as MCPServerID,
+        ...(row.owner_user_id ? { owner_user_id: row.owner_user_id as UserID } : {}),
+        transport: row.transport,
+        scope: row.scope,
+      };
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return null;
+      throw new RepositoryError(
+        `Failed to read MCP server write authority: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Transactional authority read. The row lock orders configuration changes
+   * (including HTTP→stdio, scope, and ownership) against the authorization
+   * decision and the narrow mutation that follows it.
+   */
+  async getWriteAuthorityProjectionForUpdate(
+    id: string
+  ): Promise<Pick<MCPServer, 'mcp_server_id' | 'owner_user_id' | 'transport' | 'scope'> | null> {
+    try {
+      const fullId = await this.resolveId(id);
+      const where = eq(mcpServers.mcp_server_id, fullId);
+      await lockRowForUpdate(this.db, this.db, mcpServers, where);
+      const row = await select(this.db, {
+        mcp_server_id: mcpServers.mcp_server_id,
+        owner_user_id: mcpServers.owner_user_id,
+        transport: mcpServers.transport,
+        scope: mcpServers.scope,
+      })
+        .from(mcpServers)
+        .where(where)
+        .one();
+      if (!row) return null;
+      return {
+        mcp_server_id: row.mcp_server_id as MCPServerID,
+        ...(row.owner_user_id ? { owner_user_id: row.owner_user_id as UserID } : {}),
+        transport: row.transport,
+        scope: row.scope,
+      };
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return null;
+      throw new RepositoryError(
+        `Failed to lock MCP server write authority: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
   }
 
   /**
@@ -301,51 +375,75 @@ export class MCPServerRepository
   async update(id: string, updates: UpdateMCPServerInput): Promise<MCPServer> {
     try {
       const fullId = await this.resolveId(id);
+      const mutate = () =>
+        runDatabaseTransaction(
+          this.db,
+          async (tx) => {
+            const where = eq(mcpServers.mcp_server_id, fullId);
+            await lockRowForUpdate(tx, this.db, mcpServers, where);
+            const row = await select(tx).from(mcpServers).where(where).one();
+            if (!row) throw new EntityNotFoundError('MCPServer', id);
+            const current = this.rowToMCPServer(row as MCPServerRow);
 
-      // Get current server to merge updates
-      const current = await this.findById(fullId);
-      if (!current) {
-        throw new EntityNotFoundError('MCPServer', id);
-      }
+            const merged = { ...current, ...updates };
+            if ('headers' in updates) {
+              merged.headers = restoreRedactedMCPCustomHeaders({
+                current: current.headers,
+                next: updates.headers,
+              });
+            }
+            if ('auth' in updates) {
+              merged.auth = restoreRedactedMCPAuthSecrets({
+                current: current.auth,
+                next: updates.auth,
+              });
+            }
+            if ('env' in updates) {
+              merged.env = restoreRedactedMCPEnvSecrets({
+                current: current.env,
+                next: updates.env,
+              });
+            }
+            const insertData = this.mcpServerToInsert(merged);
 
-      const merged = { ...current, ...updates };
-      if ('headers' in updates) {
-        merged.headers = restoreRedactedMCPCustomHeaders({
-          current: current.headers,
-          next: updates.headers,
-        });
-      }
-      if ('auth' in updates) {
-        merged.auth = restoreRedactedMCPAuthSecrets({
-          current: current.auth,
-          next: updates.auth,
-        });
-      }
-      if ('env' in updates) {
-        merged.env = restoreRedactedMCPEnvSecrets({
-          current: current.env,
-          next: updates.env,
-        });
-      }
-      const insertData = this.mcpServerToInsert(merged);
+            await update(tx, mcpServers)
+              .set({
+                enabled: insertData.enabled,
+                scope: insertData.scope,
+                transport: insertData.transport,
+                catalog_entry_name: insertData.catalog_entry_name,
+                updated_at: new Date(),
+                data: insertData.data,
+              })
+              .where(where)
+              .run();
 
-      await update(this.db, mcpServers)
-        .set({
-          enabled: insertData.enabled,
-          scope: insertData.scope,
-          transport: insertData.transport,
-          updated_at: new Date(),
-          data: insertData.data,
-        })
-        .where(eq(mcpServers.mcp_server_id, fullId))
-        .run();
+            const updated = await select(tx).from(mcpServers).where(where).one();
+            if (!updated) throw new RepositoryError('Failed to retrieve updated MCP server');
+            return this.rowToMCPServer(updated as MCPServerRow);
+          },
+          { sqliteImmediate: true }
+        );
 
-      const updated = await this.findById(fullId);
-      if (!updated) {
-        throw new RepositoryError('Failed to retrieve updated MCP server');
+      // This method is the whole-row merge used by discovery and ordinary
+      // patches. Retrying SQLite transaction admission lets it serialize with
+      // the one-tool JSON mutation rather than surfacing a transient busy
+      // error or falling back to the old read/overwrite race.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await mutate();
+        } catch (error) {
+          const text = error instanceof Error ? error.message : String(error);
+          if (
+            !isSQLiteDatabase(this.db) ||
+            !/SQLITE_BUSY|database is locked|database is busy/i.test(text) ||
+            attempt >= 9
+          ) {
+            throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, Math.min(5 * 2 ** attempt, 100)));
+        }
       }
-
-      return updated;
     } catch (error) {
       if (error instanceof RepositoryError) throw error;
       if (error instanceof EntityNotFoundError) throw error;
@@ -371,67 +469,90 @@ export class MCPServerRepository
   ): Promise<MCPServer | null> {
     const fullId = await this.resolveId(id);
     const key = MCPServerRepository.catalogConnectGenerationKey(ownerUserId, catalogEntryName);
-    return runDatabaseTransaction(
-      this.db,
-      async (tx) => {
-        const generationWhere = and(
-          eq(appVariables.namespace, MCPServerRepository.CATALOG_CONNECT_GENERATION_NAMESPACE),
-          eq(appVariables.key, key)
-        );
-        await lockRowForUpdate(tx, this.db, appVariables, generationWhere!);
-        const generationRow = await select(tx).from(appVariables).where(generationWhere).one();
-        if (Number(generationRow?.value_text) !== expectedGeneration) return null;
+    const mutate = () =>
+      runDatabaseTransaction(
+        this.db,
+        async (tx) => {
+          const generationWhere = and(
+            eq(appVariables.namespace, MCPServerRepository.CATALOG_CONNECT_GENERATION_NAMESPACE),
+            eq(appVariables.key, key)
+          );
+          await lockRowForUpdate(tx, this.db, appVariables, generationWhere!);
+          const generationRow = await select(tx).from(appVariables).where(generationWhere).one();
+          if (Number(generationRow?.value_text) !== expectedGeneration) return null;
 
-        await lockRowForUpdate(tx, this.db, mcpServers, eq(mcpServers.mcp_server_id, fullId));
-        const row = await select(tx)
-          .from(mcpServers)
-          .where(eq(mcpServers.mcp_server_id, fullId))
-          .one();
-        if (!row) throw new EntityNotFoundError('MCPServer', id);
-        const current = this.rowToMCPServer(row as MCPServerRow);
+          await lockRowForUpdate(tx, this.db, mcpServers, eq(mcpServers.mcp_server_id, fullId));
+          const row = await select(tx)
+            .from(mcpServers)
+            .where(eq(mcpServers.mcp_server_id, fullId))
+            .one();
+          if (!row) throw new EntityNotFoundError('MCPServer', id);
+          const current = this.rowToMCPServer(row as MCPServerRow);
+          if (
+            current.source !== 'catalog' ||
+            current.owner_user_id !== ownerUserId ||
+            current.catalog_entry_name !== catalogEntryName
+          ) {
+            throw new RepositoryError('Catalog connect generation does not match the install');
+          }
+          const merged = { ...current, ...updates };
+          if ('headers' in updates) {
+            merged.headers = restoreRedactedMCPCustomHeaders({
+              current: current.headers,
+              next: updates.headers,
+            });
+          }
+          if ('auth' in updates) {
+            merged.auth = restoreRedactedMCPAuthSecrets({
+              current: current.auth,
+              next: updates.auth,
+            });
+          }
+          if ('env' in updates) {
+            merged.env = restoreRedactedMCPEnvSecrets({ current: current.env, next: updates.env });
+          }
+          const insertData = this.mcpServerToInsert(merged);
+          await update(tx, mcpServers)
+            .set({
+              enabled: insertData.enabled,
+              scope: insertData.scope,
+              transport: insertData.transport,
+              catalog_entry_name: insertData.catalog_entry_name,
+              updated_at: new Date(),
+              data: insertData.data,
+            })
+            .where(eq(mcpServers.mcp_server_id, fullId))
+            .run();
+          const updated = await select(tx)
+            .from(mcpServers)
+            .where(eq(mcpServers.mcp_server_id, fullId))
+            .one();
+          if (!updated) throw new RepositoryError('Failed to retrieve updated MCP server');
+          return this.rowToMCPServer(updated as MCPServerRow);
+        },
+        { sqliteImmediate: true }
+      );
+
+    // A pair of first-connects deliberately contend on this transaction. On
+    // SQLite, BEGIN IMMEDIATE can report SQLITE_BUSY instead of honoring the
+    // configured busy timeout. Retry admission, then re-check the generation
+    // under the lock: the older request deterministically becomes `null`
+    // rather than leaking a storage-engine error through Connect.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await mutate();
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
         if (
-          current.source !== 'catalog' ||
-          current.owner_user_id !== ownerUserId ||
-          current.catalog_entry_name !== catalogEntryName
+          !isSQLiteDatabase(this.db) ||
+          !/SQLITE_BUSY|database is locked|database is busy/i.test(text) ||
+          attempt >= 9
         ) {
-          throw new RepositoryError('Catalog connect generation does not match the install');
+          throw error;
         }
-        const merged = { ...current, ...updates };
-        if ('headers' in updates) {
-          merged.headers = restoreRedactedMCPCustomHeaders({
-            current: current.headers,
-            next: updates.headers,
-          });
-        }
-        if ('auth' in updates) {
-          merged.auth = restoreRedactedMCPAuthSecrets({
-            current: current.auth,
-            next: updates.auth,
-          });
-        }
-        if ('env' in updates) {
-          merged.env = restoreRedactedMCPEnvSecrets({ current: current.env, next: updates.env });
-        }
-        const insertData = this.mcpServerToInsert(merged);
-        await update(tx, mcpServers)
-          .set({
-            enabled: insertData.enabled,
-            scope: insertData.scope,
-            transport: insertData.transport,
-            updated_at: new Date(),
-            data: insertData.data,
-          })
-          .where(eq(mcpServers.mcp_server_id, fullId))
-          .run();
-        const updated = await select(tx)
-          .from(mcpServers)
-          .where(eq(mcpServers.mcp_server_id, fullId))
-          .one();
-        if (!updated) throw new RepositoryError('Failed to retrieve updated MCP server');
-        return this.rowToMCPServer(updated as MCPServerRow);
-      },
-      { sqliteImmediate: true }
-    );
+        await new Promise((resolve) => setTimeout(resolve, Math.min(5 * 2 ** attempt, 100)));
+      }
+    }
   }
 
   /**
@@ -471,27 +592,36 @@ export class MCPServerRepository
    * reservation before the liveness read, so an attachment either commits
    * first and is observed or starts only after cleanup has completed.
    */
-  async deleteIfUnattached(id: string): Promise<boolean> {
+  async deleteIfUnattached(
+    id: string,
+    generation?: { ownerUserId: string; catalogEntryName: string; value: number }
+  ): Promise<boolean> {
     try {
       const fullId = await this.resolveId(id);
-      return await runDatabaseTransaction(
-        this.db,
-        async (tx) => {
-          await lockRowForUpdate(tx, this.db, mcpServers, eq(mcpServers.mcp_server_id, fullId));
-          const attachment = await select(tx)
-            .from(sessionMcpServers)
-            .where(eq(sessionMcpServers.mcp_server_id, fullId))
-            .limit(1)
-            .one();
-          if (attachment) return false;
-
-          const result = await deleteFrom(tx, mcpServers)
-            .where(eq(mcpServers.mcp_server_id, fullId))
-            .run();
-          return result.rowsAffected > 0;
-        },
-        { sqliteImmediate: true }
-      );
+      const mutate = () =>
+        runDatabaseTransaction(
+          this.db,
+          (tx) =>
+            new MCPServerRepository(tx).deleteIfUnattachedInCurrentTransaction(fullId, generation),
+          { sqliteImmediate: true }
+        );
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await mutate();
+        } catch (error) {
+          const text = error instanceof Error ? error.message : String(error);
+          if (
+            !isSQLiteDatabase(this.db) ||
+            !/SQLITE_BUSY|database is locked|database is busy/i.test(text) ||
+            attempt >= 9
+          ) {
+            throw error;
+          }
+          // Re-running the transaction is safe: the attachment liveness and
+          // optional connect generation are both re-read after admission.
+          await new Promise((resolve) => setTimeout(resolve, Math.min(5 * 2 ** attempt, 100)));
+        }
+      }
     } catch (error) {
       if (error instanceof EntityNotFoundError) return false;
       throw new RepositoryError(
@@ -499,6 +629,184 @@ export class MCPServerRepository
         error
       );
     }
+  }
+
+  /**
+   * Transaction-body variant used when caller authority and this mutation are
+   * one atomic unit. It deliberately opens no nested transaction, which keeps
+   * libsql `:memory:` and runtime SQLite on the same transaction connection.
+   */
+  async deleteIfUnattachedInCurrentTransaction(
+    id: string,
+    generation?: { ownerUserId: string; catalogEntryName: string; value: number }
+  ): Promise<boolean> {
+    const fullId = await this.resolveId(id);
+    if (generation) {
+      const generationWhere = and(
+        eq(appVariables.namespace, MCPServerRepository.CATALOG_CONNECT_GENERATION_NAMESPACE),
+        eq(
+          appVariables.key,
+          MCPServerRepository.catalogConnectGenerationKey(
+            generation.ownerUserId,
+            generation.catalogEntryName
+          )
+        )
+      );
+      await lockRowForUpdate(this.db, this.db, appVariables, generationWhere!);
+      const generationRow = await select(this.db).from(appVariables).where(generationWhere).one();
+      if (Number(generationRow?.value_text) !== generation.value) return false;
+    }
+    const where = eq(mcpServers.mcp_server_id, fullId);
+    await lockRowForUpdate(this.db, this.db, mcpServers, where);
+    const attachment = await select(this.db)
+      .from(sessionMcpServers)
+      .where(eq(sessionMcpServers.mcp_server_id, fullId))
+      .limit(1)
+      .one();
+    if (attachment) return false;
+    const result = await deleteFrom(this.db, mcpServers).where(where).run();
+    return result.rowsAffected > 0;
+  }
+
+  /** Materialized-column ownership read; never loads the secret-bearing JSON blob. */
+  async isOwnedBy(id: string, ownerUserId: UserID): Promise<boolean> {
+    try {
+      const fullId = await this.resolveId(id);
+      const row = await select(this.db, { id: mcpServers.mcp_server_id })
+        .from(mcpServers)
+        .where(and(eq(mcpServers.mcp_server_id, fullId), eq(mcpServers.owner_user_id, ownerUserId)))
+        .one();
+      return Boolean(row);
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return false;
+      throw new RepositoryError(
+        `Failed to check MCP server ownership: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Atomically change exactly one tool policy after an authoritative service
+   * has decided who may mutate the row.
+   *
+   * Discovery and ordinary patches take the same row lock, so neither can
+   * overwrite a concurrent per-tool decision with a stale whole JSON object.
+   * The SQL expression edits only `tool_permissions[toolName]`; undiscovered
+   * rules, explicit Ask rules, and another concurrent toggle remain intact.
+   */
+  async setToolEnabled(
+    id: string,
+    toolName: string,
+    enabled: boolean,
+    ownerUserId?: UserID
+  ): Promise<boolean> {
+    try {
+      const fullId = await this.resolveId(id);
+      const mutate = () =>
+        runDatabaseTransaction(
+          this.db,
+          (tx) =>
+            new MCPServerRepository(tx).setToolEnabledInCurrentTransaction(
+              fullId,
+              toolName,
+              enabled,
+              ownerUserId
+            ),
+          { sqliteImmediate: true }
+        );
+      // libsql can reject one of two simultaneous BEGIN IMMEDIATE calls
+      // before its configured busy timeout takes effect. Retry only that
+      // transient admission failure; the SQL mutation remains one atomic unit.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await mutate();
+        } catch (error) {
+          const text = error instanceof Error ? error.message : String(error);
+          if (
+            !isSQLiteDatabase(this.db) ||
+            !/SQLITE_BUSY|database is locked|database is busy/i.test(text) ||
+            attempt >= 9
+          ) {
+            throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, Math.min(5 * 2 ** attempt, 100)));
+        }
+      }
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return false;
+      throw new RepositoryError(
+        `Failed to change MCP tool permission: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /** No nested transaction; see {@link deleteIfUnattachedInCurrentTransaction}. */
+  async setToolEnabledInCurrentTransaction(
+    id: string,
+    toolName: string,
+    enabled: boolean,
+    ownerUserId?: UserID
+  ): Promise<boolean> {
+    const fullId = await this.resolveId(id);
+    const target = ownerUserId
+      ? and(eq(mcpServers.mcp_server_id, fullId), eq(mcpServers.owner_user_id, ownerUserId))!
+      : eq(mcpServers.mcp_server_id, fullId);
+    await lockRowForUpdate(this.db, this.db, mcpServers, target);
+
+    const sqlitePath = `$."tool_permissions"."${toolName
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')}"`;
+    const nextData = isPostgresDatabase(this.db)
+      ? enabled
+        ? sql`jsonb_set(${mcpServers.data}, '{tool_permissions}'::text[], coalesce(${mcpServers.data}->'tool_permissions', '{}'::jsonb) - ${toolName}::text, true)`
+        : sql`jsonb_set(${mcpServers.data}, '{tool_permissions}'::text[], coalesce(${mcpServers.data}->'tool_permissions', '{}'::jsonb) || jsonb_build_object(${toolName}::text, 'deny'), true)`
+      : enabled
+        ? sql`json_remove(${mcpServers.data}, ${sqlitePath})`
+        : sql`json_set(${mcpServers.data}, ${sqlitePath}, ${'deny'})`;
+    const result = await update(this.db, mcpServers)
+      .set({ data: nextData, updated_at: new Date() })
+      .where(target)
+      .run();
+    return result.rowsAffected > 0;
+  }
+
+  /**
+   * Persist exactly the three provider-reported capability lists.
+   *
+   * The caller must already hold the server row lock and must have rechecked
+   * its discovery configuration. Editing the JSON expression in place avoids
+   * replacing auth, endpoint configuration, or a concurrent per-tool rule
+   * with an object captured before the network request.
+   */
+  async setDiscoveredCapabilitiesInCurrentTransaction(
+    id: string,
+    capabilities: Pick<MCPServer, 'tools' | 'resources' | 'prompts'>
+  ): Promise<boolean> {
+    const fullId = await this.resolveId(id);
+    const where = eq(mcpServers.mcp_server_id, fullId);
+    const toolsJson = JSON.stringify(capabilities.tools ?? []);
+    const resourcesJson = JSON.stringify(capabilities.resources ?? []);
+    const promptsJson = JSON.stringify(capabilities.prompts ?? []);
+    const nextData = isPostgresDatabase(this.db)
+      ? sql`jsonb_set(jsonb_set(jsonb_set(${mcpServers.data}, '{tools}'::text[], ${toolsJson}::jsonb, true), '{resources}'::text[], ${resourcesJson}::jsonb, true), '{prompts}'::text[], ${promptsJson}::jsonb, true)`
+      : sql`json_set(${mcpServers.data}, '$.tools', json(${toolsJson}), '$.resources', json(${resourcesJson}), '$.prompts', json(${promptsJson}))`;
+    const result = await update(this.db, mcpServers)
+      .set({ data: nextData, updated_at: new Date() })
+      .where(where)
+      .run();
+    return result.rowsAffected > 0;
+  }
+
+  /** Backwards-compatible owner-CAS primitive for trusted repository callers. */
+  async setOwnedToolEnabled(
+    id: string,
+    ownerUserId: UserID,
+    toolName: string,
+    enabled: boolean
+  ): Promise<boolean> {
+    return this.setToolEnabled(id, toolName, enabled, ownerUserId);
   }
 
   /**

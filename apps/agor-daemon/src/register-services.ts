@@ -32,12 +32,15 @@ import {
   getCurrentTenantId,
   inArray,
   isPostgresDatabaseHandle,
+  MCPCatalogCandidateRepository,
+  MCPMarketplaceRepository,
   type MCPOAuthPendingFlowRecord,
   MCPServerRepository,
   mcpServers,
   RepoRepository,
   runWithoutTenantDatabaseScope,
   runWithTenantDatabaseScope,
+  runWithTenantDatabaseTransaction,
   type SaveTokenInput,
   SessionMCPServerRepository,
   SessionRepository,
@@ -53,7 +56,7 @@ import {
   visibleSessionReferenceAccessExists,
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import { BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
+import { BadRequest, Conflict, Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import type {
   OAuthFlowContext,
   OAuthTokenResponse,
@@ -157,6 +160,7 @@ import { registerGitHubAppSetupRoutes } from './services/github-app-setup.js';
 import {
   createGroupMembershipsService,
   createGroupsService,
+  GROUP_MEMBERSHIPS_SERVICE_TRANSPORT_METHODS,
   GROUPS_SERVICE_TRANSPORT_METHODS,
   setupBoardAlignedBranchesService,
   setupBoardGroupGrantsService,
@@ -178,6 +182,12 @@ import { createKnowledgeSettingsService } from './services/knowledge-settings.js
 import { createKnowledgeVersionsService } from './services/knowledge-versions.js';
 import { createLeaderboardService } from './services/leaderboard.js';
 import { createMCPCatalogService } from './services/mcp-catalog.js';
+import { MCPCatalogReadinessService } from './services/mcp-catalog-readiness.js';
+import { MCPMarketplaceService } from './services/mcp-marketplace.js';
+import {
+  MCPMarketplaceRemoveServerService,
+  MCPMarketplaceToolPermissionService,
+} from './services/mcp-marketplace-actions.js';
 import {
   logMCPOAuthCompatibilityPolicy,
   resolveMCPOAuthCompatibilityPolicy,
@@ -224,8 +234,15 @@ import { appendSystemMessage } from './utils/append-system-message.js';
 import { requireMinimumRole } from './utils/authorization.js';
 import { emitServiceEvent } from './utils/emit-service-event.js';
 import { renderOAuthResultPage } from './utils/html.js';
+import { emitMarketplaceInvalidation } from './utils/marketplace-invalidation.js';
 import { createAuthorityGuardedMCPFetch } from './utils/mcp-authority-fetch.js';
-import { persistDiscoveredMCPCapabilities } from './utils/mcp-discovered-capabilities.js';
+import {
+  bindMCPDiscoveryOAuthGrant,
+  bindMCPDiscoveryResolvedConfiguration,
+  captureMCPDiscoveryAuthority,
+  type MCPDiscoveryAuthoritySnapshot,
+  persistDiscoveredMCPCapabilities,
+} from './utils/mcp-discovered-capabilities.js';
 import {
   shouldExposeMCPServerSecrets,
   shouldExposeMCPServerSecretsForSessionToken,
@@ -553,7 +570,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     methods: [...GROUPS_SERVICE_TRANSPORT_METHODS],
   });
   app.use('/group-memberships', createGroupMembershipsService(db), {
-    methods: ['find', 'create', 'remove'],
+    methods: [...GROUP_MEMBERSHIPS_SERVICE_TRANSPORT_METHODS],
   });
   setupBranchEffectiveAccessService(app, new BranchRepository(db));
   setupBoardAlignedBranchesService(app, new BranchRepository(db));
@@ -3135,6 +3152,50 @@ export async function registerMCPServices(
   // Read-only marketplace browse surface. Only find/get are exposed; the
   // catalog is a file in this repository and has no writers at runtime.
   app.use('/mcp-catalog', createMCPCatalogService(), { methods: ['find', 'get'] });
+  app.use(
+    '/mcp-catalog/readiness',
+    new MCPCatalogReadinessService(app, {
+      listCandidates: (userId) => new MCPCatalogCandidateRepository(db).listForUser(userId),
+      // Readiness is advisory and may not open credential material merely to
+      // draw a button. Normal configuration writes revoke bound grants; this
+      // ID/boolean projection is enough to predict reuse. Connect separately
+      // re-reads and verifies the full HMAC at its final authority boundary.
+      isGrantAuthorized: async (candidate) => candidate.grant?.binding_ready === true,
+    }),
+    { methods: ['get'] }
+  );
+  app.use('/mcp-marketplace', new MCPMarketplaceService(new MCPMarketplaceRepository(db)), {
+    methods: ['find'],
+  });
+  app.use(
+    '/mcp-marketplace/remove-unattached',
+    new MCPMarketplaceRemoveServerService(db, (userIds, params) =>
+      emitMarketplaceInvalidation(app, params.tenant?.tenant_id, userIds)
+    ),
+    { methods: ['create'] }
+  );
+  app.use(
+    '/mcp-marketplace/tool-permission',
+    new MCPMarketplaceToolPermissionService(db, (userIds, params) =>
+      emitMarketplaceInvalidation(app, params.tenant?.tenant_id, userIds)
+    ),
+    { methods: ['create'] }
+  );
+  // Action replies are private acknowledgements. These services mutate through
+  // repository transactions, so they explicitly emit the user-targeted empty
+  // Marketplace invalidation rather than pretending the ordinary MCP CRUD
+  // service emitted a lifecycle event.
+  for (const path of [
+    'mcp-marketplace/remove-unattached',
+    'mcp-marketplace/tool-permission',
+  ] as const) {
+    // Feathers services have `publish` once a realtime provider is configured.
+    // Narrow service-only harnesses intentionally omit that provider.
+    const action = app.service(path) as unknown as {
+      publish?: (publisher: () => never[]) => void;
+    };
+    action.publish?.(() => []);
+  }
 
   // JWT test endpoint
   app.use('/mcp-servers/test-jwt', {
@@ -4750,6 +4811,7 @@ export async function registerMCPServices(
         };
         let serverId: string | undefined;
         let authoritativeServer: MCPServer | undefined;
+        let discoveryAuthority: MCPDiscoveryAuthoritySnapshot | undefined;
 
         if (hasInlineConfig) {
           if (!isTemplated(data.url!)) {
@@ -4842,6 +4904,21 @@ export async function registerMCPServices(
         if (!userId) {
           throw new NotAuthenticated('MCP discover requires an authenticated user');
         }
+        if (serverId && authoritativeServer) {
+          // Capture the exact authority/configuration used by this probe before
+          // the first provider-controlled await. Persistence re-locks and
+          // compares it after discovery; the request never carries this stamp.
+          discoveryAuthority = await runWithinOAuthAuthority(assertCurrentRequestAuthority, () =>
+            runWithTenantDatabaseScope(db, tenantId, (scopedDb) =>
+              captureMCPDiscoveryAuthority(
+                scopedDb,
+                tenantId,
+                userId,
+                authoritativeServer as MCPServer
+              )
+            )
+          );
+        }
 
         const { resolveUserEnvironment } = await import('@agor/core/config');
         const { resolveProbeServerTemplates } = await import('./utils/mcp-probe-templates.js');
@@ -4876,6 +4953,18 @@ export async function registerMCPServices(
           const recheck = validateUrl(resolution.resolved.url);
           if (!recheck.valid) return { success: false, error: recheck.error };
           serverConfig.url = resolution.resolved.url;
+        }
+        if (discoveryAuthority) {
+          discoveryAuthority = bindMCPDiscoveryResolvedConfiguration(
+            discoveryAuthority,
+            {
+              url: resolution.resolved.url,
+              transport: resolution.resolved.transport,
+              auth: resolution.resolved.auth,
+              headers: resolution.resolved.headers,
+            },
+            process.env.AGOR_MASTER_SECRET ?? ''
+          );
         }
 
         console.log('[MCP Discovery] Starting test for:', serverConfig.name || 'inline-config');
@@ -4979,6 +5068,28 @@ export async function registerMCPServices(
             // The callback durably persisted the token row. The access token
             // is returned only to this in-flight request and is never cached
             // in an origin-only process namespace.
+            if (serverId && discoveryAuthority) {
+              const grantSubject =
+                (serverConfig.auth?.oauth_mode ?? 'per_user') === 'shared' ? null : userId;
+              const persistedGrant = await runWithTenantDatabaseScope(db, tenantId, (scopedDb) =>
+                new UserMCPOAuthTokenRepository(scopedDb, process.env.AGOR_MASTER_SECRET).getToken(
+                  grantSubject,
+                  serverId as MCPServerID
+                )
+              );
+              if (
+                !persistedGrant ||
+                persistedGrant.oauth_access_token !== tokenResponse.access_token
+              ) {
+                throw new Conflict('OAuth authorization changed during MCP discovery. Retry.');
+              }
+              discoveryAuthority = bindMCPDiscoveryOAuthGrant(
+                discoveryAuthority,
+                grantSubject,
+                persistedGrant,
+                process.env.AGOR_MASTER_SECRET ?? ''
+              );
+            }
             return tokenResponse.access_token;
           } catch (error) {
             // A provider/DB rejection is allowed to degrade to "no fresh
@@ -4991,7 +5102,7 @@ export async function registerMCPServices(
             // surface it to the caller instead of silently falling through to
             // an unauthenticated MCP probe.
             if (error instanceof PublicBaseUrlNotConfiguredError) throw error;
-            if (error instanceof Forbidden) throw error;
+            if (error instanceof Forbidden || error instanceof Conflict) throw error;
             console.error(
               `[MCP Discovery] OAuth token acquisition failed category=${
                 error instanceof Error ? error.name : 'unknown'
@@ -5005,14 +5116,12 @@ export async function registerMCPServices(
           // Durable token rows are the only daemon authority. The old cache
           // keyed solely by MCP origin could cross tenant/server/user grants.
           let oauthToken: string | undefined;
+          let selectedGrant: UserMCPOAuthToken | undefined;
+          const lookupUserId = serverConfig.auth?.oauth_mode === 'shared' ? null : userId;
           if (serverId) {
-            oauthToken = await runWithinOAuthBrowserReservation(browserReservation, () =>
-              runInOAuthTenantScope(db, tenantId, async () => {
-                const tokenRepo = new UserMCPOAuthTokenRepository(db);
-                const lookupUserId =
-                  serverConfig.auth?.oauth_mode === 'shared'
-                    ? null
-                    : ((params?.user?.user_id as UserID | undefined) ?? null);
+            selectedGrant = await runWithinOAuthBrowserReservation(browserReservation, () =>
+              runWithTenantDatabaseScope(db, tenantId, async (scopedDb) => {
+                const tokenRepo = new UserMCPOAuthTokenRepository(scopedDb);
                 const grant = await runWithinOAuthBrowserReservation(browserReservation, () =>
                   tokenRepo.getToken(lookupUserId, serverId as MCPServerID)
                 );
@@ -5053,9 +5162,18 @@ export async function registerMCPServices(
                 if (grant.oauth_token_expires_at && grant.oauth_token_expires_at <= new Date()) {
                   return undefined;
                 }
-                return grant.oauth_access_token;
+                return grant;
               })
             );
+            oauthToken = selectedGrant?.oauth_access_token;
+            if (selectedGrant && discoveryAuthority) {
+              discoveryAuthority = bindMCPDiscoveryOAuthGrant(
+                discoveryAuthority,
+                lookupUserId,
+                selectedGrant,
+                process.env.AGOR_MASTER_SECRET ?? ''
+              );
+            }
           }
           if (!oauthToken) {
             const freshToken = await probeAndAcquireOAuthToken(serverConfig.url);
@@ -5176,29 +5294,46 @@ export async function registerMCPServices(
             listTimeout,
           ])) as PromptsResult;
 
-          if (serverId) {
+          if (serverId && discoveryAuthority) {
             await runWithinOAuthAuthority(assertCurrentRequestAuthority, () =>
-              persistDiscoveredMCPCapabilities(db, tenantId, serverId as MCPServerID, {
-                tools: toolsResult.tools.map((t) => ({
-                  name: t.name,
-                  description: t.description || '',
-                  input_schema: t.inputSchema,
-                })),
-                resources: resourcesResult.resources.map((r) => ({
-                  uri: r.uri,
-                  name: r.name,
-                  mimeType: r.mimeType,
-                })),
-                prompts: promptsResult.prompts.map((p) => ({
-                  name: p.name,
-                  description: p.description || '',
-                  arguments: p.arguments?.map((a) => ({
-                    name: a.name,
-                    description: a.description || '',
-                    required: a.required,
-                  })),
-                })),
-              })
+              runWithTenantDatabaseTransaction(db, tenantId, (scopedDb) =>
+                persistDiscoveredMCPCapabilities(
+                  scopedDb,
+                  tenantId,
+                  discoveryAuthority as MCPDiscoveryAuthoritySnapshot,
+                  {
+                    tools: toolsResult.tools.map((t) => ({
+                      name: t.name,
+                      description: t.description || '',
+                      input_schema: t.inputSchema,
+                    })),
+                    resources: resourcesResult.resources.map((r) => ({
+                      uri: r.uri,
+                      name: r.name,
+                      mimeType: r.mimeType,
+                    })),
+                    prompts: promptsResult.prompts.map((p) => ({
+                      name: p.name,
+                      description: p.description || '',
+                      arguments: p.arguments?.map((a) => ({
+                        name: a.name,
+                        description: a.description || '',
+                        required: a.required,
+                      })),
+                    })),
+                  },
+                  process.env.AGOR_MASTER_SECRET ?? ''
+                )
+              )
+            );
+            // Discovery writes through a short repository transaction rather
+            // than the generic MCP service. Refresh every device belonging to
+            // the actor and durable owner with the same empty, tenant-targeted
+            // control event used by Marketplace actions.
+            emitMarketplaceInvalidation(
+              app,
+              tenantId,
+              [userId, authoritativeServer?.owner_user_id].filter(Boolean) as UserID[]
             );
           }
 

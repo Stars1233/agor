@@ -285,6 +285,22 @@ export const REALTIME_PUBLISH_POLICY = {
     why: 'Returns { mcp_server, session } where an api-key entry carries a credential belonging to the caller. This is the leak that motivated the allowlist.',
   },
   'mcp-catalog': { audience: 'none', why: 'find/get only — a static curated catalog, no events.' },
+  'mcp-catalog/readiness': {
+    audience: 'none',
+    why: 'Caller-scoped advisory read with no mutations or events.',
+  },
+  'mcp-marketplace': {
+    audience: 'none',
+    why: 'Caller-private overview returned only to the requesting connection.',
+  },
+  'mcp-marketplace/remove-unattached': {
+    audience: 'none',
+    why: 'Caller-private acknowledgement; an explicit empty user-room invalidation refreshes every owner device.',
+  },
+  'mcp-marketplace/tool-permission': {
+    audience: 'none',
+    why: 'Caller-private acknowledgement; an explicit empty user-room invalidation refreshes every affected owner/admin device.',
+  },
   'mcp-member-policy': { audience: 'none', why: 'Policy read for the caller.' },
 
   // ---------------------------------------------------------------------------

@@ -3,7 +3,8 @@ import type { AgorClient, User } from '@agor-live/client';
 import { sessionPath } from '@agor-live/client';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { consumeMarketplacePromptSuggestion } from '../../utils/marketplaceOAuthPrompt';
 import { getPromptDraft } from '../../utils/promptDrafts';
 import { CatalogTab } from './CatalogTab';
 
@@ -46,6 +47,7 @@ const LINEAR = {
   name: 'app.linear/linear',
   title: 'Linear',
   permission_disclosure: 'Reads and writes issues in the Linear workspaces you authorise.',
+  auth_type: 'oauth',
 };
 
 /**
@@ -59,6 +61,8 @@ let catalogReads: Array<Record<string, unknown> | undefined>;
 let catalogRows: (typeof DEEPWIKI)[];
 let connectCalls: Array<Record<string, unknown>>;
 let connectImpl: (data: Record<string, unknown>) => Promise<unknown>;
+let oauthStartCalls: Array<Record<string, unknown>>;
+let oauthStartImpl: (data: Record<string, unknown>) => Promise<unknown>;
 let catalogFindError: Error | null;
 let memberPolicyAnswer: {
   policy: 'use_existing_only' | 'allow_private_only' | 'allow_crud';
@@ -97,15 +101,34 @@ function makeClient(): AgorClient {
         },
       };
     }
+    if (path === 'mcp-catalog/readiness') {
+      return {
+        get: async (catalogKey: string) => ({
+          catalog_key: catalogKey,
+          state:
+            catalogRows.find((entry) => entry.name === catalogKey)?.auth_type === 'oauth'
+              ? 'oauth_required'
+              : 'no_auth',
+        }),
+      };
+    }
     if (path === 'mcp-member-policy') {
       return { find: async () => memberPolicyAnswer };
     }
+    if (path === 'mcp-servers/oauth-start') {
+      return {
+        create: async (data: Record<string, unknown>) => {
+          oauthStartCalls.push(data);
+          return oauthStartImpl(data);
+        },
+      };
+    }
     if (path === 'mcp-servers') {
-      return { on: vi.fn(), removeListener: vi.fn() };
+      return { on: vi.fn(), off: vi.fn(), removeListener: vi.fn() };
     }
     throw new Error(`unexpected service: ${path}`);
   };
-  return { service } as unknown as AgorClient;
+  return { service, io: { on: vi.fn(), off: vi.fn() } } as unknown as AgorClient;
 }
 
 function renderTab({
@@ -159,11 +182,24 @@ async function findDrawer() {
   return within(screen.getByRole('dialog'));
 }
 
+function chooseSelectOption(inputLabel: string, optionLabel: string): void {
+  const input = document.querySelector(`input[aria-label="${inputLabel}"]`);
+  if (!(input instanceof HTMLElement)) throw new Error(`${inputLabel} select not found`);
+  fireEvent.mouseDown(input);
+  fireEvent.change(input, { target: { value: optionLabel } });
+  const option = Array.from(document.querySelectorAll('.ant-select-item-option-content')).find(
+    (node) => node.textContent === optionLabel
+  );
+  if (!(option instanceof HTMLElement)) throw new Error(`${optionLabel} option not found`);
+  fireEvent.click(option);
+}
+
 beforeEach(() => {
   catalogReads = [];
   catalogRows = [DEEPWIKI, LINEAR];
   catalogFindError = null;
   connectCalls = [];
+  oauthStartCalls = [];
   memberPolicyAnswer = { policy: 'allow_crud', can_configure: true };
   connectImpl = async () => ({
     mcp_server: { mcp_server_id: 'server-1' },
@@ -171,9 +207,24 @@ beforeEach(() => {
     starter_prompt: DEEPWIKI.starter_prompt,
     reused_existing_server: false,
   });
+  oauthStartImpl = async () => ({
+    success: true,
+    authorizationUrl: 'https://accounts.example.test/authorize',
+    attempt_id: 'attempt-1',
+  });
   mockNavigate.mockClear();
   localStorage.clear();
+  sessionStorage.clear();
+  vi.spyOn(window, 'open').mockReturnValue({
+    opener: null,
+    closed: false,
+    close: vi.fn(),
+    location: { replace: vi.fn() },
+    document: { title: '', body: { textContent: '' } },
+  } as unknown as Window);
 });
+
+afterEach(() => vi.restoreAllMocks());
 
 describe('catalog browsing', () => {
   it('renders a card per entry', async () => {
@@ -184,6 +235,16 @@ describe('catalog browsing', () => {
     // query rather than one per attempt.
     expect(screen.getByRole('button', { name: 'Open DeepWiki' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Open Linear' })).toBeInTheDocument();
+  });
+
+  it('keeps the catalog grid responsive from one to four columns', async () => {
+    renderTab();
+    const column = (await findCard('DeepWiki')).closest('.ant-col');
+
+    expect(column).toHaveClass('ant-col-xs-24');
+    expect(column).toHaveClass('ant-col-sm-12');
+    expect(column).toHaveClass('ant-col-lg-8');
+    expect(column).toHaveClass('ant-col-xxl-6');
   });
 
   it('reads nothing until the socket can answer, and never calls that an empty catalog', async () => {
@@ -379,6 +440,47 @@ describe('catalog browsing', () => {
     expect(queryCard('DeepWiki')).toBeInTheDocument();
   });
 
+  it('combines category and capability filters over the catalog already loaded', async () => {
+    catalogRows = [
+      { ...DEEPWIKI, capabilities: ['docs', 'code-search'] },
+      {
+        ...LINEAR,
+        category: 'productivity',
+        capabilities: ['projects', 'issues'],
+      },
+      {
+        ...DEEPWIKI,
+        name: 'com.logs/mcp',
+        title: 'Logs',
+        category: 'observability',
+        capabilities: ['logs', 'alerts'],
+      },
+      {
+        ...DEEPWIKI,
+        name: 'com.metrics/mcp',
+        title: 'Metrics',
+        category: 'observability',
+        capabilities: ['metrics', 'alerts'],
+      },
+    ] as typeof catalogRows;
+    renderTab();
+    await findCard('DeepWiki');
+    const before = catalogReads.length;
+
+    fireEvent.click(screen.getByText('Observability').closest('label')!);
+    await waitFor(() => expect(queryCard('DeepWiki')).not.toBeInTheDocument());
+    expect(queryCard('Logs')).toBeInTheDocument();
+    expect(queryCard('Metrics')).toBeInTheDocument();
+    expect(screen.getByText('2 of 4 servers match')).toBeVisible();
+
+    chooseSelectOption('Filter by capability', 'Logs');
+
+    await waitFor(() => expect(queryCard('Metrics')).not.toBeInTheDocument());
+    expect(queryCard('Logs')).toBeInTheDocument();
+    expect(screen.getByText('1 of 4 servers match')).toBeVisible();
+    expect(catalogReads).toHaveLength(before);
+  });
+
   it('pages the entries it holds without reading again', async () => {
     // 30 entries is more than one 24-entry page.
     catalogRows = Array.from({ length: 30 }, (_, index) => ({
@@ -405,6 +507,18 @@ describe('connect', () => {
     fireEvent.click(await findCard('DeepWiki'));
     return findDrawer();
   }
+
+  it('restores focus to the keyboard trigger after the drawer finishes closing', async () => {
+    renderTab();
+    const trigger = await findCard('DeepWiki');
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: 'Enter' });
+    await findDrawer();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
 
   it('shows the access disclosure expanded and blocks connect until it is acknowledged', async () => {
     const drawer = await openDrawer();
@@ -510,7 +624,7 @@ describe('connect', () => {
   // the AntD Form and its Selects twice; the drawer takes the entry as a prop
   // and states the same invariant in one mount.
 
-  it('connects by catalog key alone and lands in the new session with the prompt loaded', async () => {
+  it('connects by catalog key alone and lands with a tab-local prompt suggestion', async () => {
     const drawer = await openDrawer();
     const connect = drawer.getByRole('button', { name: /Connect/ });
     fireEvent.click(drawer.getByRole('checkbox'));
@@ -531,7 +645,14 @@ describe('connect', () => {
     await waitFor(() =>
       expect(mockNavigate).toHaveBeenCalledWith(sessionPath(SESSION_ID as SessionID))
     );
-    expect(getPromptDraft(CURRENT_USER_ID, SESSION_ID)).toBe(DEEPWIKI.starter_prompt);
+    expect(localStorage.getItem(`agor-draft-${SESSION_ID}`)).toBeNull();
+    expect(
+      consumeMarketplacePromptSuggestion(SESSION_ID, {
+        userId: DEFAULT_ADMIN.user_id,
+        role: DEFAULT_ADMIN.role,
+        authGeneration: 1,
+      })
+    ).toBe(DEEPWIKI.starter_prompt);
     expect(localStorage.getItem(`agor-marketplace-branch:${DEFAULT_ADMIN.user_id}`)).toBe(
       'branch-1'
     );
@@ -539,13 +660,12 @@ describe('connect', () => {
 
   /**
    * A new OAuth install with no reusable grant lands without credentials. A
-   * starter prompt is written to exercise the server it ships with, so arming
-   * the composer with one here means pressing Connect produces a loaded prompt
-   * whose only result is a tool-less answer.
+   * starter prompt is suggested to exercise the server it ships with, so
+   * presenting one here would invite a tool-less answer.
    *
-   * These pin the split. Landing in the session is unchanged: the session is
-   * where the sign-in lives (the notice above the composer, the warning MCP badge,
-   * the pill that starts OAuth on activation). Only the loaded gun is withheld.
+   * These pin the split. The automatic provider popup runs alongside the new,
+   * recoverable session. Its notice, warning MCP badge, and server pill remain
+   * available if the popup is cancelled; only the loaded gun is withheld.
    */
   async function connectAndLand(mcpServer: Record<string, unknown>) {
     connectImpl = async () => ({
@@ -570,16 +690,16 @@ describe('connect', () => {
     expect(getPromptDraft(CURRENT_USER_ID, SESSION_ID)).toBe('');
   });
 
-  it('still lands in the session so the sign-in is reachable', async () => {
+  it('lands in the recoverable session while the automatic popup signs in', async () => {
     await connectAndLand({ mcp_server_id: 'server-1', auth: { type: 'oauth' } });
 
     // Withholding the prompt must not withhold the session: the MCP badge and
-    // the pill that starts OAuth are both inside it.
+    // the server recovery controls are both inside it if the popup is cancelled.
     expect(mockNavigate).toHaveBeenCalledWith(sessionPath(SESSION_ID as SessionID));
     expect(connectCalls).toHaveLength(1);
   });
 
-  it('arms the composer when a reused install already holds a live token', async () => {
+  it('suggests the starter prompt when a reused install already holds a live token', async () => {
     // A reused install comes back through `mcp-servers` find, where the daemon
     // injects the caller's token — redacted to a sentinel, but present, which
     // is all "is this finished" needs.
@@ -592,7 +712,14 @@ describe('connect', () => {
       },
     });
 
-    expect(getPromptDraft(CURRENT_USER_ID, SESSION_ID)).toBe(DEEPWIKI.starter_prompt);
+    expect(localStorage.getItem(`agor-draft-${SESSION_ID}`)).toBeNull();
+    expect(
+      consumeMarketplacePromptSuggestion(SESSION_ID, {
+        userId: DEFAULT_ADMIN.user_id,
+        role: DEFAULT_ADMIN.role,
+        authGeneration: 1,
+      })
+    ).toBe(DEEPWIKI.starter_prompt);
   });
 
   it('withholds the prompt when the token the install carries has expired', async () => {

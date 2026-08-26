@@ -177,6 +177,10 @@ import { emitServiceEvent } from './utils/emit-service-event.js';
 import { redactGatewayChannelForTransport } from './utils/gateway-channel-redaction.js';
 import { injectCreatedBy } from './utils/inject-created-by.js';
 import {
+  captureMarketplaceInvalidationTargets as captureMarketplaceTargets,
+  publishCapturedMarketplaceInvalidation,
+} from './utils/marketplace-invalidation.js';
+import {
   redactMCPServerSecrets,
   shouldExposeMCPServerSecrets,
 } from './utils/mcp-header-secrets.js';
@@ -494,6 +498,10 @@ export const TENANT_OWNED_SERVICE_PATHS = [
   'mcp-servers/oauth-attempt-status',
   'mcp-servers/oauth-disconnect',
   'mcp-servers/oauth-status',
+  'mcp-catalog/readiness',
+  'mcp-marketplace',
+  'mcp-marketplace/remove-unattached',
+  'mcp-marketplace/tool-permission',
   'card-types',
   'cards',
   'artifacts',
@@ -1426,6 +1434,33 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   }
 
   /**
+   * Snapshot tenant principals before an authority-changing write. Publication
+   * after the write cannot use the new branch audience: the principal who was
+   * just removed is precisely the browser that must clear its old rows. The
+   * ID-only repository projection keeps this control signal independent of
+   * user credential/profile material.
+   */
+  const captureMarketplaceInvalidationTargets = async (
+    context: HookContext
+  ): Promise<HookContext> => captureMarketplaceTargets(context, usersRepository, app);
+  const publishMarketplaceInvalidation = (context: HookContext): HookContext =>
+    publishCapturedMarketplaceInvalidation(context, app);
+  const captureBoardAlignedBranchMarketplaceTargets = async (
+    context: HookContext
+  ): Promise<HookContext> => {
+    const items = Array.isArray(context.data) ? context.data : [context.data];
+    const changesAlignedBranchVisibility = items.some(
+      (item) =>
+        item &&
+        typeof item === 'object' &&
+        itemHasAnyField(item as Record<string, unknown>, ['access_mode', 'default_others_can'])
+    );
+    return changesAlignedBranchVisibility
+      ? captureMarketplaceInvalidationTargets(context)
+      : context;
+  };
+
+  /**
    * Authorization chain shared by the two externally-initiated prompt writes,
    * `messages.create` and `tasks.create`.
    *
@@ -1984,6 +2019,19 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     },
   });
 
+  const branchUpdateAuthorization = [
+    requireMinimumRole(ROLES.MEMBER, 'update branches'),
+    requireAdminForEnvConfig(),
+    validateBranchEnvPolicyHook(config),
+    ...(executionMode.appRbacEnabled
+      ? [
+          loadBranch(branchRepository),
+          ensureBranchPermission('all', 'update branches', superadminOpts),
+        ]
+      : []),
+    captureMarketplaceInvalidationTargets,
+  ];
+
   app.service('branches').hooks({
     before: {
       all: [typedValidateQuery(branchQueryValidator), requireAuth],
@@ -2006,21 +2054,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         validateBranchEnvPolicyHook(config),
         injectCreatedBy(),
       ],
-      update: [
-        requireMinimumRole(ROLES.MEMBER, 'update branches'),
-        requireAdminForEnvConfig(),
-        validateBranchEnvPolicyHook(config),
-      ],
+      update: [...branchUpdateAuthorization],
       patch: [
-        requireMinimumRole(ROLES.MEMBER, 'update branches'),
-        requireAdminForEnvConfig(),
-        validateBranchEnvPolicyHook(config),
-        ...(executionMode.appRbacEnabled
-          ? [
-              loadBranch(branchRepository),
-              ensureBranchPermission('all', 'update branches', superadminOpts), // Require 'all' permission to update
-            ]
-          : []),
+        ...branchUpdateAuthorization,
         // Capture previous others_fs_access for comparison in after Unix sync hook.
       ],
       remove: [
@@ -2032,6 +2068,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             ]
           : [ensureBranchOwnerOrAdmin('delete branches')]),
         captureBranchRemovalRealtimeVisibility,
+        captureMarketplaceInvalidationTargets,
       ],
     },
     after: {
@@ -2058,8 +2095,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           : []),
         invalidateRealtimeBranchFromResult,
       ],
-      patch: [invalidateRealtimeBranchFromResult],
-      remove: [invalidateRealtimeBranchFromResult],
+      update: [invalidateRealtimeBranchFromResult, publishMarketplaceInvalidation],
+      patch: [invalidateRealtimeBranchFromResult, publishMarketplaceInvalidation],
+      remove: [invalidateRealtimeBranchFromResult, publishMarketplaceInvalidation],
     },
   });
 
@@ -2359,6 +2397,11 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       all: [typedValidateQuery(mcpCatalogQueryValidator), requireAuth],
     },
   });
+
+  safeService('mcp-catalog/readiness')?.hooks({ before: { all: [requireAuth] } });
+  safeService('mcp-marketplace')?.hooks({ before: { all: [requireAuth] } });
+  safeService('mcp-marketplace/remove-unattached')?.hooks({ before: { all: [requireAuth] } });
+  safeService('mcp-marketplace/tool-permission')?.hooks({ before: { all: [requireAuth] } });
 
   safeService('session-mcp-servers')?.hooks({
     before: {
@@ -2681,42 +2724,68 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   }
   safeService('groups')?.hooks(groupsHooks);
   safeService('groups')?.hooks({
+    before: {
+      patch: [captureMarketplaceInvalidationTargets],
+      remove: [captureMarketplaceInvalidationTargets],
+    },
     after: {
-      patch: [clearRealtimeBranchVisibility],
-      remove: [clearRealtimeBranchVisibility],
+      patch: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
+      remove: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
     },
   });
   safeService('group-memberships')?.hooks(groupMembershipsHooks);
   safeService('group-memberships')?.hooks({
+    before: {
+      create: [captureMarketplaceInvalidationTargets],
+      remove: [captureMarketplaceInvalidationTargets],
+    },
     after: {
-      create: [clearRealtimeBranchVisibility],
-      remove: [clearRealtimeBranchVisibility],
+      create: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
+      remove: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
     },
   });
   safeService('branches/:id/owners')?.hooks({
+    before: {
+      create: [captureMarketplaceInvalidationTargets],
+      remove: [captureMarketplaceInvalidationTargets],
+    },
     after: {
-      create: [invalidateRealtimeBranchFromRoute],
-      remove: [invalidateRealtimeBranchFromRoute],
+      create: [invalidateRealtimeBranchFromRoute, publishMarketplaceInvalidation],
+      remove: [invalidateRealtimeBranchFromRoute, publishMarketplaceInvalidation],
     },
   });
   safeService('branches/:id/group-grants')?.hooks({
+    before: {
+      create: [captureMarketplaceInvalidationTargets],
+      patch: [captureMarketplaceInvalidationTargets],
+      remove: [captureMarketplaceInvalidationTargets],
+    },
     after: {
-      create: [invalidateRealtimeBranchFromRoute],
-      patch: [invalidateRealtimeBranchFromRoute],
-      remove: [invalidateRealtimeBranchFromRoute],
+      create: [invalidateRealtimeBranchFromRoute, publishMarketplaceInvalidation],
+      patch: [invalidateRealtimeBranchFromRoute, publishMarketplaceInvalidation],
+      remove: [invalidateRealtimeBranchFromRoute, publishMarketplaceInvalidation],
     },
   });
   safeService('boards/:id/owners')?.hooks({
+    before: {
+      create: [captureMarketplaceInvalidationTargets],
+      remove: [captureMarketplaceInvalidationTargets],
+    },
     after: {
-      create: [clearRealtimeBranchVisibility],
-      remove: [clearRealtimeBranchVisibility],
+      create: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
+      remove: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
     },
   });
   safeService('boards/:id/group-grants')?.hooks({
+    before: {
+      create: [captureMarketplaceInvalidationTargets],
+      patch: [captureMarketplaceInvalidationTargets],
+      remove: [captureMarketplaceInvalidationTargets],
+    },
     after: {
-      create: [clearRealtimeBranchVisibility],
-      patch: [clearRealtimeBranchVisibility],
-      remove: [clearRealtimeBranchVisibility],
+      create: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
+      patch: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
+      remove: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
     },
   });
 
@@ -2790,7 +2859,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       // and any requested role. Hooks remain responsible for transport
       // validation only and cannot accidentally become an alternate bypass.
       create: [(context) => protectFilesystemHomeWrite(context, config)],
-      patch: [(context) => protectFilesystemHomeWrite(context, config)],
+      patch: [
+        (context) => protectFilesystemHomeWrite(context, config),
+        captureMarketplaceInvalidationTargets,
+      ],
     },
     after: {
       // Registered on `all`, not a method list: Feathers composes
@@ -2842,6 +2914,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           });
           return context;
         },
+        publishMarketplaceInvalidation,
         async (context: HookContext) => {
           if ((context.params as Params & { skipAvatarRefresh?: boolean }).skipAvatarRefresh) {
             return context;
@@ -3393,6 +3466,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     }
   };
 
+  const boardUpdateAuthorization = [
+    requireMinimumRole(ROLES.MEMBER, 'update boards'),
+    ensureCanMutateBoard('update this board'),
+    captureBoardAlignedBranchMarketplaceTargets,
+  ];
+
   safeService('boards')?.hooks({
     before: {
       all: [typedValidateQuery(boardQueryValidator), requireAuth],
@@ -3409,13 +3488,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       // Whole-row replacement carries the same authorization as patch. The
       // `_action` dispatcher below is patch-only: those atomic board-object
       // operations are addressed through PATCH and have no PUT equivalent.
-      update: [
-        requireMinimumRole(ROLES.MEMBER, 'update boards'),
-        ensureCanMutateBoard('update this board'),
-      ],
+      update: [...boardUpdateAuthorization],
       patch: [
-        requireMinimumRole(ROLES.MEMBER, 'update boards'),
-        ensureCanMutateBoard('update this board'),
+        ...boardUpdateAuthorization,
         async (context: HookContext<Board>) => {
           // Handle atomic board object operations via _action parameter
           const contextData = context.data || {};
@@ -3542,6 +3617,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         requireMinimumRole(ROLES.MEMBER, 'delete boards'),
         ensureCanMutateBoard('delete this board'),
         captureBoardRemovalRealtimeVisibility,
+        captureMarketplaceInvalidationTargets,
       ],
       toBlob: [
         requireMinimumRole(ROLES.MEMBER, 'export boards'),
@@ -3638,8 +3714,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           return context;
         },
       ],
-      patch: [clearRealtimeBranchVisibility],
-      remove: [clearRealtimeBranchVisibility],
+      update: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
+      patch: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
+      remove: [clearRealtimeBranchVisibility, publishMarketplaceInvalidation],
       // Emit created events for custom methods that create boards
       // Custom methods don't automatically trigger app.publish(), so we emit manually
       clone: [
