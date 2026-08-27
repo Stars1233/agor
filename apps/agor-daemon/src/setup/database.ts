@@ -7,7 +7,9 @@
 
 import { constants } from 'node:fs';
 import { access, mkdir } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
+import type { ApmTraceServiceDepth } from '@agor/core/config';
 import { ensureAgorHome, getAgorHome } from '@agor/core/config';
 import {
   checkMigrationStatus,
@@ -21,6 +23,7 @@ import {
   seedInitialData,
   type TenantScopeAwareDatabase,
 } from '@agor/core/db';
+import { resolveDatadogTracer } from '@agor/core/tracing/datadog';
 import type { TenantID } from '@agor/core/types';
 import { extractDbFilePath } from '@agor/core/utils/path';
 import { logFirstRunAdminBootstrap, runFirstRunAdminBootstrap } from './first-run-admin.js';
@@ -121,6 +124,8 @@ export async function initializeDatabase(
     skipFirstRunAdminBootstrap?: boolean;
     /** PostgreSQL per-replica connection limit. PostgreSQL only. */
     pool?: { max: number };
+    /** Shared custom APM tracing gate; `off` also disables PostgreSQL tracing. */
+    traceServices?: ApmTraceServiceDepth;
   } = {}
 ): Promise<DatabaseInitResult> {
   const dialect = detectDialectFromUrl(dbPath) ?? getDatabaseDialect();
@@ -129,11 +134,20 @@ export async function initializeDatabase(
   // Ensure directory exists for SQLite
   await ensureDatabaseDirectory(dbPath);
 
+  // `trace_services` is the single gate for both custom APM layers. Avoid even
+  // resolving the optional tracer when tracing is off: this keeps the disabled
+  // path free of per-query and startup module-resolution overhead.
+  const tracingEnabled = (options.traceServices ?? 'off') !== 'off';
+  const tracer = tracingEnabled ? resolveDatadogTracer(createRequire(import.meta.url)) : null;
+
   // Create database with foreign keys enabled
-  const db = await createDatabaseAsync({
+  const databaseConfig = {
     url: dbPath,
     ...(options.pool ? { pool: options.pool } : {}),
-  });
+  };
+  const db = tracer
+    ? await createDatabaseAsync(databaseConfig, { tracer })
+    : await createDatabaseAsync(databaseConfig);
   const scopedDb = createTenantScopedDatabaseProxy(db, {
     requireScope: options.requireTenantScope === true,
     label: 'daemon database',
