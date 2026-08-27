@@ -32,6 +32,8 @@ import {
 } from '@agor/core/config';
 import {
   and,
+  boards,
+  branches,
   compare,
   decryptApiKey,
   deleteFrom,
@@ -46,6 +48,7 @@ import {
   select,
   sql,
   type TenantScopeAwareDatabase,
+  type TenantScopedDatabase,
   UserPrimaryTeammateRepository,
   update,
   users,
@@ -94,7 +97,7 @@ import {
   WORKSPACE_DEFAULT_AGENTIC_CONFIGURATION,
 } from '@agor/core/types';
 import { emitServiceEvent } from '../utils/emit-service-event.js';
-import { lockUserAuthorityMutation } from './user-authority-lock.js';
+import { lockTenantAuthorizationFence } from './tenant-authorization-fence.js';
 import { UserAvatarSyncManager } from './user-avatar-sync.js';
 import {
   getTrustedUserMutationPurpose,
@@ -421,14 +424,16 @@ export class UsersService {
   private readonly identityAuthority: ResolvedIdentityAuthority;
 
   constructor(
-    protected db: TenantScopeAwareDatabase,
+    protected db: TenantScopeAwareDatabase | TenantScopedDatabase,
     protected app?: Application,
     config?: AgorConfig
   ) {
     const effectiveConfig = config ?? (app?.get('config') as AgorConfig | undefined) ?? {};
     this.identityAuthority = resolveIdentityAuthority(effectiveConfig);
     if (app) {
-      this.avatarSync = new UserAvatarSyncManager(db, app);
+      // Application-bound services are created only from the long-lived,
+      // tenant-scope-aware base handle. Transaction-bound services omit app.
+      this.avatarSync = new UserAvatarSyncManager(db as TenantScopeAwareDatabase, app);
     }
   }
 
@@ -774,7 +779,7 @@ export class UsersService {
       throw new BadRequest(`Execution home key "${data.unix_username}" is already in use`);
     }
     if (Object.hasOwn(data, 'role')) data.role = canonicalizeRoleWrite(data.role);
-    await lockUserAuthorityMutation(this.db, params);
+    await lockTenantAuthorizationFence(this.db, params);
     await this.authorizeCreate(data, params);
     const assignedPassword = validatedAssignedPassword(data.password, data.email);
     // Check if email already exists
@@ -845,7 +850,7 @@ export class UsersService {
     ) {
       throw new BadRequest(`Execution home key "${data.unix_username}" is already in use`);
     }
-    await lockUserAuthorityMutation(this.db, params);
+    await lockTenantAuthorizationFence(this.db, params);
     const authority = await this.authorizePatch(id, data, params);
     const hasPasswordWrite = Object.hasOwn(data, 'password');
     const assignedPassword = hasPasswordWrite
@@ -1158,7 +1163,7 @@ export class UsersService {
       throw new BadRequest('Bulk user mutations are not supported');
     }
     this.assertDeleteAllowed();
-    await lockUserAuthorityMutation(this.db, params);
+    await lockTenantAuthorizationFence(this.db, params);
     const authority = await this.authorizeRemove(id, params);
     await this.assertNotLastSuperadmin(authority.target, params);
     const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
@@ -1170,6 +1175,24 @@ export class UsersService {
       requesterId,
       shouldIncludeAuthMetadata(params)
     );
+
+    const [ownedBoard, ownedBranch] = await Promise.all([
+      select(this.db, { board_id: boards.board_id })
+        .from(boards)
+        .where(eq(boards.primary_owner_user_id, id))
+        .limit(1)
+        .one(),
+      select(this.db, { branch_id: branches.branch_id })
+        .from(branches)
+        .where(eq(branches.primary_owner_user_id, id))
+        .limit(1)
+        .one(),
+    ]);
+    if (ownedBoard || ownedBranch) {
+      throw new BadRequest(
+        'This user still owns boards or branches. Delete those resources before deleting the user.'
+      );
+    }
 
     const authorityActorPredicate = this.actorStillCurrentPredicate(authority.actor, params);
     const removed = await deleteFrom(this.db, users)
@@ -1497,7 +1520,7 @@ export class UsersService {
       throw new BadRequest('Invalid primary agentic tool');
     }
 
-    await lockUserAuthorityMutation(this.db, params);
+    await lockTenantAuthorizationFence(this.db, params);
     // Tenant ownership is ambient here: the users service hook has already
     // entered the trusted tenant database scope, and PostgreSQL RLS applies it
     // to every query through this.db. Do not derive SQL scope from request
@@ -1736,7 +1759,16 @@ class UsersServiceWithAuth extends UsersService {
  */
 export function createUsersService(
   db: TenantScopeAwareDatabase,
-  app?: Application
+  app?: Application,
+  config?: AgorConfig
 ): UsersServiceWithAuth {
-  return new UsersServiceWithAuth(db, app);
+  return new UsersServiceWithAuth(db, app, config);
+}
+
+/** Create a provider-less Users service bound to one active tenant transaction. */
+export function createTenantTransactionUsersService(
+  db: TenantScopedDatabase,
+  config: AgorConfig
+): UsersServiceWithAuth {
+  return new UsersServiceWithAuth(db, undefined, config);
 }

@@ -49,6 +49,7 @@ import type {
   AgenticToolName,
   AuthenticatedParams,
   Branch,
+  BranchID,
   BranchPermissionLevel,
   CreateSessionInput,
   MCPServerID,
@@ -62,7 +63,6 @@ import type {
 } from '@agor/core/types';
 import {
   isAgenticToolDefaultConfigurationReference,
-  ROLES,
   SessionStatus,
   USER_DEFAULT_AGENTIC_CONFIGURATION,
 } from '@agor/core/types';
@@ -167,7 +167,7 @@ export type SessionParams = QueryParams<{
  * Whether a sessions `find` query should be served by `SessionRepository.findPage`
  * (SQL board filter + recency sort + limit/offset) rather than the generic
  * in-memory path. We only divert the loader's bounded list queries — those that
- * sort by `updated_at` and/or scope to a `board_id` — and only when the rest of
+ * sort by `updated_at` and/or scope to a `board_id`/`branch_id` — and only when the rest of
  * the query is a shape findPage fully models (archived + pagination). Anything
  * with extra filters, operators, or `$select` falls through to the existing path
  * so we never silently drop semantics findPage doesn't implement.
@@ -177,19 +177,32 @@ function shouldSqlPageSessionQuery(query?: Record<string, unknown>, forcePage = 
 
   const sort = query.$sort as Record<string, unknown> | undefined;
   const wantsRecency = !!sort && sort.updated_at !== undefined;
+  const wantsCreatedAt = !!sort && sort.created_at !== undefined;
   const wantsBoard = query.board_id !== undefined;
-  if (!wantsRecency && !wantsBoard && !forcePage) return false;
+  const wantsBranch = query.branch_id !== undefined;
+  if (!wantsRecency && !wantsCreatedAt && !wantsBoard && !wantsBranch && !forcePage) return false;
 
-  const allowedKeys = new Set(['archived', 'board_id', '$sort', '$limit', '$skip']);
+  const allowedKeys = new Set(['archived', 'board_id', 'branch_id', '$sort', '$limit', '$skip']);
   for (const key of Object.keys(query)) {
     if (!allowedKeys.has(key)) return false;
   }
   if (query.archived !== undefined && typeof query.archived !== 'boolean') return false;
   if (wantsBoard && typeof query.board_id !== 'string') return false;
+  if (wantsBranch) {
+    const branchFilter = query.branch_id;
+    const validExact = typeof branchFilter === 'string';
+    const validSet =
+      branchFilter !== null &&
+      typeof branchFilter === 'object' &&
+      Array.isArray((branchFilter as { $in?: unknown }).$in) &&
+      (branchFilter as { $in: unknown[] }).$in.every((id) => typeof id === 'string');
+    if (!validExact && !validSet) return false;
+  }
   if (sort) {
     const sortKeys = Object.keys(sort);
-    if (sortKeys.length !== 1 || sortKeys[0] !== 'updated_at') return false;
-    if (sort.updated_at !== 1 && sort.updated_at !== -1) return false;
+    if (sortKeys.length !== 1 || !['updated_at', 'created_at'].includes(sortKeys[0])) return false;
+    const direction = sort[sortKeys[0]];
+    if (direction !== 1 && direction !== -1) return false;
   }
   return true;
 }
@@ -473,8 +486,21 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
   }
 
   protected async fetchData(_query: Query, params?: SessionParams): Promise<Session[]> {
+    const branchId =
+      typeof _query.branch_id === 'string' ? (_query.branch_id as BranchID) : undefined;
+    const branchIds =
+      _query.branch_id &&
+      typeof _query.branch_id === 'object' &&
+      Array.isArray(_query.branch_id.$in) &&
+      _query.branch_id.$in.every((value: unknown) => typeof value === 'string')
+        ? (_query.branch_id.$in as BranchID[])
+        : undefined;
+    const archived = typeof _query.archived === 'boolean' ? _query.archived : undefined;
     return this.sessionRepo.findAll({
       visibleToUserId: params?._agorSqlSessionAccessUserId,
+      branchId,
+      branchIds,
+      archived,
     });
   }
 
@@ -580,10 +606,9 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
    * being created via spawn / fork / btw. See {@link determineSpawnIdentity}
    * for the rules.
    *
-   * Defaults the child to the MCP-authenticated caller; only inherits the
-   * parent's identity when the branch explicitly opts in via the
-   * `dangerously_allow_session_sharing` flag (and the caller is not an admin
-   * acting on someone else's session).
+   * Same-owner children stay with their owner. A cross-user child is accepted
+   * only through the Session owner's personal sharing rule and stays in that
+   * owner's genealogy and execution home.
    *
    * Internal calls (`params.provider == null`) preserve parent attribution —
    * they're service-to-service or scheduler-driven and have no human caller
@@ -600,8 +625,7 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
    * - Internal call (no provider) → inherit parent.unix_username. The scheduler /
    *   service-to-service callers have no human caller to attribute to, and the
    *   parent's stamped value is the closest thing to ground truth.
-   * - Legacy sharing (`dangerously_allow_session_sharing` triggers) → inherit
-   *   parent's unix_username by design — this is the point of identity borrowing.
+   * - Personal session sharing → inherit the parent's execution-home key.
    * - Otherwise (including the common same-user path) → load the attributed
    *   caller's CURRENT unix_username via {@link loadUnixUsernameForUser}. We
    *   do NOT inherit parent.unix_username on same-user forks, because the user's
@@ -633,36 +657,46 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
       throw new Forbidden('Cannot spawn/fork session without an authenticated caller identity.');
     }
 
-    // Look up the parent's branch to read the opt-in flag.
-    let branch: { branch_id: string; dangerously_allow_session_sharing?: boolean } | undefined;
+    // Resolve the personal, owner-authored session-sharing grant. This is the
+    // only path that may preserve the parent owner's home for a cross-user
+    // child; branch managers and filesystem access never imply it.
+    let sharing: { branch_id: string; share_owner_home: boolean } | undefined;
     try {
       const wt = await this.app.service('branches').get(parent.branch_id, { provider: undefined });
-      branch = wt as typeof branch;
       if (caller.user_id) {
-        const effective = await this.branchRepo.resolveUserAccess(
-          wt as Branch,
-          caller.user_id as UUID
+        const authority = await this.branchRepo.resolveSessionPromptAuthority(
+          (wt as Branch).branch_id,
+          caller.user_id as UUID,
+          parent.created_by as UUID
         );
-        if (branch) {
-          branch.dangerously_allow_session_sharing = effective.dangerously_allow_session_sharing;
+        sharing = {
+          branch_id: (wt as Branch).branch_id,
+          share_owner_home: authority.source === 'personal_session_sharing',
+        };
+        if (!authority.allowed) {
+          throw new Forbidden(
+            caller.user_id === parent.created_by
+              ? 'Collaborator access is required to fork or spawn from this session.'
+              : 'The session owner has not shared their sessions with you.'
+          );
         }
       }
-    } catch {
-      // If we can't load the branch, default to the safe (caller-as-owner) path.
-      branch = undefined;
+    } catch (error) {
+      if (error instanceof Forbidden) throw error;
+      throw new Forbidden('Cannot resolve session-sharing authority for this branch.');
     }
 
-    const result = determineSpawnIdentity(parent, caller, branch);
+    const result = determineSpawnIdentity(parent, caller, sharing);
     const createdBy = result.created_by as Session['created_by'];
 
-    // Legacy sharing → inherit parent's unix_username (identity borrowing by design).
+    // Personal sharing → inherit the session owner's execution-home key.
     // Otherwise (including same-user) → resolve the attributed user's CURRENT
     // unix_username. Same-user forks must NOT inherit stale parent.unix_username,
     // because validateSessionUnixUsername would later reject prompts when the
     // user's unix_username drifts. The decision is delegated to the pure helper
     // `resolveChildUnixUsername` so it can be unit tested without DB mocks.
     let callerUnixUsername: string | null = null;
-    if (!result.usedLegacySharing) {
+    if (!result.usesSharedHome) {
       try {
         callerUnixUsername = await loadUnixUsernameForUser(this.usersRepo, createdBy as string);
       } catch (err) {
@@ -678,12 +712,12 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     const unixUsername = resolveChildUnixUsername(
       parent.unix_username,
       callerUnixUsername,
-      result.usedLegacySharing
+      result.usesSharedHome
     ) as Session['unix_username'];
 
     // In delegated mode, a child stamped null would fail at prompt time (or
     // silently share an identity in hosted deployments) — reject at fork/spawn
-    // time with an actionable error instead. Also covers legacy sharing
+    // time with an actionable error instead. Also covers shared-home children
     // inheriting a null stamp from a pre-migration parent.
     assertExecutionHomeKeySatisfiesMode(
       unixUsername,
@@ -707,9 +741,8 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     const parent = await this.get(id, params);
     const parentTool = requireActiveAgenticTool(parent.agentic_tool);
 
-    // Default: attribute the child to the MCP-authenticated caller, not the
-    // parent owner. Legacy parent-inheriting "identity borrowing" is preserved
-    // only when the branch opts in via dangerously_allow_session_sharing.
+    // Cross-user genealogy is allowed only by the Session owner's personal
+    // sharing rule and remains attributed to that owner.
     const { created_by, unix_username } = await this.resolveChildIdentity(parent, params);
     const inherited = await materializeAgenticToolConfiguration(this.db, {
       tool: parentTool,
@@ -941,17 +974,11 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
       );
     }
 
-    // Session env var selections: explicit envVarNames > copy from parent.
-    // Only the parent's creator (now the spawned session's creator) or a
-    // global admin may override selections — otherwise silently fall back to
-    // copying the parent's selections (the caller cannot see the creator's
-    // env var names anyway).
+    // An explicit caller selection wins; otherwise continue the parent's
+    // selected names. Values resolve for each Task's creator in the executor.
     const callerUserId = params?.user?.user_id as string | undefined;
-    const callerRole = params?.user?.role as string | undefined;
-    const callerIsCreatorOrAdmin =
-      callerUserId === parent.created_by || callerRole === ROLES.ADMIN || isSuperAdmin(callerRole);
 
-    if (data.envVarNames !== undefined && callerIsCreatorOrAdmin) {
+    if (data.envVarNames !== undefined && callerUserId) {
       await this.sessionEnvSelectionRepo.setAll(session.session_id as SessionID, data.envVarNames);
     } else {
       const parentNames = await this.sessionEnvSelectionRepo.listNames(
@@ -1532,13 +1559,23 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
     // filter + recency sort + limit/offset in SQL instead.
     const query = params?.query as Record<string, unknown> | undefined;
     if (shouldSqlPageSessionQuery(query, !!params?._agorSqlSessionAccessUserId)) {
-      const sortSpec = query?.$sort as { updated_at?: 1 | -1 } | undefined;
+      const sortSpec = query?.$sort as { updated_at?: 1 | -1; created_at?: 1 | -1 } | undefined;
+      const branchFilter = query?.branch_id;
+      const branchIds =
+        branchFilter &&
+        typeof branchFilter === 'object' &&
+        Array.isArray((branchFilter as { $in?: unknown }).$in)
+          ? ((branchFilter as { $in: BranchID[] }).$in ?? [])
+          : undefined;
       const limit = (query?.$limit as number | undefined) ?? PAGINATION.DEFAULT_LIMIT;
       const skip = (query?.$skip as number | undefined) ?? 0;
       const { data, total } = await this.sessionRepo.findPage({
         boardId: query?.board_id as string | undefined,
+        branchId: typeof branchFilter === 'string' ? (branchFilter as BranchID) : undefined,
+        branchIds,
         archived: query?.archived as boolean | undefined,
         sortUpdatedAt: sortSpec?.updated_at,
+        sortCreatedAt: sortSpec?.created_at,
         limit,
         skip,
         visibleToUserId: params?._agorSqlSessionAccessUserId,
@@ -1569,6 +1606,43 @@ export class SessionsService extends DrizzleService<Session, SessionUpdate, Sess
       const selected = this.selectFields(sorted, residual.$select);
       const paged = this.paginateData(selected as Session[], residual, total);
 
+      if (Array.isArray(paged)) {
+        const enriched = await this.enrichRemoteRelationships(paged);
+        return markRemoteRelationshipsEnrichedResult(enriched);
+      }
+      const enrichedData = await this.enrichRemoteRelationships(paged.data);
+      return markRemoteRelationshipsEnrichedResult({ ...paged, data: enrichedData });
+    }
+
+    // Branch-modal session lists commonly sort by created_at rather than the
+    // recency column used by findPage. Keep the generic Feathers semantics for
+    // those shapes, but scope the candidate rows to the branch in SQL.
+    const branchId = params?.query?.branch_id;
+    const exactBranchId = typeof branchId === 'string' ? (branchId as BranchID) : undefined;
+    const branchIds =
+      branchId &&
+      typeof branchId === 'object' &&
+      Array.isArray(branchId.$in) &&
+      branchId.$in.every((value: unknown) => typeof value === 'string')
+        ? (branchId.$in as BranchID[])
+        : undefined;
+    if (exactBranchId || branchIds) {
+      const { branch_id: _scopedBranchId, ...residualQuery } = (params?.query ?? {}) as Record<
+        string,
+        unknown
+      >;
+      const rows = await this.sessionRepo.findAll({
+        branchId: exactBranchId,
+        branchIds,
+        archived: typeof residualQuery.archived === 'boolean' ? residualQuery.archived : undefined,
+        visibleToUserId: params?._agorSqlSessionAccessUserId,
+      });
+      const residual = residualQuery as Query;
+      const filtered = this.filterData(rows, residual);
+      const total = filtered.length;
+      const sorted = this.sortData(filtered, residual.$sort);
+      const selected = this.selectFields(sorted, residual.$select);
+      const paged = this.paginateData(selected as Session[], residual, total);
       if (Array.isArray(paged)) {
         const enriched = await this.enrichRemoteRelationships(paged);
         return markRemoteRelationshipsEnrichedResult(enriched);

@@ -34,8 +34,10 @@ import {
   MCPCatalogCandidateRepository,
   MCPServerRepository,
   MessagesRepository,
+  MISSING_TASK_ACTOR_ERROR,
   resolveMcpMemberPolicy,
   runWithTenantDatabaseScope,
+  runWithTenantDatabaseTransaction,
   ScheduleRepository,
   type SessionRepository,
   setMCPEgressGatewayMode,
@@ -43,6 +45,7 @@ import {
   shortId,
   TaskRepository,
   type TenantScopeAwareDatabase,
+  type TenantScopedDatabase,
   UploadRepository,
   UserMCPOAuthTokenRepository,
   UsersRepository,
@@ -59,11 +62,7 @@ import {
   NotAuthenticated,
   NotFound,
 } from '@agor/core/feathers';
-import {
-  filterMCPServersForSession,
-  isMCPServerUsableInSession,
-  MCPServerNotUsableError,
-} from '@agor/core/mcp';
+import { isMCPServerUsableBy, MCPServerNotUsableError } from '@agor/core/mcp';
 import type {
   AuthenticatedParams,
   BoardComment,
@@ -175,6 +174,10 @@ import {
   type SchedulerService,
 } from './services/scheduler.js';
 import { runSessionInitializationStages } from './services/session-initialization.js';
+import {
+  lockTenantAuthorizationFence,
+  resolveCurrentTenantAuthorityActor,
+} from './services/tenant-authorization-fence.js';
 import type { TerminalsService } from './services/terminals.js';
 import { createUserApiKeysService } from './services/user-api-keys.js';
 import {
@@ -316,6 +319,51 @@ export interface RouteParams extends Params {
   user?: User;
   /** Trusted internal callback request, populated by MCP tooling only. */
   _taskCompletionCallback?: NonNullable<TaskMetadata['completion_callback']>;
+}
+
+/**
+ * Authorize the executor-only read of effective MCP configuration.
+ *
+ * Returns false for ordinary browser/API callers so the route can apply its
+ * existing Session owner/admin rule. A verified task executor is accepted only
+ * for its exact signed Session/Task and immutable Task actor.
+ */
+export async function authorizeTaskExecutorSessionMcpRead(
+  params: RouteParams,
+  session: Session,
+  findTask: (taskId: string) => Promise<Task | null>
+): Promise<boolean> {
+  const scope = authenticatedTaskExecutorRuntimeScope(params);
+  if (!scope) return false;
+  if (scope.sessionId !== session.session_id) {
+    throw new Forbidden('Executor token is not scoped to this session');
+  }
+  const userId = params.user?.user_id;
+  if (!userId) throw new NotAuthenticated('Executor MCP read requires a prompt actor');
+  const task = await findTask(scope.taskId);
+  if (
+    !task ||
+    task.task_id !== scope.taskId ||
+    task.session_id !== session.session_id ||
+    task.created_by !== userId
+  ) {
+    throw new Forbidden('Executor task scope is no longer current');
+  }
+  return true;
+}
+
+/**
+ * Resolve the durable actor of a queued Task.
+ *
+ * Queue scheduling metadata is intentionally absent from this boundary: only
+ * `Task.created_by` may select credentials, mounts, or private integrations.
+ */
+export async function resolveQueuedTaskActor(
+  task: Pick<Task, 'created_by'>,
+  findUser: (userId: string) => Promise<User | null | undefined>
+): Promise<User | null> {
+  if (!task.created_by) return null;
+  return (await findUser(task.created_by)) ?? null;
 }
 
 /** Compatibility tombstone retained for stale Claude CLI restart clients. */
@@ -1009,6 +1057,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       accessTokenTtl: ACCESS_TOKEN_TTL,
       refreshTokenTtl: REFRESH_TOKEN_TTL,
       usersService,
+      onAuthorizationInvalidated: (tenantId) => {
+        app.emit('realtime:authorization-invalidated', {
+          tenantId,
+          disconnectSockets: true,
+        });
+      },
     })
   );
 
@@ -1612,7 +1666,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     // Atomically claim queued/created → launch status. Process-local session
     // locks reduce contention, but this expected-state transition is the
     // cross-daemon fence that prevents duplicate executor launches.
-    const dispatchClaim = await runWithTenantDatabaseScope(db, tenantId, async (tenantDb) => {
+    const dispatchClaim = await runWithTenantDatabaseTransaction(db, tenantId, async (tenantDb) => {
+      await lockTenantAuthorizationFence(tenantDb, params);
       await assertTenantWritable(tenantDb, tenantId);
       return tasksService.claimDispatchAndProjectSession(
         task.task_id,
@@ -1892,47 +1947,43 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         // per-user home store), so the prompt either silently impersonates the
         // owner or stalls into a hung task instead of returning a clean 403.
         // Mirrors the `/tasks/:id/run` (~L1832) and upload (~L2233) routes.
-        // Internal/daemon callers (spawn-prompt forward, widget submissions,
-        // scheduler, gateway) are provider-less and skipped, as are executor
-        // service accounts.
+        // The same check runs again inside the durable Task-admission
+        // transaction below; this first pass is only a low-latency rejection.
         const promptBranchId = session.branch_id;
-        const isInternalPrompt = !params.provider;
         const isPromptServiceAccount =
           (params.user as { _isServiceAccount?: boolean } | undefined)?._isServiceAccount === true;
-        if (branchRbacEnabled && !isInternalPrompt && !isPromptServiceAccount && promptBranchId) {
-          const promptUserId = params.user?.user_id as UUID | undefined;
+        const promptUserId = params.user?.user_id as UUID | undefined;
+        const assertCurrentPromptAuthority = async (
+          operationDb: TenantScopedDatabase,
+          currentSession: Session
+        ): Promise<void> => {
+          if (!branchRbacEnabled || isPromptServiceAccount || !currentSession.branch_id) return;
           if (!promptUserId) {
             throw new NotAuthenticated('Authentication required to prompt a session');
           }
-          const access = await runWithTenantDatabaseScope(db, promptTenantId, async () => {
-            const wt = await branchRepository.findById(promptBranchId);
-            if (!wt) return null;
-            const isOwner = await branchRepository.isOwner(wt.branch_id, promptUserId);
-            const branchPermission = await branchRepository.resolveUserPermission(wt, promptUserId);
-            return { branchPermission, isOwner, wt };
-          });
-          if (!access) {
-            throw new NotFound(`Branch ${promptBranchId} not found`);
+          const scopedBranchRepository = new BranchRepository(operationDb);
+          const branch = await scopedBranchRepository.findById(currentSession.branch_id);
+          if (!branch) {
+            throw new NotFound(`Branch ${currentSession.branch_id} not found`);
           }
-          const { allowed, effectiveLevel } = resolveSessionPromptAccess({
-            branch: access.wt,
-            session,
+          const { allowed } = await resolveSessionPromptAccess({
+            branchRepository: scopedBranchRepository,
+            branch,
+            session: currentSession,
             userId: promptUserId,
-            isOwner: access.isOwner,
-            userRole: params.user?.role,
-            allowSuperadmin: superadminOpts.allowSuperadmin,
-            branchPermission: access.branchPermission,
           });
           if (!allowed) {
             throw new Forbidden(
-              effectiveLevel === 'session'
-                ? `You have 'session' permission — you can only prompt sessions you created. ` +
-                    `This session was created by another user. Ask a branch owner to upgrade ` +
-                    `your access to 'prompt' if you need to prompt other users' sessions.`
-                : `You need 'prompt' permission to prompt this session. You have ` +
-                    `'${effectiveLevel}' permission.`
+              currentSession.created_by === promptUserId
+                ? `Collaborator access is required to prompt this session.`
+                : `The session owner has not shared their sessions with you.`
             );
           }
+        };
+        if (branchRbacEnabled && !isPromptServiceAccount && promptBranchId) {
+          await runWithTenantDatabaseScope(db, promptTenantId, (operationDb) =>
+            assertCurrentPromptAuthority(operationDb, session)
+          );
         }
 
         const reconcileDurablyDispatchedTask = async (): Promise<Task | null> => {
@@ -2045,14 +2096,31 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             if (params._taskCompletionCallback) {
               taskMetadata.completion_callback = params._taskCompletionCallback;
             }
-            const task = await taskRepo.createPending({
-              task_id: data.idempotencyTaskId,
-              session_id: id as SessionID,
-              full_prompt: data.prompt,
-              created_by: createdBy,
-              status: TaskStatus.QUEUED,
-              metadata: Object.keys(taskMetadata).length > 0 ? taskMetadata : undefined,
-            });
+            const task = await runWithTenantDatabaseTransaction(
+              db,
+              promptTenantId,
+              async (operationDb) => {
+                // Serialize against user/group and capability-policy mutations,
+                // then re-authorize at the exact durable admission boundary.
+                await lockTenantAuthorizationFence(operationDb, params);
+                if (!isPromptServiceAccount) {
+                  const current = await resolveCurrentTenantAuthorityActor(operationDb, params);
+                  if (current.service || !hasMinimumRole(current.role, ROLES.MEMBER)) {
+                    throw new Forbidden('Member access is required to prompt a session');
+                  }
+                }
+                const admissionSession = (await sessionsService.get(id, params)) as Session;
+                await assertCurrentPromptAuthority(operationDb, admissionSession);
+                return new TaskRepository(operationDb).createPending({
+                  task_id: data.idempotencyTaskId,
+                  session_id: id as SessionID,
+                  full_prompt: data.prompt,
+                  created_by: createdBy,
+                  status: TaskStatus.QUEUED,
+                  metadata: Object.keys(taskMetadata).length > 0 ? taskMetadata : undefined,
+                });
+              }
+            );
             await tasksService.autoTitleSession(task, params);
 
             if (!prior) {
@@ -2197,21 +2265,17 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             if (!wt) {
               throw new NotFound(`Branch ${session.branch_id} not found`);
             }
-            const isOwner = await branchRepository.isOwner(wt.branch_id, userId);
-            const branchPermission = await branchRepository.resolveUserPermission(wt, userId);
-            const { allowed, effectiveLevel } = resolveSessionPromptAccess({
+            const { allowed, effectiveLevel } = await resolveSessionPromptAccess({
+              branchRepository,
               branch: wt,
               session,
               userId,
-              isOwner,
-              userRole: params.user?.role,
-              allowSuperadmin: superadminOpts.allowSuperadmin,
-              branchPermission,
             });
             if (!allowed) {
               throw new Forbidden(
                 `You have '${effectiveLevel}' permission on this branch, which does not ` +
-                  `allow running tasks. Need 'prompt' or 'all' (or 'session' for own sessions).`
+                  `allow running tasks. Collaborator access is required, and foreign ` +
+                  `sessions must be shared by their owner.`
               );
             }
           }
@@ -2591,22 +2655,17 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         const access = await runWithTenantDatabaseScope(db, params.tenant?.tenant_id, async () => {
           const wt = await branchRepo.findById(session.branch_id);
           if (!wt) return null;
-          const isOwner = await branchRepo.isOwner(wt.branch_id, userId);
-          const branchPermission = await branchRepo.resolveUserPermission(wt, userId);
-          return { branchPermission, isOwner, wt };
+          return { wt };
         });
         if (!access) {
           return res.status(404).json({ error: 'Branch not found' });
         }
-        const { branchPermission, isOwner, wt } = access;
-        const { allowed, effectiveLevel } = resolveSessionPromptAccess({
+        const { wt } = access;
+        const { allowed, effectiveLevel } = await resolveSessionPromptAccess({
+          branchRepository: branchRepo,
           branch: wt,
           session,
           userId,
-          isOwner,
-          userRole: params.user?.role,
-          allowSuperadmin: superadminOpts.allowSuperadmin,
-          branchPermission,
         });
 
         if (!allowed) {
@@ -2811,8 +2870,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     const allowed = await runWithTenantDatabaseScope(db, tenantId, async () => {
       const branch = await branchRepo.findById(upload.branchId);
       if (!branch) return false;
-      if (await branchRepo.isOwner(branch.branch_id, userId)) return true;
-      return (await branchRepo.resolveUserPermission(branch, userId)) !== 'none';
+      const access = await branchRepo.resolveUserAccess(branch, userId);
+      return access.is_owner || access.can !== 'none';
     });
     if (
       !allowed &&
@@ -3002,11 +3061,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           app.service('sessions').get(id, params)
         );
 
-        // Stop is process control and must use the same authorization policy as
-        // prompting the target session. A session-tier collaborator may view a
-        // teammate's session but must not stop an executor running with that
-        // teammate's identity and credentials. Force-fail deliberately skips
-        // this check and applies its narrower owner-or-admin policy below.
+        // Stop is session lifecycle control. Managers may stop any session on
+        // the branch without gaining prompt authority over its owner's home;
+        // collaborators may stop a foreign session only when that owner has
+        // explicitly shared it with them. Force-fail deliberately skips this
+        // check and applies its narrower owner-or-admin policy below.
         if (
           body.force_unverified !== true &&
           branchRbacEnabled &&
@@ -3023,33 +3082,26 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           const access = await inCurrentTenantDatabaseScope(async () => {
             const branch = await branchRepository.findById(session.branch_id);
             if (!branch) return null;
-            const isOwner = await branchRepository.isOwner(branch.branch_id, stopUserId);
-            const branchPermission = await branchRepository.resolveUserPermission(
-              branch,
-              stopUserId
-            );
-            return { branch, branchPermission, isOwner };
+            const branchAccess = await branchRepository.resolveUserAccess(branch, stopUserId);
+            return { branch, branchAccess };
           });
           if (!access) {
             throw new NotFound(`Branch ${session.branch_id} not found`);
           }
-          const { allowed, effectiveLevel } = resolveSessionPromptAccess({
+          const { allowed: hasPromptAuthority } = await resolveSessionPromptAccess({
+            branchRepository,
             branch: access.branch,
             session,
             userId: stopUserId,
-            isOwner: access.isOwner,
-            userRole: params.user?.role,
-            allowSuperadmin: superadminOpts.allowSuperadmin,
-            branchPermission: access.branchPermission,
           });
-          if (!allowed) {
+          const isManager = access.branchAccess.can === 'all';
+          const isGlobalSuperadmin =
+            superadminOpts.allowSuperadmin && hasMinimumRole(params.user?.role, ROLES.SUPERADMIN);
+          if (!hasPromptAuthority && !isManager && !isGlobalSuperadmin) {
             throw new Forbidden(
-              effectiveLevel === 'session'
-                ? `You have 'session' permission — you can only stop sessions you created. ` +
-                    `This session was created by another user. Ask a branch owner to upgrade ` +
-                    `your access to 'prompt' if you need to stop other users' sessions.`
-                : `You need 'prompt' permission to stop this session. You have ` +
-                    `'${effectiveLevel}' permission.`
+              session.created_by === stopUserId
+                ? `Collaborator access is required to stop this session.`
+                : `Manager access or permission from the session owner is required to stop this session.`
             );
           }
         }
@@ -3302,15 +3354,60 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       return;
     }
 
-    // Recovery triggers carry trusted tenant routing but no request user. Restore
-    // the durable enqueuer identity before entering hooked Session reads/repairs
-    // so branch RBAC applies exactly as it did at admission time.
-    const userId = nextTask.metadata?.queued_by_user_id ?? nextTask.created_by;
+    // Recovery triggers carry trusted tenant routing but no request user.
+    // `Task.created_by` is the canonical prompt actor and credential identity;
+    // callback scheduling metadata is provenance only and must never select
+    // another user's token, environment, mounts, or private MCP servers.
     const userRepo = bindRepositoryToTenantUnitOfWork(db, new UsersRepository(db));
-    const queuedByUser = userId ? await userRepo.findById(userId) : undefined;
-    const taskParams: RouteParams = queuedByUser
-      ? ({ ...params, user: queuedByUser } as RouteParams)
-      : params;
+    let queuedByUser = await resolveQueuedTaskActor(nextTask, (userId) =>
+      userRepo.findById(userId)
+    );
+    if (!queuedByUser) {
+      const actorCheck = await runWithTenantDatabaseTransaction(
+        db,
+        getCurrentTenantId(),
+        async (operationDb) => {
+          await lockTenantAuthorizationFence(operationDb, params);
+          return new TaskRepository(operationDb).failQueuedTaskIfCreatorMissing(nextTask.task_id);
+        }
+      );
+      if (actorCheck.outcome === 'condition_changed') return;
+      if (actorCheck.outcome === 'actor_available') {
+        queuedByUser = await userRepo.findById(nextTask.created_by);
+        if (queuedByUser) {
+          // Continue below; the final dispatch admission rechecks this actor
+          // under the same tenant fence as hard deletion.
+        } else {
+          deferWithSessionQueueTenantScope(
+            { db, config, sessionId, params, label: 'processNextQueuedTask actor race' },
+            async (retryParams) => processNextQueuedTask(sessionId, retryParams),
+            (error) => console.error('❌ [Queue] Actor-race continuation failed:', error)
+          );
+          return;
+        }
+      } else {
+        emitServiceEvent(app, {
+          path: 'tasks',
+          event: 'patched',
+          data: actorCheck.task,
+          params,
+          id: actorCheck.task.task_id,
+        });
+        console.warn(
+          `[task-queue] event=actor_missing task_id=${JSON.stringify(nextTask.task_id)} actor_id=${JSON.stringify(nextTask.created_by)}`
+        );
+        // A missing actor must not strand later valid work behind this queue
+        // head. Re-enter through the ordinary drain coalescer after returning.
+        deferWithSessionQueueTenantScope(
+          { db, config, sessionId, params, label: 'processNextQueuedTask missing actor' },
+          async (retryParams) => processNextQueuedTask(sessionId, retryParams),
+          (error) => console.error('❌ [Queue] Missing-actor continuation failed:', error)
+        );
+        return;
+      }
+    }
+    if (!queuedByUser) return;
+    const taskParams = { ...params, user: queuedByUser } as RouteParams;
 
     const queuedSession = await runWithTenantDatabaseScope(db, getCurrentTenantId(), () =>
       sessionsService.get(sessionId, taskParams)
@@ -3355,6 +3452,17 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     if (admitted.status === TaskStatus.QUEUED) {
       taskQueueDebug(
         `⏸️  Queue head ${shortId(admitted.task_id)} remains queued after a lost/changed claim`
+      );
+      return;
+    }
+    if (
+      admitted.status === TaskStatus.FAILED &&
+      admitted.error_message === MISSING_TASK_ACTOR_ERROR
+    ) {
+      deferWithSessionQueueTenantScope(
+        { db, config, sessionId, params, label: 'processNextQueuedTask actor revoked' },
+        async (retryParams) => processNextQueuedTask(sessionId, retryParams),
+        (error) => console.error('❌ [Queue] Actor-revoked continuation failed:', error)
       );
       return;
     }
@@ -3432,10 +3540,16 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         method: 'patch',
         id: payload.widget_id as string,
       }),
-    isBranchOwner: async (branchId: string, userId: UUID) =>
-      widgetResolutionBranches.isOwner(branchId as import('@agor/core/types').BranchID, userId),
-    resolveBranchPermission: async (branch: import('@agor/core/types').Branch, userId: UUID) =>
-      widgetResolutionBranches.resolveUserPermission(branch, userId),
+    resolveSessionPromptAuthority: async (
+      branchId: string,
+      callerUserId: UUID,
+      sessionOwnerUserId: UUID
+    ) =>
+      widgetResolutionBranches.resolveSessionPromptAuthority(
+        branchId as import('@agor/core/types').BranchID,
+        callerUserId,
+        sessionOwnerUserId
+      ),
   };
 
   registerLongAuthenticatedRoute(
@@ -4256,10 +4370,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     );
   }
 
-  // Route-side wrapper for session-scoped runtime configuration. These
-  // settings can influence what a session process receives, so branch-level
-  // read/write tiers are not enough: only the session creator or a global
-  // admin/superadmin may read or mutate them.
+  // Route-side mutation wrapper for session-scoped runtime configuration.
+  // These settings can influence what a session process receives, so only the
+  // Session owner or a global admin/superadmin may mutate them.
   const requireSessionScopedConfigOwnerOrAdmin = async (
     sessionId: string,
     // biome-ignore lint/suspicious/noExplicitAny: FeathersJS params type
@@ -4279,10 +4392,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     checkSessionOwnerOrAdmin(user, session, superadminOpts);
   };
 
-  // Same authorization, but returns the session. MCP routes need its
-  // `created_by`: that identity, not the caller's, decides which private
-  // servers the session may see, so it has to be loaded for service-account
-  // callers too rather than short-circuited.
+  // Human/API reads retain the owner/admin rule. The sole exception is the
+  // executor projection read for the exact signed Task, Session, and actor.
   const authorizeAndLoadSessionForMcpConfig = async (
     sessionId: string,
     // biome-ignore lint/suspicious/noExplicitAny: FeathersJS params type
@@ -4294,6 +4405,20 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       | Session
       | undefined;
     if (!session) throw new NotFound(`Session not found: ${sessionId}`);
+    const tenantId = (params as AuthenticatedParams).tenant?.tenant_id ?? getCurrentTenantId();
+    const executorAuthorized = await authorizeTaskExecutorSessionMcpRead(
+      params,
+      session,
+      async (taskId) => {
+        if (!tenantId) throw new NotAuthenticated('Executor MCP read requires tenant identity');
+        return runWithTenantDatabaseScope(db, tenantId, (tenantDb) =>
+          new TaskRepository(tenantDb).findById(taskId)
+        );
+      }
+    );
+    if (executorAuthorized) {
+      return session;
+    }
     if (!user._isServiceAccount) checkSessionOwnerOrAdmin(user, session, superadminOpts);
     return session;
   };
@@ -4303,19 +4428,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     session: Session,
     params: RouteParams
   ): Promise<MCPServer[]> => {
-    const payload = (
-      params as RouteParams & {
-        authentication?: {
-          payload?: { type?: unknown; task_id?: unknown; sub?: unknown; tenant_id?: unknown };
-        };
-      }
-    ).authentication?.payload;
+    const executorScope = authenticatedTaskExecutorRuntimeScope(params);
     const tenantId =
       (params as RouteParams & { tenant?: { tenant_id?: string } }).tenant?.tenant_id ??
       getCurrentTenantId();
     if (!tenantId) throw new NotAuthenticated('MCP gateway projection requires tenant identity');
     const mode = await getMCPEgressGatewayMode(db);
-    if (payload?.type !== 'executor-session' || typeof payload.task_id !== 'string') {
+    if (!executorScope) {
       if (mode === 'compatibility' || mode === 'enforced') {
         throw new Forbidden(
           'MCP credentials are available only through a live task-scoped daemon capability'
@@ -4335,11 +4454,19 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     const gatewayBaseUrl =
       config.daemon?.public_url ?? config.daemon?.base_url ?? `http://localhost:${_DAEMON_PORT}`;
     return runWithTenantDatabaseScope(db, tenantId, async (tenantDb) => {
-      const task = await new TaskRepository(tenantDb).findById(payload.task_id as string);
-      if (!task || task.session_id !== session.session_id) {
+      const task = await new TaskRepository(tenantDb).findById(executorScope.taskId);
+      if (
+        !task ||
+        executorScope.sessionId !== session.session_id ||
+        task.session_id !== session.session_id ||
+        task.created_by !== params.user?.user_id
+      ) {
         throw new Forbidden('Executor task scope is no longer current');
       }
-      const resolvedEnv = await resolveMCPEgressEnvironment(tenantDb, session.created_by, session);
+      // The native conversation/home belongs to the Session owner, but every
+      // credential projection belongs to the actor who created this Task.
+      const credentialUserId = task.created_by;
+      const resolvedEnv = await resolveMCPEgressEnvironment(tenantDb, credentialUserId, session);
       const projected: MCPServer[] = [];
       for (const server of servers) {
         const eligibility = mcpEgressEligibility(server);
@@ -4354,7 +4481,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           const tokenUserId =
             (server.auth.oauth_mode ?? 'per_user') === 'shared'
               ? null
-              : (session.created_by as import('@agor/core/types').UserID);
+              : (credentialUserId as import('@agor/core/types').UserID);
           const grant = await new UserMCPOAuthTokenRepository(tenantDb).getToken(
             tokenUserId,
             server.mcp_server_id
@@ -4373,7 +4500,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             task_id: task.task_id,
             session_id: session.session_id,
             principal_user_id: task.created_by,
-            credential_user_id: session.created_by,
+            credential_user_id: credentialUserId,
             mcp_server_id: server.mcp_server_id,
             config_version: server.config_version ?? 1,
             material_hash: mcpEgressMaterialHash(server, resolvedEnv, jwtSecret),
@@ -4442,6 +4569,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           isServiceAccount: routeUser?._isServiceAccount,
           callerUserId: params.user?.user_id,
         });
+        // Personal session sharing preserves the Session owner/home but runs
+        // each prompt with the Task creator's Agor credentials. A private MCP
+        // server owned by the Session owner must therefore disappear when a
+        // different prompt actor executes the turn.
+        const credentialUserId = userId ?? session.created_by;
         const rawLookupParams = {
           ...params,
           provider: undefined,
@@ -4480,7 +4612,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             .filter(
               (entry): entry is Exclude<(typeof withMetadata)[number], null> => entry !== null
             )
-            .filter((entry) => isMCPServerUsableInSession(entry.server, session));
+            .filter((entry) => isMCPServerUsableBy(entry.server, credentialUserId));
           if (
             shouldExposeMCPServerSecrets(params, {
               allowSessionToken: true,
@@ -4526,12 +4658,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           scope: 'global',
           ...(enabledOnly ? { enabled: true } : {}),
           ...(userId ? { forUserId: userId } : {}),
-          // Global scope means "every session of everyone who may use it", not
-          // "every session in the tenant": a private server belongs to its
-          // owner's sessions only. Keyed on the session's creator rather than
-          // the caller or the query's `forUserId`, neither of which is the
-          // identity the session runs as.
-          usableByUserId: session.created_by,
+          // Private global servers belong to the current prompt actor. Shared
+          // rows remain available and resolve per-user OAuth for this same ID.
+          usableByUserId: credentialUserId,
           $limit: 1000,
         };
         const globalResult = includeGlobal
@@ -4542,7 +4671,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             })
           : [];
         const globalServers = Array.isArray(globalResult) ? globalResult : globalResult.data;
-        const servers = filterMCPServersForSession(
+        const servers = (
           includeGlobal
             ? [
                 ...new Map(
@@ -4552,9 +4681,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
                   ])
                 ).values(),
               ]
-            : sessionServers,
-          session
-        );
+            : sessionServers
+        ).filter((server) => isMCPServerUsableBy(server, credentialUserId));
         return shouldExposeMCPServerSecrets(params, {
           allowSessionToken: true,
           sessionId: id,
@@ -4566,7 +4694,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         const id = params.route?.id;
         if (!id) throw new Error('Session ID required');
         if (!data.mcpServerId) throw new Error('MCP Server ID required');
-        await authorizeAndLoadSessionForMcpConfig(id, params);
+        await requireSessionScopedConfigOwnerOrAdmin(id, params);
 
         try {
           await sessionMCPServersService.addServer(
@@ -4608,7 +4736,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           throw new BadRequest('mcpServerIds must contain strings');
         }
 
-        await authorizeAndLoadSessionForMcpConfig(id, params);
+        await requireSessionScopedConfigOwnerOrAdmin(id, params);
         const serverIds = [...new Set(data.mcpServerIds)] as Array<
           import('@agor/core/types').MCPServerID
         >;
@@ -5107,9 +5235,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         if (!callerId || data?.expectedUserId !== callerId) {
           throw new Forbidden('Session initialization caller changed');
         }
-        const session = await inCurrentTenantDatabaseScope(() =>
-          authorizeAndLoadSessionForMcpConfig(id, params)
-        );
+        const session = await inCurrentTenantDatabaseScope(async () => {
+          await requireSessionScopedConfigOwnerOrAdmin(id, params);
+          const current = await sessionsService.get(id, { provider: undefined });
+          if (!current) throw new NotFound(`Session not found: ${id}`);
+          return current as Session;
+        });
         let configuredMcpServerIds: MCPServerID[] | undefined;
         let configuredEnvVarNames: string[] | undefined;
 
@@ -5252,6 +5383,11 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           // unavailable storage modes before submit.
           branchStorage: resolveBranchStorageConfig(config),
           uploadPolicy: getUploadLimits(),
+          // Normalized board/branch policies are independently feature-gated.
+          // This is safe to advertise before login so the UI can avoid
+          // rendering controls that the daemon will reject. Authorization
+          // remains enforced server-side.
+          branchRbac: config.execution?.branch_rbac === true,
         },
       };
 

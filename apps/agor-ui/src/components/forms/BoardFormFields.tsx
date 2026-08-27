@@ -42,7 +42,10 @@ function normalizeBackgroundColor(value: unknown): string | null {
  * runtime the boards repository treats `null` as "clear this field", so the
  * cast is honest about wire semantics even though TS can't express them.
  */
-export function extractBoardFormValues(form: FormInstance): Partial<Board> {
+export function extractBoardFormValues(
+  form: FormInstance,
+  options: { includeLegacyPermissions?: boolean } = {}
+): Partial<Board> {
   const values = form.getFieldsValue(true);
   const bgColor = values.background_color;
   return {
@@ -57,13 +60,17 @@ export function extractBoardFormValues(form: FormInstance): Partial<Board> {
     // toHexString when it's actually present; otherwise clear the field.
     background_color: normalizeBackgroundColor(bgColor),
     custom_css: values.custom_css || null,
-    access_mode: values.access_mode || 'shared',
-    default_others_can:
-      values.access_mode === 'private' ? 'none' : values.default_others_can || 'session',
-    default_others_fs_access: values.default_others_fs_access || 'read',
-    default_dangerously_allow_session_sharing: Boolean(
-      values.default_dangerously_allow_session_sharing
-    ),
+    ...(options.includeLegacyPermissions === false
+      ? {}
+      : {
+          access_mode: values.access_mode || 'shared',
+          default_others_can:
+            values.access_mode === 'private' ? 'none' : values.default_others_can || 'session',
+          default_others_fs_access: values.default_others_fs_access || 'read',
+          default_dangerously_allow_session_sharing: Boolean(
+            values.default_dangerously_allow_session_sharing
+          ),
+        }),
     custom_context: values.custom_context ? JSON.parse(values.custom_context) : null,
   } as unknown as Partial<Board>;
 }
@@ -82,6 +89,8 @@ export interface BoardFormFieldsProps {
   rbacEnabled?: boolean;
   allUsers?: User[];
   allGroups?: Group[];
+  /** Normalized permission editor mounted by BoardEditModal and persisted separately. */
+  capabilityPolicyEditor?: React.ReactNode;
 }
 
 /**
@@ -99,6 +108,7 @@ export const BoardFormFields: React.FC<BoardFormFieldsProps> = ({
   rbacEnabled = false,
   allUsers = [],
   allGroups = [],
+  capabilityPolicyEditor,
 }) => {
   const generalFields = (
     <>
@@ -156,7 +166,7 @@ export const BoardFormFields: React.FC<BoardFormFieldsProps> = ({
     }
   };
 
-  const permissionsFields = (
+  const legacyPermissionsFields = (
     <Form layout="horizontal" colon={false} component={false}>
       <Alert
         type="info"
@@ -187,6 +197,8 @@ export const BoardFormFields: React.FC<BoardFormFieldsProps> = ({
       )}
     </Form>
   );
+
+  const permissionsFields = capabilityPolicyEditor ?? legacyPermissionsFields;
 
   const cssFields = <BoardBackgroundEditor form={form} resetSignal={backgroundResetSignal} />;
 
