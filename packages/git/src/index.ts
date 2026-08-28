@@ -2158,7 +2158,6 @@ export async function getGitState(repoPath: string): Promise<string> {
   try {
     // Check if it's a git repo first
     if (!(await isGitRepo(repoPath))) {
-      console.warn(`[getGitState] Not a git repo: ${repoPath}`);
       return 'unknown';
     }
 
@@ -2173,20 +2172,12 @@ export async function getGitState(repoPath: string): Promise<string> {
         if (headSha) {
           const clean = await isClean(repoPath);
           const trimmed = headSha.trim();
-          console.log(
-            `[getGitState] git.log() returned no SHA but rev-parse HEAD succeeded: ${trimmed.substring(0, 8)} (${repoPath})`
-          );
           return clean ? trimmed : `${trimmed}-dirty`;
         }
-      } catch (revParseError) {
-        console.warn(
-          `[getGitState] Both git.log() and rev-parse HEAD failed for ${repoPath}:`,
-          revParseError
-        );
+      } catch {
+        // Fall through to the documented unknown result. Owning callers decide
+        // whether and how to record contextual diagnostics.
       }
-      console.warn(
-        `[getGitState] Could not determine SHA for ${repoPath} (git log returned empty)`
-      );
       return 'unknown';
     }
 
@@ -2194,8 +2185,7 @@ export async function getGitState(repoPath: string): Promise<string> {
     const clean = await isClean(repoPath);
 
     return clean ? sha : `${sha}-dirty`;
-  } catch (error) {
-    console.warn(`[getGitState] Failed for ${repoPath}:`, error);
+  } catch {
     return 'unknown';
   }
 }
