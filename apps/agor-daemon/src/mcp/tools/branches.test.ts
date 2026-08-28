@@ -1276,6 +1276,7 @@ describe('agor_branches_set_zone', () => {
     const result = await setZone({ branchId: 'branch-1', zoneId: null });
     const parsed = JSON.parse(result.content[0].text);
 
+    expect(branchesGet).toHaveBeenCalledOnce();
     expect(branchesGet).toHaveBeenCalledWith('branch-1', baseServiceParams);
     expect(findByBranchId).toHaveBeenCalledWith('branch-1', baseServiceParams);
     expect(boardObjectsPatch).toHaveBeenCalledWith(
@@ -1409,6 +1410,7 @@ describe('agor_branches_set_zone', () => {
     });
     const parsed = JSON.parse(result.content[0].text);
 
+    expect(branchesGet).toHaveBeenCalledOnce();
     expect(sessionsGet).toHaveBeenCalledWith('session-1', baseServiceParams);
     expect(boardObjectsPatch).toHaveBeenCalledWith(
       'obj-branch-1',

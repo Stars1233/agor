@@ -442,6 +442,8 @@ export interface RegisterHooksContext {
   sessionsService: SessionsServiceImpl;
   messagesService: MessagesServiceImpl;
   boardsService: BoardsServiceImpl | undefined;
+  /** Test seam; production constructs one repository over the trusted scoped DB. */
+  boardRepository?: BoardRepository & RealtimeAccessBoardRepository;
   branchRepository: BranchRepository;
   usersRepository: UsersRepository;
   sessionsRepository: SessionRepository;
@@ -1229,8 +1231,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     sessionsRepository: sessionsRepository as unknown as RealtimeAccessSessionRepository,
   });
   bindRealtimeAccessCacheInvalidation(app, realtimeAccessCache);
-  const boardRepository = new BoardRepository(db) as BoardRepository &
-    RealtimeAccessBoardRepository;
+  const boardRepository =
+    ctx.boardRepository ??
+    (new BoardRepository(db) as BoardRepository & RealtimeAccessBoardRepository);
   const boardCommentsRepository = new BoardCommentsRepository(db);
   const boardObjectsRepository = new BoardObjectRepository(db);
   const cardRepository = new CardRepository(db);
@@ -1577,7 +1580,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
    */
   const promptWriteGuards = [
     ...(executionMode.appRbacEnabled || executionMode.requiresExecutionHomeKey
-      ? [resolveSessionContext(), loadSession(sessionsService)]
+      ? [resolveSessionContext(), loadSession(sessionsRepository)]
       : []),
     ...(executionMode.requiresExecutionHomeKey
       ? [validateSessionUnixUsername(usersRepository)]
@@ -1617,7 +1620,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(executionMode.appRbacEnabled
           ? [
               resolveSessionContext(),
-              loadSession(sessionsService),
+              loadSession(sessionsRepository),
               loadBranchFromSession(branchRepository),
               ensureCanView(superadminOpts), // Require 'view' permission
             ]
@@ -1650,7 +1653,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(executionMode.appRbacEnabled
           ? [
               resolveSessionContext(),
-              loadSession(sessionsService),
+              loadSession(sessionsRepository),
               loadBranchFromSession(branchRepository),
               ensureCanPromptInSession({ ...superadminOpts, branchRepository }), // Require 'prompt' (or 'session' for own sessions)
             ]
@@ -1663,7 +1666,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(executionMode.appRbacEnabled
           ? [
               resolveSessionContext(),
-              loadSession(sessionsService),
+              loadSession(sessionsRepository),
               loadBranchFromSession(branchRepository),
               ensureCanPromptInSession({ ...superadminOpts, branchRepository }), // Require 'prompt' (or 'session' for own sessions)
             ]
@@ -2681,7 +2684,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 if (!sessionId) return context;
                 context.params.sessionId = sessionId;
                 // Delegate to the existing chain now that sessionId is primed.
-                await loadSession(sessionsService)(context);
+                await loadSession(sessionsRepository)(context);
                 await loadBranchFromSession(branchRepository)(context);
                 await ensureCanView(superadminOpts)(context);
                 return context;
@@ -2970,7 +2973,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     ...(executionMode.appRbacEnabled
       ? [
           resolveSessionContext(),
-          loadSession(sessionsService),
+          loadSession(sessionsRepository),
           loadBranchFromSession(branchRepository),
           // Branch permission by patch type:
           //   - Prompt-flow patches (tasks, archived, status, …) are bookkeeping
@@ -3026,7 +3029,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(executionMode.appRbacEnabled
           ? [
               // Load session's branch and check permissions
-              loadSessionBranch(sessionsService, branchRepository),
+              loadSessionBranch(sessionsRepository, branchRepository),
               ensureCanView(superadminOpts), // Require 'view' permission on branch
             ]
           : []),
@@ -3114,7 +3117,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(executionMode.appRbacEnabled
           ? [
               resolveSessionContext(),
-              loadSession(sessionsService),
+              loadSession(sessionsRepository),
               loadBranchFromSession(branchRepository),
               ensureBranchPermission('all', 'delete sessions', superadminOpts), // Require 'all' permission
             ]
@@ -3312,7 +3315,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(executionMode.appRbacEnabled
           ? [
               resolveSessionContext(),
-              loadSession(sessionsService),
+              loadSession(sessionsRepository),
               loadBranchFromSession(branchRepository),
               ensureCanView(superadminOpts), // Require 'view' permission
             ]
@@ -3330,7 +3333,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(executionMode.appRbacEnabled
           ? [
               resolveSessionContext(),
-              loadSession(sessionsService),
+              loadSession(sessionsRepository),
               loadBranchFromSession(branchRepository),
               ensureCanPromptInSession({ ...superadminOpts, branchRepository }), // Require 'prompt' (or 'session' for own sessions)
             ]
@@ -3348,7 +3351,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(executionMode.appRbacEnabled
           ? [
               resolveSessionContext(),
-              loadSession(sessionsService),
+              loadSession(sessionsRepository),
               loadBranchFromSession(branchRepository),
               ensureBranchPermission('all', 'delete tasks', superadminOpts),
             ]
@@ -3399,14 +3402,36 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       if (!board) throw new Forbidden(`Board not found: ${id}`);
       const allowed =
         mode === 'view'
-          ? await boardRepository.canView(board.board_id, user.user_id as UserID)
-          : await boardRepository.canMutate(board.board_id, user.user_id as UserID);
+          ? await boardRepository.canViewResolved(board, user.user_id as UserID)
+          : await boardRepository.canMutateResolved(board, user.user_id as UserID);
       if (!allowed) {
         throw new Forbidden(
           mode === 'view'
             ? `You need board access to ${action}`
             : `You need Board Editor or Manager access to ${action}`
         );
+      }
+      if (context.path === 'boards' && context.method === 'get' && context.id) {
+        // The same tenant transaction and caller authority immediately enter
+        // BoardsService.get after this hook. Canonicalize short/slug IDs and
+        // pass the just-authorized row through the generic adapter's bounded
+        // request params instead of reading it a third time. This is neither a
+        // cross-request nor cross-principal cache; policy resolution above is
+        // still performed on every call, preserving immediate revocation.
+        context.id = board.board_id;
+        (
+          context.params as typeof context.params & {
+            _agorPrefetchedRecord?: {
+              id: string;
+              idField: string;
+              record: Board;
+            };
+          }
+        )._agorPrefetchedRecord = {
+          id: board.board_id,
+          idField: 'board_id',
+          record: board,
+        };
       }
       return context;
     };

@@ -1260,7 +1260,7 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
       }),
     },
     async (args) => {
-      const branchId = await resolveBranchId(ctx, coerceString(args.branchId)!);
+      const branchIdInput = coerceString(args.branchId)!;
       const zoneId = args.zoneId === null ? null : coerceString(args.zoneId)!;
       const rawTargetSessionId = coerceString(args.targetSessionId);
       const triggerTemplate = args.triggerTemplate === true;
@@ -1271,6 +1271,11 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
         );
       }
 
+      // branches.get resolves short IDs and returns the canonical authorized
+      // entity. Keep it for the rest of this operation instead of resolving
+      // with one get and reading the same branch again below.
+      const branch = await ctx.app.service('branches').get(branchIdInput, ctx.baseServiceParams);
+      const branchId = branch.branch_id;
       const targetSession = rawTargetSessionId
         ? ((await ctx.app
             .service('sessions')
@@ -1286,9 +1291,6 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           ? `📍 MCP clearing zone pin for branch ${shortId(branchId)}`
           : `📍 MCP pinning branch ${shortId(branchId)} to zone ${zoneId}`
       );
-
-      // Get branch to find its board
-      const branch = await ctx.app.service('branches').get(branchId, ctx.baseServiceParams);
 
       if (triggerTemplate && targetSession && targetSession.branch_id !== branch.branch_id) {
         throw new Error(
