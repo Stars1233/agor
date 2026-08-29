@@ -1015,3 +1015,116 @@ describe('MCP catalog install identity migration', () => {
     expect(postgres).toContain('coalesce("owner_user_id",\'\')');
   });
 });
+
+describe('MCP stdio transport repair migrations', () => {
+  it('removes only remote fields from SQLite stdio rows', async () => {
+    const client = createClient({ url: ':memory:' });
+    await client.executeMultiple(`
+      CREATE TABLE mcp_servers (
+        mcp_server_id text PRIMARY KEY,
+        transport text NOT NULL,
+        tenant_id text NOT NULL,
+        data text NOT NULL
+      );
+      CREATE TABLE user_mcp_oauth_tokens (
+        user_id text,
+        mcp_server_id text NOT NULL,
+        oauth_access_token text NOT NULL
+      );
+      CREATE TABLE mcp_oauth_pending_flows (
+        attempt_id text PRIMARY KEY,
+        mcp_server_id text NOT NULL,
+        sealed_material text
+      );
+      INSERT INTO mcp_servers VALUES (
+        'legacy-stdio',
+        'stdio',
+        'tenant-a',
+        '{"command":"mcp-server-shortcut","args":[""],"env":{"SHORTCUT_API_TOKEN":"{{ user.env.SHORTCUT_API_TOKEN }}"},"auth":{"type":"bearer","token":"obsolete"},"url":"https://unused.example","headers":{"X-Unused":"obsolete"},"config_version":7}'
+      );
+      INSERT INTO mcp_servers VALUES (
+        'clean-stdio',
+        'stdio',
+        'tenant-b',
+        '{"command":"other-server","env":{"TOKEN":"{{ user.env.OTHER_TOKEN }}"}}'
+      );
+      INSERT INTO mcp_servers VALUES (
+        'remote',
+        'http',
+        'tenant-a',
+        '{"url":"https://mcp.example.com","headers":{"X-Key":"kept"},"auth":{"type":"bearer","token":"kept"}}'
+      );
+      INSERT INTO user_mcp_oauth_tokens VALUES
+        ('user-a', 'legacy-stdio', 'obsolete-legacy-grant'),
+        ('user-b', 'clean-stdio', 'obsolete-clean-grant'),
+        ('user-a', 'remote', 'kept-remote-grant');
+      INSERT INTO mcp_oauth_pending_flows VALUES
+        ('legacy-flow', 'legacy-stdio', 'obsolete-legacy-sealed-material'),
+        ('clean-flow', 'clean-stdio', 'obsolete-clean-sealed-material'),
+        ('remote-flow', 'remote', 'kept-remote-sealed-material');
+    `);
+
+    const migration = await readFile(
+      new URL('../../drizzle/sqlite/0099_strip_stdio_remote_fields.sql', import.meta.url),
+      'utf8'
+    );
+    await client.executeMultiple(migration.replaceAll('--> statement-breakpoint', ''));
+
+    const rows = await client.execute(
+      'SELECT mcp_server_id, tenant_id, data FROM mcp_servers ORDER BY mcp_server_id'
+    );
+    const decoded = Object.fromEntries(
+      rows.rows.map((row) => [row.mcp_server_id, JSON.parse(row.data as string)])
+    );
+    expect(decoded['legacy-stdio']).toEqual({
+      command: 'mcp-server-shortcut',
+      args: [''],
+      env: { SHORTCUT_API_TOKEN: '{{ user.env.SHORTCUT_API_TOKEN }}' },
+      config_version: 7,
+    });
+    expect(decoded['clean-stdio']).toEqual({
+      command: 'other-server',
+      env: { TOKEN: '{{ user.env.OTHER_TOKEN }}' },
+    });
+    expect(decoded.remote).toEqual({
+      url: 'https://mcp.example.com',
+      headers: { 'X-Key': 'kept' },
+      auth: { type: 'bearer', token: 'kept' },
+    });
+    expect(rows.rows.map((row) => [row.mcp_server_id, row.tenant_id])).toEqual([
+      ['clean-stdio', 'tenant-b'],
+      ['legacy-stdio', 'tenant-a'],
+      ['remote', 'tenant-a'],
+    ]);
+    const grants = await client.execute(
+      'SELECT mcp_server_id FROM user_mcp_oauth_tokens ORDER BY mcp_server_id'
+    );
+    expect(grants.rows.map((row) => row.mcp_server_id)).toEqual(['remote']);
+    const pendingFlows = await client.execute(
+      'SELECT mcp_server_id, sealed_material FROM mcp_oauth_pending_flows ORDER BY mcp_server_id'
+    );
+    expect(pendingFlows.rows).toEqual([
+      {
+        mcp_server_id: 'remote',
+        sealed_material: 'kept-remote-sealed-material',
+      },
+    ]);
+    client.close();
+  });
+
+  it('bounds the PostgreSQL cross-tenant repair to a temporary exact capability', async () => {
+    const migration = await readFile(
+      new URL('../../drizzle/postgres/0096_strip_stdio_remote_fields.sql', import.meta.url),
+      'utf8'
+    );
+
+    expect(migration).toContain(`SET "data" = server."data" - 'auth' - 'url' - 'headers'`);
+    expect(migration).toContain(`WHERE "transport" = 'stdio'`);
+    expect(migration).toContain('DELETE FROM "user_mcp_oauth_tokens"');
+    expect(migration).toContain('DELETE FROM "mcp_oauth_pending_flows"');
+    expect(migration).toContain("= 'stdio_remote_repair_0096'");
+    expect(migration.match(/CREATE POLICY "stdio_repair_0096_/g)).toHaveLength(6);
+    expect(migration.match(/DROP POLICY "stdio_repair_0096_/g)).toHaveLength(6);
+    expect(migration).toContain("SELECT set_config('agor.system_scope', '', true)");
+  });
+});
