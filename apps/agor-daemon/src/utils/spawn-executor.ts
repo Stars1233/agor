@@ -161,6 +161,16 @@ export interface ExecutorTemplateVariables {
   log_level?: string;
   executor_type?: string;
   /**
+   * Absolute path of the per-branch SDK home for a branch-scoped Session, or
+   * empty for an execution-home Session (design §7.4). In `delegated` mode
+   * Agor mounts nothing, so the external launcher owns enforcement: it must
+   * relocate the tool's SDK home and provide any safe caller-scoped credential
+   * overlay. Shell-escaped during substitution like {tenant_id}; always
+   * rendered (empty string when unused) so the placeholder never survives into
+   * the command.
+   */
+  branch_sdk_home?: string;
+  /**
    * Trusted runtime tenant identity. This is populated from the ambient tenant
    * context, shell-escaped during substitution, and is not caller-overridable
    * through `SpawnExecutorOptions.templateVariables`.
@@ -192,6 +202,13 @@ export interface SpawnExecutorOptions {
   onSpawn?: (child: ChildProcess, context: ExecutorSpawnContext) => void | Promise<void>;
   /** Caller-assembled env; bypasses internal curation. Ignored by templated path. */
   preparedEnv?: Record<string, string>;
+  /**
+   * Parent-process descriptors for race-safe local sandbox file mounts. The
+   * caller keeps each descriptor open through this synchronous spawn call and
+   * closes its copy afterwards. Never forwarded to delegated launchers or the
+   * executor payload.
+   */
+  localSandboxFileBinds?: Array<{ sourceFd: number; destination: string }>;
 }
 
 export type { ExecutorCommandResult } from '@agor/core/executor-protocol';
@@ -220,7 +237,7 @@ function observeExitCallback(
 }
 
 export interface RunExecutorCommandOptions
-  extends Omit<SpawnExecutorOptions, 'onExit' | 'onSpawn'> {
+  extends Omit<SpawnExecutorOptions, 'localSandboxFileBinds' | 'onExit' | 'onSpawn'> {
   /** Built-in call-specific timeout; config `timeout_ms.by_command` may override it. */
   timeoutMs?: number;
   /** Suppress child stdout/stderr logs for credential-sensitive operations. */
@@ -312,17 +329,23 @@ export function substituteTemplateVariables(
     branch_fs_access: variables.branch_fs_access,
     log_level: variables.log_level,
     executor_type: variables.executor_type,
+    // Always render (empty string when unused) so `{branch_sdk_home}` never
+    // survives literally into the command line (design §7.4).
+    branch_sdk_home: variables.branch_sdk_home ?? '',
     tenant_id: variables.tenant_id,
   };
 
+  // Security-sensitive values rendered as one opaque shell argument. tenant_id
+  // may originate in external auth claims; branch_sdk_home is a filesystem path
+  // that must not word-split or glob. Templates should use them unquoted, e.g.
+  // `launcher --tenant-id {tenant_id} --sdk-home {branch_sdk_home}`.
+  const shellEscapedKeys = new Set(['tenant_id', 'branch_sdk_home']);
   for (const [key, value] of Object.entries(substitutions)) {
     if (value !== undefined) {
       const placeholder = new RegExp(`\\{${key}\\}`, 'g');
-      // executor_command_template is executed via `sh -c`. Tenant IDs may
-      // originate in external auth claims, so render this security-sensitive
-      // value as one opaque shell argument. Templates should use
-      // `{tenant_id}` unquoted, e.g. `launcher --tenant-id {tenant_id}`.
-      const renderedValue = key === 'tenant_id' ? escapeShellArg(String(value)) : String(value);
+      const renderedValue = shellEscapedKeys.has(key)
+        ? escapeShellArg(String(value))
+        : String(value);
       result = result.replace(placeholder, renderedValue);
     }
   }
@@ -419,6 +442,9 @@ export function spawnExecutor(
   };
 
   if (executorCommandTemplate) {
+    if (options.localSandboxFileBinds?.length) {
+      throw new Error('Local sandbox file binds cannot be forwarded to a delegated launcher');
+    }
     spawnExecutorWithTemplate(payloadWithConfig, {
       ...options,
       executorCommandTemplate,
@@ -470,8 +496,14 @@ function sendExecutorPayload(
 function sandboxLocalExecutorCommand(
   payload: Record<string, unknown>,
   command: { cmd: string; args: string[]; env: Record<string, string | undefined> },
-  logPrefix: string
-): { cmd: string; args: string[]; env: Record<string, string | undefined> } {
+  logPrefix: string,
+  localSandboxFileBinds: SpawnExecutorOptions['localSandboxFileBinds']
+): {
+  cmd: string;
+  args: string[];
+  env: Record<string, string | undefined>;
+  inheritedFds?: number[];
+} {
   // Sandbox around the WORK directory, never the executor package cwd. The
   // daemon supplies this path and the caller's normalized filesystem access;
   // the executor must not rediscover either from client-controlled data.
@@ -482,6 +514,7 @@ function sandboxLocalExecutorCommand(
         sandboxHomeStore?: unknown;
         sandboxWorktreesRoot?: unknown;
         principalBranchAccess?: unknown;
+        sandboxBranchSdkHome?: unknown;
       }
     | undefined;
   const workdir =
@@ -490,7 +523,19 @@ function sandboxLocalExecutorCommand(
       : typeof params?.cwd === 'string' && params.cwd.length > 0
         ? params.cwd
         : undefined;
-  if (!workdir) return command;
+  if (!workdir) {
+    if (localSandboxFileBinds?.length) {
+      throw new Error('Sandbox file binds require an authoritative branch working directory');
+    }
+    return command;
+  }
+
+  const inheritedFds = localSandboxFileBinds?.map((bind) => bind.sourceFd) ?? [];
+  const childCredentialBinds = localSandboxFileBinds?.map((bind, index) => ({
+    // Node maps extra stdio entries to child descriptors starting at 3.
+    fd: 3 + index,
+    destination: bind.destination,
+  }));
 
   const branchAccess =
     params?.principalBranchAccess === 'read' || params?.principalBranchAccess === 'none'
@@ -508,14 +553,23 @@ function sandboxLocalExecutorCommand(
     worktreesRoot:
       typeof params?.sandboxWorktreesRoot === 'string' ? params.sandboxWorktreesRoot : undefined,
     branchAccess,
+    branchSdkHomeDir:
+      typeof params?.sandboxBranchSdkHome === 'string' ? params.sandboxBranchSdkHome : undefined,
+    branchSdkCredentialBinds: childCredentialBinds,
     runtimePaths: configuredExecutorDefaults.sandboxRuntimePaths as SandboxRuntimePaths,
   });
-  if (!wrap) return command;
+  if (!wrap) {
+    if (inheritedFds.length > 0) {
+      throw new Error('Credential file binds require the fail-closed filesystem sandbox');
+    }
+    return command;
+  }
   console.log(`${logPrefix} Sandbox: wrapping executor via bwrap (filesystem-only)`);
   return {
     cmd: wrap.cmd,
     args: wrap.args,
     env: { ...command.env, ...wrap.extraEnv },
+    ...(inheritedFds.length > 0 ? { inheritedFds } : {}),
   };
 }
 
@@ -546,7 +600,8 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
     spawnCommand = sandboxLocalExecutorCommand(
       payload,
       { cmd, args, env: envWithDaemonUrl },
-      logPrefix
+      logPrefix,
+      options.localSandboxFileBinds
     );
   } catch (err) {
     console.error(
@@ -568,7 +623,7 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
   const executorProcess = spawn(spawnCommand.cmd, spawnCommand.args, {
     cwd,
     env: { ...spawnCommand.env },
-    stdio: ['pipe', 'inherit', 'inherit'], // stdin: pipe, stdout/stderr: inherit (show in daemon logs)
+    stdio: ['pipe', 'inherit', 'inherit', ...(spawnCommand.inheritedFds ?? [])], // stdin: pipe, stdout/stderr: inherit; extra entries are pinned credential fds
     detached: process.platform !== 'win32',
   });
 
@@ -1210,7 +1265,8 @@ function requestExecutorLocal(
     spawnCommand = sandboxLocalExecutorCommand(
       payload,
       { cmd, args, env: envWithDaemonUrl },
-      logPrefix
+      logPrefix,
+      undefined
     );
   } catch (error) {
     response.fail({

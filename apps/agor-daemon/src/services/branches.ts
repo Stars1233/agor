@@ -6,6 +6,7 @@
  */
 
 import type { ChildProcess } from 'node:child_process';
+import { rm } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 import { analyticsLogger } from '@agor/core/analytics';
 import {
@@ -14,6 +15,7 @@ import {
   ensureBranchCloneDepthAllowed,
   ensureBranchStorageModeAllowed,
   getBranchesDir,
+  getBranchHomePath,
   PAGINATION,
   resolveBranchStorageConfig,
   resolveExecutionSecurityMode,
@@ -817,6 +819,11 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
       if (!item.board_id) {
         throw new BadRequest('board_id is required when creating a branch');
       }
+      if (Object.hasOwn(item, 'sdk_home')) {
+        throw new BadRequest(
+          'sdk_home is server-managed and cannot be set through the Branch API.'
+        );
+      }
     };
 
     if (Array.isArray(data)) {
@@ -1136,6 +1143,11 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
     data: Partial<Branch>,
     params?: BranchParams
   ): Promise<BranchWithZoneAndSessions> {
+    if (Object.hasOwn(data, 'sdk_home')) {
+      throw new BadRequest(
+        'sdk_home is server-managed and cannot be changed through the Branch API.'
+      );
+    }
     if (Object.hasOwn(data, 'base_remote_url')) {
       throw new BadRequest('base_remote_url is immutable after branch creation.');
     }
@@ -1458,6 +1470,8 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
       }
     );
 
+    this.removeBranchSdkHomeAfterDelete(branch, tenantId);
+
     // Then remove from filesystem via a one-purpose executor (fire-and-forget).
     // The daemon owns metadata; the payload contains only authoritative paths.
     if (deleteFromFilesystem) {
@@ -1512,31 +1526,48 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
   async removeMetadataWithRealtime(id: BranchID, params?: BranchParams): Promise<Branch> {
     const removalParams = params ?? ({} as BranchParams);
     const tenantId = removalParams.tenant?.tenant_id ?? getCurrentTenantId();
-    return runWithTenantDatabaseTransaction(this.db, tenantId, async (scoped) => {
-      const { branchRepo, taskRepo } = this.removalRepositories(scoped);
-      const branch = await branchRepo.findById(id);
-      if (!branch) throw new NotFound(`Branch not found: ${id}`);
-      await this.assertNoUnfinishedTasks(branch.branch_id, taskRepo);
-      await captureBranchRemovalRealtimeVisibility({
-        params: removalParams,
-        branchRepository: branchRepo,
-        branchId: branch.branch_id,
-        branchRbacEnabled: this.appRbacEnabled,
-      });
+    const removedBranch = await runWithTenantDatabaseTransaction(
+      this.db,
+      tenantId,
+      async (scoped) => {
+        const { branchRepo, taskRepo } = this.removalRepositories(scoped);
+        const branch = await branchRepo.findById(id);
+        if (!branch) throw new NotFound(`Branch not found: ${id}`);
+        await this.assertNoUnfinishedTasks(branch.branch_id, taskRepo);
+        await captureBranchRemovalRealtimeVisibility({
+          params: removalParams,
+          branchRepository: branchRepo,
+          branchId: branch.branch_id,
+          branchRbacEnabled: this.appRbacEnabled,
+        });
 
-      // This custom method deliberately bypasses Feathers' standard method
-      // wrapper. The explicit event below is the single authoritative
-      // tombstone and drains only after the transaction commits.
-      await branchRepo.delete(branch.branch_id);
-      const removedBranch = branch;
-      emitServiceEvent(this.app, {
-        path: 'branches',
-        event: 'removed',
-        data: removedBranch,
-        params: removalParams,
-        id: removedBranch.branch_id,
-      });
-      return removedBranch;
+        // This custom method deliberately bypasses Feathers' standard method
+        // wrapper. The explicit event below is the single authoritative
+        // tombstone and drains only after the transaction commits.
+        await branchRepo.delete(branch.branch_id);
+        const removedBranch = branch;
+        emitServiceEvent(this.app, {
+          path: 'branches',
+          event: 'removed',
+          data: removedBranch,
+          params: removalParams,
+          id: removedBranch.branch_id,
+        });
+        return removedBranch;
+      }
+    );
+    this.removeBranchSdkHomeAfterDelete(removedBranch, tenantId);
+    return removedBranch;
+  }
+
+  /** Best-effort cleanup for every hard-delete path; archives never call it. */
+  private removeBranchSdkHomeAfterDelete(branch: Branch, tenantId: string | undefined): void {
+    const branchHomeDir = getBranchHomePath(branch.branch_id, tenantId);
+    void rm(branchHomeDir, { recursive: true, force: true }).catch((err) => {
+      console.warn(
+        `[BranchesService.delete ${branch.name}] Failed to remove branch SDK home ` +
+          `${branchHomeDir}: ${err instanceof Error ? err.message : String(err)}`
+      );
     });
   }
 
@@ -1639,6 +1670,7 @@ export class BranchesService extends DrizzleService<Branch, Partial<Branch>, Bra
 
       console.log(`🗑️  Spawning executor to delete branch from filesystem: ${branch.path}`);
       const tenantId = params?.tenant?.tenant_id ?? getCurrentTenantId();
+
       spawnExecutor(
         {
           command: 'git.branch.remove',
