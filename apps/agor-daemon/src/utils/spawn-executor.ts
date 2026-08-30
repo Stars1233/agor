@@ -55,6 +55,7 @@ import {
 } from '../executor-tracking.js';
 import { withResolvedConfig } from './build-resolved-config-slice.js';
 import { buildSandboxWrap, type SandboxRuntimePaths } from './sandbox-wrap.js';
+import { buildTrustedLauncherEnvironment } from './trusted-launcher-environment.js';
 
 let configuredDaemonUrl: string | null = null;
 
@@ -83,15 +84,12 @@ function withDaemonExecutorEnv(
  * The executor's authenticated payload is sent over stdin; the intermediate
  * `sh -c <launcher>` must not inherit the daemon's database URL, JWT/master
  * secrets, provider credentials, or other ambient deployment configuration.
- * Operators that need launcher authentication must arrange it outside the
- * daemon environment (for example through the delegated substrate's workload
- * identity) rather than implicitly exporting the daemon's credential bag.
+ * The one exception is the launcher's own `AGOR_CLOUD_*` runtime-service
+ * credentials (https://github.com/preset-io/agor-cloud/issues/198);
+ * daemon-internal secrets stay withheld.
  */
 function resolveTemplateLauncherEnvironment(logLevel: string): Record<string, string> {
-  return {
-    ...buildAllowlistedEnv(),
-    LOG_LEVEL: logLevel,
-  };
+  return buildTrustedLauncherEnvironment(logLevel);
 }
 
 /** Set the daemon URL for executor payloads. Call once at daemon startup. */
@@ -675,18 +673,13 @@ function spawnExecutorWithTemplate(
 
   const executorProcess = spawn('sh', ['-c', command], {
     env: resolveTemplateLauncherEnvironment(logLevel),
-    stdio: ['pipe', 'pipe', 'pipe'],
+    // Trusted launchers receive the reserved AGOR_CLOUD_* credential namespace.
+    // Their output is therefore not a daemon logging channel: discard it at the
+    // process boundary and retain only the closed spawn/exit metadata below.
+    stdio: ['pipe', 'ignore', 'ignore'],
   });
 
   const spawnReady = options.onSpawn?.(executorProcess, { mode: 'templated' });
-
-  executorProcess.stdout?.on('data', (data) => {
-    console.log(`${logPrefix} ${data.toString().trim()}`);
-  });
-
-  executorProcess.stderr?.on('data', (data) => {
-    console.error(`${logPrefix} ${data.toString().trim()}`);
-  });
 
   executorProcess.on('error', (error) => {
     console.error(`${logPrefix} Spawn error:`, error.message);
@@ -1349,16 +1342,13 @@ function requestExecutorWithTemplate(
 
   const child = spawn('sh', ['-c', command], {
     env: resolveTemplateLauncherEnvironment(logLevel),
-    stdio: ['pipe', 'pipe', 'pipe'],
+    // The authenticated response channel is the result protocol. Launcher
+    // stdout/stderr are untrusted diagnostics from a secret-bearing process
+    // and must never be relayed into daemon logs.
+    stdio: ['pipe', 'ignore', 'ignore'],
   });
 
   response.setFailureCleanup(() => child.kill('SIGTERM'));
-  child.stdout?.on('data', (chunk: Buffer) => {
-    if (!options.sensitiveOutput) logChunkedOutput(logPrefix, 'stdout', chunk);
-  });
-  child.stderr?.on('data', (chunk: Buffer) => {
-    if (!options.sensitiveOutput) logChunkedOutput(logPrefix, 'stderr', chunk);
-  });
   child.stdin?.on('error', () => {
     response.fail({
       success: false,
