@@ -21,6 +21,7 @@ import type { AgenticToolConfigurationReference } from './agentic-tool-preset';
 import type { ContextFilePath } from './context';
 import type { BoardID, BranchID, SessionID, SessionRelationshipID, TaskID, UserID } from './id';
 import type { ScheduleID } from './schedule';
+import type { TaskStatus, TerminationCoordinationPendingCode } from './task';
 
 export const SessionStatus = {
   IDLE: 'idle',
@@ -34,6 +35,81 @@ export const SessionStatus = {
 } as const;
 
 export type SessionStatus = (typeof SessionStatus)[keyof typeof SessionStatus];
+
+/** Durable outcome reported by the authenticated Session Stop endpoint. */
+export const SESSION_STOP_OUTCOMES = [
+  'stopped',
+  'already_idle',
+  'pending',
+  'unverified',
+  'condition_changed',
+  'not_stoppable',
+  'force_failed',
+] as const;
+
+export type SessionStopOutcome = (typeof SESSION_STOP_OUTCOMES)[number];
+
+/** Authenticated Session Stop endpoint request. */
+export type SessionStopRequest =
+  | {
+      force_unverified?: false;
+      reason?: string;
+      expected_task_id?: TaskID;
+      task_id?: never;
+      termination_requested_at?: never;
+      confirmation?: never;
+    }
+  | {
+      force_unverified: true;
+      task_id: TaskID;
+      termination_requested_at: string;
+      confirmation: string;
+      reason?: never;
+      expected_task_id?: never;
+    };
+
+interface SessionStopResultBase {
+  reason?: string;
+  stoppedTaskId?: TaskID;
+  queuedTasksPreserved?: number;
+}
+
+/** Result returned by the authenticated Session Stop endpoint. */
+export type SessionStopResult =
+  | (SessionStopResultBase & {
+      success: true;
+      outcome: 'stopped' | 'already_idle';
+      status: typeof SessionStatus.IDLE;
+    })
+  | (SessionStopResultBase & {
+      /** The Stop claim is durable; a different HA coordination step owns containment. */
+      success: false;
+      outcome: 'pending';
+      status: typeof SessionStatus.STOPPING;
+      reason: string;
+      stoppedTaskId: TaskID;
+      pendingCode: TerminationCoordinationPendingCode;
+    })
+  | (SessionStopResultBase & {
+      success: false;
+      outcome: 'unverified';
+      status: typeof SessionStatus.STOPPING;
+      reason: string;
+      stoppedTaskId: TaskID;
+    })
+  | (SessionStopResultBase & {
+      success: false;
+      outcome: 'condition_changed' | 'not_stoppable';
+      status?: SessionStatus;
+      reason: string;
+    })
+  | {
+      /** Explicit owner/admin recovery; does not prove executor containment. */
+      success: true;
+      outcome: 'force_failed';
+      status: typeof TaskStatus.FAILED;
+      stoppedTaskId: TaskID;
+    };
 
 /**
  * Permission mode controls how agentic tools handle execution approvals

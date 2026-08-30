@@ -83,8 +83,10 @@ import type {
   Session,
   SessionID,
   SessionMCPServer,
+  SessionStopResult,
   StreamingEventType,
   Task,
+  TaskID,
   TaskMetadata,
   User,
   UserID,
@@ -94,6 +96,7 @@ import {
   boardCommentZoneParentObjectKey,
   hasMinimumRole,
   isBranchArchiveOrDeleteOptions,
+  isCanonicalFullUuid,
   isTaskPendingDispatch,
   MCP_MEMBER_POLICIES,
   MCP_MEMBER_POLICY_CHANGED_EVENT,
@@ -3047,7 +3050,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     app,
     '/sessions/:id/stop',
     {
-      async create(data: unknown, params: RouteParams) {
+      async create(data: unknown, params: RouteParams): Promise<SessionStopResult> {
         const id = params.route?.id;
         if (!id) throw new Error('Session ID required');
         const body = data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
@@ -3081,17 +3084,18 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             const branch = await branchRepository.findById(session.branch_id);
             if (!branch) return null;
             const branchAccess = await branchRepository.resolveUserAccess(branch, stopUserId);
-            return { branch, branchAccess };
+            const { allowed: hasPromptAuthority } = await resolveSessionPromptAccess({
+              branchRepository,
+              branch,
+              session,
+              userId: stopUserId,
+            });
+            return { branchAccess, hasPromptAuthority };
           });
           if (!access) {
             throw new NotFound(`Branch ${session.branch_id} not found`);
           }
-          const { allowed: hasPromptAuthority } = await resolveSessionPromptAccess({
-            branchRepository,
-            branch: access.branch,
-            session,
-            userId: stopUserId,
-          });
+          const { hasPromptAuthority } = access;
           const isManager = access.branchAccess.can === 'all';
           const isGlobalSuperadmin =
             superadminOpts.allowSuperadmin && hasMinimumRole(params.user?.role, ROLES.SUPERADMIN);
@@ -3135,7 +3139,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
                   stopRouteRepositories.branchRepo.isOwner(branchId, userId),
               });
             });
-            const failedTask = await runInFreshTerminationTenantWriteDatabase(() =>
+            const forceFail = await runInFreshTerminationTenantWriteDatabase(() =>
               forceFailUnverifiedTask({
                 app,
                 taskId: target.task.task_id,
@@ -3144,10 +3148,19 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
                 params,
               })
             );
+            if (forceFail.outcome === 'already_terminal') {
+              return {
+                success: false as const,
+                outcome: 'condition_changed' as const,
+                reason: 'Task completed before force-fail could be applied.',
+                stoppedTaskId: forceFail.task.task_id,
+              };
+            }
             return {
-              success: true,
-              status: failedTask.status,
-              stoppedTaskId: failedTask.task_id,
+              success: true as const,
+              outcome: 'force_failed' as const,
+              status: TaskStatus.FAILED,
+              stoppedTaskId: forceFail.task.task_id,
             };
           });
           triggerPreservedQueue();
@@ -3155,21 +3168,23 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         }
 
         const stopReason = typeof body.reason === 'string' ? body.reason : undefined;
+        if (body.expected_task_id !== undefined && !isCanonicalFullUuid(body.expected_task_id)) {
+          throw new BadRequest('expected_task_id must be a canonical Task ID.');
+        }
+        const expectedTaskId = body.expected_task_id as TaskID | undefined;
         const result = await withSessionTurnLock(sessionTurnLocks, id as SessionID, async () =>
           stopSessionPreserveQueue(
             {
               app,
               taskRepo: stopRouteRepositories.taskRepo,
               sessionsService: sessionsServiceWithHooks,
-              findActiveTasks: (stopApp, sessionId, stopParams) =>
-                inCurrentTenantDatabaseScope(() =>
-                  findActiveTasksForSession(stopApp, sessionId, stopParams)
-                ),
+              findActiveTasks: findActiveTasksForSession,
+              runInTenantDatabaseScope: inCurrentTenantDatabaseScope,
               runInFreshTenantWriteDatabase: runInFreshTerminationTenantWriteDatabase,
             },
             id as SessionID,
             params,
-            { reason: stopReason }
+            { reason: stopReason, expectedTaskId }
           )
         );
 
