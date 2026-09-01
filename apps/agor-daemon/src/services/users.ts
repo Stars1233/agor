@@ -18,7 +18,6 @@ import {
   assertInlineAgenticConfigurationAllowed,
   assertSecurePassword,
   assertV05Scope,
-  DEFAULT_STATIC_TENANT_ID,
   getEnvVarBlockReason,
   AgorIdentityCapability as IdentityCapability,
   isEnvVarAllowed,
@@ -107,70 +106,13 @@ import {
 } from '@agor/core/types';
 import { emitServiceEvent } from '../utils/emit-service-event.js';
 import { resolveOwnerHomeStore } from '../utils/sandbox-context.js';
-import { claudeCredentialMutationKey } from './claude-oauth.js';
+import type { ClaudeUserCredentialPatchCoordinator } from './claude-credential-mutation.js';
 import { lockTenantAuthorizationFence } from './tenant-authorization-fence.js';
 import { UserAvatarSyncManager } from './user-avatar-sync.js';
 import {
   getTrustedUserMutationPurpose,
   type TrustedUserMutationPurpose,
 } from './user-mutation-trust.js';
-
-interface ClaudeCredentialMutationCoordinatorLike {
-  runCredentialMutation<T>(key: string, work: (generation: number) => Promise<T>): Promise<T>;
-  tombstoneCurrentCredential: (input: {
-    tenantId: string;
-    userId: UserID;
-    generation: number;
-  }) => Promise<void>;
-}
-
-const CLAUDE_CREDENTIAL_MUTATION_GENERATION = Symbol('claude-credential-mutation-generation');
-const TENANT_USER_MUTATION_LOCK_HELD = Symbol('agor.users.tenant-mutation-lock-held');
-
-// SQLite is a single-daemon topology, so one process-local tenant authority
-// lock provides the serialization that PostgreSQL gets from its transaction
-// advisory fence. It deliberately spans authorization, external credential
-// cleanup, and the final guarded SQL mutation: a concurrent actor demotion can
-// therefore linearize either before cleanup (and deny it) or after the
-// authorized mutation, never between destructive cleanup and its SQL CAS.
-const tenantUserMutationLocks = new Map<string, Promise<void>>();
-
-async function withTenantUserMutationLock<T>(
-  params: Params | undefined,
-  work: (params: Params) => Promise<T>
-): Promise<T> {
-  const tenantId =
-    (params as AuthenticatedParams | undefined)?.tenant?.tenant_id ??
-    getCurrentTenantId() ??
-    '<standalone>';
-  const previous = tenantUserMutationLocks.get(tenantId) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  tenantUserMutationLocks.set(tenantId, current);
-  await previous.catch(() => undefined);
-  try {
-    const lockedParams = { ...(params ?? {}) } as Params & {
-      [TENANT_USER_MUTATION_LOCK_HELD]: boolean;
-    };
-    lockedParams[TENANT_USER_MUTATION_LOCK_HELD] = true;
-    return await work(lockedParams);
-  } finally {
-    release();
-    if (tenantUserMutationLocks.get(tenantId) === current) tenantUserMutationLocks.delete(tenantId);
-  }
-}
-
-function affectsClaudeCredentialAuthority(data: UpdateUserData): boolean {
-  return (
-    Object.hasOwn(data, 'unix_username') ||
-    Object.hasOwn(data, 'filesystem_home') ||
-    Object.hasOwn(data.agentic_auth_methods ?? {}, 'claude-code') ||
-    Object.hasOwn(data.agentic_credential_sources ?? {}, 'claude-code') ||
-    Object.hasOwn(data.agentic_tools ?? {}, 'claude-code')
-  );
-}
 
 function optionalNonNegativeInteger(value: unknown): number | undefined {
   if (value === undefined || value === null || value === '') return undefined;
@@ -229,6 +171,7 @@ export const USERS_SERVICE_TRANSPORT_METHODS = [
 export const LOCAL_AUTH_LOOKUP_PARAM = Symbol('agor.users.local-auth-lookup');
 export const AUTH_INTERNAL_USER_LOOKUP_PARAM = Symbol('agor.users.auth-internal-lookup');
 const USER_PATCH_LOCK_HELD_PARAM = Symbol('agor.users.patch-lock-held');
+const USER_CREDENTIAL_LOCK_HELD_PARAM = Symbol('agor.users.credential-lock-held');
 
 // SQLite runs one daemon and has no cross-process writer, but two async
 // requests can still read the same users.data snapshot and then overlap on the
@@ -237,6 +180,33 @@ const USER_PATCH_LOCK_HELD_PARAM = Symbol('agor.users.patch-lock-held');
 // advisory/CAS fences as the cross-replica authority; this local lock merely
 // avoids needless same-process conflicts there.
 const userPatchLocks = new Map<string, Promise<void>>();
+const sqliteTenantAuthorityLocks = new Map<string, Promise<void>>();
+
+async function withSqliteTenantAuthorityLock<T>(
+  db: TenantScopeAwareDatabase | TenantScopedDatabase,
+  params: Params | undefined,
+  work: () => Promise<T>
+): Promise<T> {
+  if (isPostgresDatabaseHandle(db)) return work();
+  const tenantId =
+    (params as AuthenticatedParams | undefined)?.tenant?.tenant_id ??
+    getCurrentTenantId() ??
+    '<standalone>';
+  const key = String(tenantId);
+  const previous = sqliteTenantAuthorityLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  sqliteTenantAuthorityLocks.set(key, current);
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (sqliteTenantAuthorityLocks.get(key) === current) sqliteTenantAuthorityLocks.delete(key);
+  }
+}
 
 async function withUserPatchLock<T>(
   id: UserID,
@@ -528,14 +498,14 @@ function validatedAssignedPassword(password: unknown, email?: string): string {
  */
 export class UsersService {
   private avatarSync?: UserAvatarSyncManager;
-  private readonly identityAuthority: ResolvedIdentityAuthority;
   private readonly config: AgorConfig;
+  private readonly identityAuthority: ResolvedIdentityAuthority;
 
   constructor(
     protected db: TenantScopeAwareDatabase | TenantScopedDatabase,
     protected app?: Application,
     config?: AgorConfig,
-    private readonly claudeCredentialMutations?: ClaudeCredentialMutationCoordinatorLike
+    private readonly claudeCredentialPatches?: ClaudeUserCredentialPatchCoordinator
   ) {
     const effectiveConfig = config ?? (app?.get('config') as AgorConfig | undefined) ?? {};
     this.config = effectiveConfig;
@@ -556,16 +526,6 @@ export class UsersService {
       capability,
       authority,
     });
-  }
-
-  private claudeCredentialTenantId(params?: Params): string {
-    const tenantId =
-      (params as AuthenticatedParams | undefined)?.tenant?.tenant_id ?? getCurrentTenantId();
-    if (tenantId) return tenantId;
-    if (this.config.multi_tenancy?.mode === 'required_from_auth') {
-      throw new Error('Missing active tenant context for Claude credential mutation');
-    }
-    return this.config.multi_tenancy?.static_tenant_id?.trim() || DEFAULT_STATIC_TENANT_ID;
   }
 
   private assertCreateAllowed(): void {
@@ -955,43 +915,40 @@ export class UsersService {
    * Update user
    */
   async patch(id: UserID, data: UpdateUserData, params?: Params): Promise<User> {
-    const coordinated = params as
-      | (Params & { [CLAUDE_CREDENTIAL_MUTATION_GENERATION]?: number })
-      | undefined;
-    if (
-      this.claudeCredentialMutations &&
-      coordinated?.[CLAUDE_CREDENTIAL_MUTATION_GENERATION] === undefined &&
-      getTrustedUserMutationPurpose(params) !== 'claude-auth' &&
-      affectsClaudeCredentialAuthority(data)
-    ) {
-      const tenantId = this.claudeCredentialTenantId(params);
-      return this.claudeCredentialMutations.runCredentialMutation(
-        claudeCredentialMutationKey(this.config, tenantId, id),
-        (generation) =>
-          this.patch(id, data, {
-            ...(params ?? {}),
-            [CLAUDE_CREDENTIAL_MUTATION_GENERATION]: generation,
-          } as Params)
-      );
-    }
-    if (
-      !isPostgresDatabaseHandle(this.db) &&
-      !(params as (Params & { [TENANT_USER_MUTATION_LOCK_HELD]?: boolean }) | undefined)?.[
-        TENANT_USER_MUTATION_LOCK_HELD
-      ]
-    ) {
-      return withTenantUserMutationLock(params, (lockedParams) =>
-        this.patch(id, data, lockedParams)
-      );
-    }
     if (typeof id !== 'string' || !id) {
       throw new BadRequest('Bulk user mutations are not supported');
     }
+    const coordinateClaudeCredential = this.claudeCredentialPatches?.applies(data, params) === true;
+    const credentialTenantId = coordinateClaudeCredential ? getCurrentTenantId() : undefined;
+    if (coordinateClaudeCredential && !credentialTenantId) {
+      throw new Error('Missing active tenant context for Claude credential mutation');
+    }
+    const credentialLockHeld =
+      (params as (Params & { [USER_CREDENTIAL_LOCK_HELD_PARAM]?: boolean }) | undefined)?.[
+        USER_CREDENTIAL_LOCK_HELD_PARAM
+      ] === true;
     if (
       !(params as (Params & { [USER_PATCH_LOCK_HELD_PARAM]?: boolean }) | undefined)?.[
         USER_PATCH_LOCK_HELD_PARAM
       ]
     ) {
+      if (coordinateClaudeCredential && !credentialLockHeld) {
+        const releaseClaudeCredential = await this.claudeCredentialPatches!.lock(
+          String(credentialTenantId),
+          id
+        );
+        try {
+          const credentialLockedParams = { ...(params ?? {}) } as Params & {
+            [USER_CREDENTIAL_LOCK_HELD_PARAM]: boolean;
+          };
+          credentialLockedParams[USER_CREDENTIAL_LOCK_HELD_PARAM] = true;
+          return await withUserPatchLock(id, credentialLockedParams, (lockedParams) =>
+            this.patch(id, data, lockedParams)
+          );
+        } finally {
+          await releaseClaudeCredential?.();
+        }
+      }
       return withUserPatchLock(id, params, (lockedParams) => this.patch(id, data, lockedParams));
     }
     assertSingleUserMutation(data);
@@ -1006,8 +963,62 @@ export class UsersService {
     ) {
       throw new BadRequest(`Execution home key "${data.unix_username}" is already in use`);
     }
+    // Keep lock ordering consistent with OAuth finalization: credential
+    // authority first, then the users-service role/identity authority.
+    const releaseClaudeCredential =
+      coordinateClaudeCredential && !credentialLockHeld
+        ? await this.claudeCredentialPatches!.lock(String(credentialTenantId), id)
+        : undefined;
+    try {
+      return await withSqliteTenantAuthorityLock(this.db, params, () =>
+        this.patchWithClaudeCredentialAuthority(
+          id,
+          data,
+          params,
+          coordinateClaudeCredential,
+          credentialTenantId
+        )
+      );
+    } finally {
+      await releaseClaudeCredential?.();
+    }
+  }
+
+  private async patchWithClaudeCredentialAuthority(
+    id: UserID,
+    data: UpdateUserData,
+    params: Params | undefined,
+    coordinateClaudeCredential: boolean,
+    credentialTenantId: string | undefined
+  ): Promise<User> {
     await lockTenantAuthorizationFence(this.db, params);
     const authority = await this.authorizePatch(id, data, params);
+    const changesClaudeCredentialSource =
+      coordinateClaudeCredential && this.claudeCredentialPatches!.changesSource(data, params);
+    const normalizeRouteField = (value: string | null | undefined) => value?.trim() || null;
+    const unixUsernameChanges =
+      coordinateClaudeCredential &&
+      data.unix_username !== undefined &&
+      this.claudeCredentialPatches!.changesRoute({ unix_username: data.unix_username }) &&
+      normalizeRouteField(data.unix_username) !==
+        normalizeRouteField(authority.target.unix_username);
+    const filesystemHomeChanges =
+      coordinateClaudeCredential &&
+      data.filesystem_home !== undefined &&
+      this.claudeCredentialPatches!.changesRoute({ filesystem_home: data.filesystem_home }) &&
+      resolveOwnerHomeStore({
+        config: this.config,
+        tenantId: credentialTenantId,
+        ownerUserId: id,
+        filesystemHome: authority.target.filesystem_home,
+      }) !==
+        resolveOwnerHomeStore({
+          config: this.config,
+          tenantId: credentialTenantId,
+          ownerUserId: id,
+          filesystemHome: data.filesystem_home,
+        });
+    const changesClaudeCredentialRoute = unixUsernameChanges || filesystemHomeChanges;
     const hasPasswordWrite = Object.hasOwn(data, 'password');
     const assignedPassword = hasPasswordWrite
       ? validatedAssignedPassword(data.password, data.email ?? authority.target.email)
@@ -1411,58 +1422,14 @@ export class UsersService {
       updates.tokens_valid_after = credentialUpdatedAt;
     }
 
-    const currentClaudeSource = (
-      authority.target.data as { agentic_credential_sources?: AgenticCredentialSources }
-    ).agentic_credential_sources?.['claude-code'];
-    const nextClaudeSource = updates.data
-      ? (updates.data as { agentic_credential_sources?: AgenticCredentialSources })
-          .agentic_credential_sources?.['claude-code']
-      : currentClaudeSource;
-    const normalizeRouteField = (value: string | null | undefined) => value?.trim() || null;
-    const unixUsernameChanges =
-      Object.hasOwn(data, 'unix_username') &&
-      normalizeRouteField(data.unix_username) !==
-        normalizeRouteField(authority.target.unix_username);
-    const executionMode = this.config.execution?.unix_user_mode ?? 'simple';
-    const filesystemHomeChanges = (() => {
-      if (executionMode !== 'sandbox' || !Object.hasOwn(data, 'filesystem_home')) return false;
-      const routeTenantId = this.claudeCredentialTenantId(params);
-      return (
-        resolveOwnerHomeStore({
-          config: this.config,
-          tenantId: routeTenantId,
-          ownerUserId: id,
-          filesystemHome: authority.target.filesystem_home,
-        }) !==
-        resolveOwnerHomeStore({
-          config: this.config,
-          tenantId: routeTenantId,
-          ownerUserId: id,
-          filesystemHome: data.filesystem_home,
-        })
-      );
-    })();
-    const routeChanges =
-      executionMode === 'sandbox'
-        ? filesystemHomeChanges
-        : executionMode === 'delegated'
-          ? unixUsernameChanges
-          : false;
-    const generation = coordinated?.[CLAUDE_CREDENTIAL_MUTATION_GENERATION];
-    if (
-      generation !== undefined &&
-      currentClaudeSource === 'managed_file' &&
-      (routeChanges || nextClaudeSource !== 'managed_file')
-    ) {
-      const tenantId = this.claudeCredentialTenantId(params);
-      await this.claudeCredentialMutations?.tombstoneCurrentCredential({
-        tenantId,
-        userId: id,
-        generation,
-      });
-    }
-
     const authorityActorPredicate = this.actorStillCurrentPredicate(authority.actor, params);
+    if (changesClaudeCredentialRoute) {
+      // The old row is still authoritative here. Invalidate attempts and
+      // generation-delete its credential before publishing a different route;
+      // reversing this order would strand secrets in a home no longer
+      // discoverable from the user record.
+      await this.claudeCredentialPatches!.cleanupRouteBeforePatch(String(credentialTenantId), id);
+    }
     const row = await runWithTenantDatabaseTransaction(
       this.db,
       (params as AuthenticatedParams | undefined)?.tenant?.tenant_id ?? getCurrentTenantId(),
@@ -1514,6 +1481,13 @@ export class UsersService {
       }
     );
 
+    if (changesClaudeCredentialSource) {
+      // Authorization and the SQL update have succeeded, but the surrounding
+      // tenant transaction has not committed. Invalidate attempts and advance
+      // the per-home generation now; a failure rolls back the metadata change.
+      await this.claudeCredentialPatches!.complete(String(credentialTenantId), id);
+    }
+
     const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
       | UserID
       | undefined;
@@ -1524,35 +1498,41 @@ export class UsersService {
    * Delete user
    */
   async remove(id: UserID, params?: Params): Promise<User> {
-    const coordinated = params as
-      | (Params & { [CLAUDE_CREDENTIAL_MUTATION_GENERATION]?: number })
-      | undefined;
-    if (
-      this.claudeCredentialMutations &&
-      coordinated?.[CLAUDE_CREDENTIAL_MUTATION_GENERATION] === undefined
-    ) {
-      const tenantId = this.claudeCredentialTenantId(params);
-      return this.claudeCredentialMutations.runCredentialMutation(
-        claudeCredentialMutationKey(this.config, tenantId, id),
-        (generation) =>
-          this.remove(id, {
-            ...(params ?? {}),
-            [CLAUDE_CREDENTIAL_MUTATION_GENERATION]: generation,
-          } as Params)
-      );
-    }
-    if (
-      !isPostgresDatabaseHandle(this.db) &&
-      !(params as (Params & { [TENANT_USER_MUTATION_LOCK_HELD]?: boolean }) | undefined)?.[
-        TENANT_USER_MUTATION_LOCK_HELD
-      ]
-    ) {
-      return withTenantUserMutationLock(params, (lockedParams) => this.remove(id, lockedParams));
-    }
     if (typeof id !== 'string' || !id) {
       throw new BadRequest('Bulk user mutations are not supported');
     }
     this.assertDeleteAllowed();
+    const coordinateClaudeCredential = this.claudeCredentialPatches?.coordinatesRemoval() === true;
+    const credentialTenantId = coordinateClaudeCredential ? getCurrentTenantId() : undefined;
+    if (coordinateClaudeCredential && !credentialTenantId) {
+      throw new Error('Missing active tenant context for Claude credential mutation');
+    }
+    // Credential authority always precedes users/role authority. OAuth
+    // finalization and route deletion therefore cannot deadlock by taking
+    // these locks in opposite orders.
+    const releaseClaudeCredential = coordinateClaudeCredential
+      ? await this.claudeCredentialPatches.lock(String(credentialTenantId), id)
+      : undefined;
+    try {
+      return await withSqliteTenantAuthorityLock(this.db, params, () =>
+        this.removeWithClaudeCredentialAuthority(
+          id,
+          params,
+          coordinateClaudeCredential,
+          credentialTenantId
+        )
+      );
+    } finally {
+      await releaseClaudeCredential?.();
+    }
+  }
+
+  private async removeWithClaudeCredentialAuthority(
+    id: UserID,
+    params: Params | undefined,
+    coordinateClaudeCredential: boolean,
+    credentialTenantId: string | undefined
+  ): Promise<User> {
     await lockTenantAuthorizationFence(this.db, params);
     const authority = await this.authorizeRemove(id, params);
     await this.assertNotLastSuperadmin(authority.target, params);
@@ -1584,17 +1564,11 @@ export class UsersService {
       );
     }
 
-    const currentClaudeSource = (
-      authority.target.data as { agentic_credential_sources?: AgenticCredentialSources }
-    ).agentic_credential_sources?.['claude-code'];
-    const generation = coordinated?.[CLAUDE_CREDENTIAL_MUTATION_GENERATION];
-    if (generation !== undefined && currentClaudeSource === 'managed_file') {
-      const tenantId = this.claudeCredentialTenantId(params);
-      await this.claudeCredentialMutations?.tombstoneCurrentCredential({
-        tenantId,
-        userId: id,
-        generation,
-      });
+    if (coordinateClaudeCredential) {
+      // Remove the generation-fenced file while the old route and owner row
+      // still exist. Only after cleanup succeeds may the home key become
+      // reusable through the SQL delete below.
+      await this.claudeCredentialPatches!.cleanupRouteBeforeRemove(String(credentialTenantId), id);
     }
 
     const authorityActorPredicate = this.actorStillCurrentPredicate(authority.actor, params);
@@ -2116,9 +2090,9 @@ export function createUsersService(
   db: TenantScopeAwareDatabase,
   app?: Application,
   config?: AgorConfig,
-  claudeCredentialMutations?: ClaudeCredentialMutationCoordinatorLike
+  claudeCredentialPatches?: ClaudeUserCredentialPatchCoordinator
 ): UsersServiceWithAuth {
-  return new UsersServiceWithAuth(db, app, config, claudeCredentialMutations);
+  return new UsersServiceWithAuth(db, app, config, claudeCredentialPatches);
 }
 
 /** Create a provider-less Users service bound to one active tenant transaction. */

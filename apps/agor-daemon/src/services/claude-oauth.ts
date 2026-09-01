@@ -21,11 +21,14 @@
  *      to `subscription`.
  *
  * One in-flight attempt per user: starting a new attempt replaces the previous.
- * Attempts live in daemon memory only — a restart discards them and the user
- * requests a fresh URL.
+ * Where that attempt lives is the store's business — process memory for a
+ * standalone daemon, PostgreSQL rows with sealed PKCE material and a one-shot
+ * exchange claim when replicas must be able to finish each other's attempts.
+ * See `claude-oauth-attempt-store.ts`.
  *
- * SECURITY CONTRACT: tokens transit UI ↔ daemon ↔ Anthropic and the target
- * user's filesystem only. Status responses carry the authorize URL and
+ * SECURITY CONTRACT: the browser carries the authorize URL and pasted
+ * authorization code/state, but never tokens. Token material flows Anthropic
+ * → daemon → the target user's filesystem only. Status responses carry the authorize URL and
  * non-secret metadata; token material and the PKCE verifier are never returned,
  * logged, or exposed to any agent/LLM context. `state` is verified before
  * exchange. Callers act only on their own credentials.
@@ -54,12 +57,20 @@ import type {
   TenantID,
   UserID,
 } from '@agor/core/types';
-import {
-  deleteClaudeAuthViaExecutor,
-  writeClaudeAuthViaExecutor,
-} from '../utils/executor-claude-auth.js';
+import { writeClaudeAuthViaExecutor } from '../utils/executor-claude-auth.js';
 import { sandboxManagedCredentialIsolationAvailable } from '../utils/sandbox-wrap.js';
-import { type AppLike, resolveCodexCredentialRoute } from './codex-auth-shared.js';
+import { CLAUDE_AUTH_TRUSTED_USER_MUTATION } from './claude-credential-mutation-trust.js';
+import {
+  type ClaudeOAuthAttemptContext,
+  type ClaudeOAuthAttemptStore,
+  type ClaudeOAuthExchangeClaim,
+  InMemoryClaudeOAuthAttemptStore,
+} from './claude-oauth-attempt-store.js';
+import {
+  type AppLike,
+  CODEX_AUTH_DEFER_USER_REALTIME,
+  resolveCodexCredentialRoute,
+} from './codex-auth-shared.js';
 import { markTrustedUserMutation } from './user-mutation-trust.js';
 
 // Constants are the PROD OAuth config (`yol`) read out of the native `claude`
@@ -94,10 +105,6 @@ const CLAUDE_SCOPES = [
 ];
 
 const FETCH_TIMEOUT_MS = 15_000;
-/** How long a daemon-side attempt keeps its verifier/state before it must restart. */
-const ATTEMPT_LIFETIME_MS = 10 * 60 * 1000;
-/** How long a finished attempt stays queryable before eviction. */
-const TERMINAL_ATTEMPT_TTL_MS = 60 * 60 * 1000;
 const MAX_PASTED_CODE_LENGTH = 16 * 1024;
 
 function assertClaudeSubscriptionOAuthEnabled(app: AppLike): void {
@@ -205,10 +212,19 @@ const MAX_EXPIRES_IN_SEC = 400 * 24 * 60 * 60;
 export class TokenExchangeError extends BadRequest {
   constructor(
     readonly disposition: 'rejected' | 'ambiguous',
-    message: string
+    message: string,
+    readonly retryAfterMs?: number
   ) {
     super(message);
   }
+}
+
+function retryAfterMs(response: Response): number | undefined {
+  const value = response.headers.get('retry-after')?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number(value) * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
 }
 
 export async function exchangeCodeForTokens(
@@ -305,11 +321,10 @@ export async function exchangeCodeForTokens(
  * to the provider runtime. The POST deliberately has the same rejected versus
  * ambiguous taxonomy as the one-shot code exchange:
  *
- * - definitive 4xx responses (including `invalid_grant`) are rejections;
- * - network failures, 408/425/429 throttling or timeout responses, 5xx, and
- *   malformed success bodies are ambiguous because the provider may already
- *   have rotated the refresh token. `Retry-After` must not trigger an automatic
- *   replay of a possibly consumed refresh token within the launch.
+ * - invalid credentials and other definitive 4xx responses are rejections;
+ * - 408, 425, and 429 are transient/ambiguous and must not trigger a replay;
+ * - network failures, 5xx, and malformed success bodies are ambiguous because
+ *   the provider may already have rotated the refresh token.
  *
  * Callers must never clear the canonical file or persisted source for either
  * disposition. An ambiguous refresh is never replayed within the launch.
@@ -338,12 +353,13 @@ export async function refreshClaudeTokens(
     );
   }
   if (!res.ok) {
-    const ambiguous = res.status >= 500 || [408, 425, 429].includes(res.status);
+    const transient = res.status >= 500 || [408, 425, 429].includes(res.status);
     throw new TokenExchangeError(
-      ambiguous ? 'ambiguous' : 'rejected',
-      ambiguous
-        ? 'Claude login refresh is temporarily unavailable. Try again later.'
-        : 'Claude rejected this login refresh. Sign in again.'
+      transient ? 'ambiguous' : 'rejected',
+      transient
+        ? 'Claude had a server error refreshing this login. Try again later.'
+        : 'Claude rejected this login refresh. Sign in again.',
+      transient ? retryAfterMs(res) : undefined
     );
   }
 
@@ -419,25 +435,6 @@ export function buildClaudeCredentialsJson(tokens: ExchangedTokens, nowMs = Date
   return `${JSON.stringify(credentials, null, 2)}\n`;
 }
 
-interface OAuthAttempt {
-  key: string;
-  userId: UserID;
-  tenantId: TenantID | string;
-  authUser: NonNullable<AuthenticatedParams['user']>;
-  delegatedHomeKey: string | null;
-  claudeConfigDir?: string;
-  phase: ClaudeOAuthStatus['phase'];
-  verifier: string;
-  state: string;
-  verificationUrl: string;
-  expiresAtMs: number;
-  subscriptionType?: string;
-  hint?: string;
-  finishedAtMs?: number;
-  /** Set when a newer attempt replaces this one, so an in-flight submit bails. */
-  cancelled: boolean;
-}
-
 /** Minimal users-service surface — mirrors codex-auth-shared's structural typing. */
 interface UsersServiceLike {
   patch(
@@ -454,135 +451,26 @@ interface UsersServiceLike {
 }
 
 /**
- * Process-local authority for the standalone Claude credential boundary.
- * Provider exchange never holds this lock; start, final persistence, and logout
- * do, so a slow writer cannot land after a newer attempt or sign-out.
+ * Build the authorize URL from the attempt's PKCE verifier and state. The URL
+ * and raw state are returned only by the start request and are never persisted;
+ * durable rows retain only the state fingerprint and sealed verifier.
  */
-export interface ClaudeCredentialMutationCoordinator {
-  runCredentialMutation<T>(key: string, work: (generation: number) => Promise<T>): Promise<T>;
-  invalidate(key: string, hint: string): void;
-}
-
-/**
- * Credential homes are user-private only in the exact persistent-per-user
- * topology. Shared/simple layouts intentionally retain one global authority
- * key because different users can address the same physical file.
- */
-export function claudeCredentialMutationKey(
-  config: Pick<import('@agor/core/config').AgorConfig, 'execution'>,
-  tenantId: string,
-  userId: UserID
-): string {
-  return hasContainedClaudeRuntimeCredentials(config) ? `${tenantId}:${userId}` : 'shared-home';
-}
-
-export class InMemoryClaudeOAuthCoordinator implements ClaudeCredentialMutationCoordinator {
-  readonly attempts = new Map<string, OAuthAttempt>();
-  private readonly mutationTails = new Map<string, Promise<void>>();
-  private lastGeneration = 0;
-
-  async runCredentialMutation<T>(
-    key: string,
-    work: (generation: number) => Promise<T>
-  ): Promise<T> {
-    const previous = this.mutationTails.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.catch(() => undefined).then(() => gate);
-    this.mutationTails.set(key, tail);
-    await previous.catch(() => undefined);
-    try {
-      // Persisted credential generation fences also protect delegated executor
-      // writes that outlive their request. Time supplies restart monotonicity;
-      // the local counter supplies uniqueness within one millisecond.
-      const generation = Math.max(Date.now() * 1_000, this.lastGeneration + 1);
-      this.lastGeneration = generation;
-      return await work(generation);
-    } finally {
-      release();
-      if (this.mutationTails.get(key) === tail) this.mutationTails.delete(key);
-    }
-  }
-
-  invalidate(key: string, hint: string): void {
-    const attempt = this.attempts.get(key);
-    if (!attempt) return;
-    attempt.cancelled = true;
-    finishAttempt(attempt, 'error', hint);
-  }
-}
-
-function statusOf(attempt: OAuthAttempt | undefined): ClaudeOAuthStatus {
-  if (!attempt) return { phase: 'idle' };
-  const base: ClaudeOAuthStatus = { phase: attempt.phase };
-  if (attempt.phase === 'awaiting_code') {
-    base.verificationUrl = attempt.verificationUrl;
-    base.expiresAt = new Date(attempt.expiresAtMs).toISOString();
-  }
-  if (attempt.subscriptionType) base.subscriptionType = attempt.subscriptionType;
-  if (attempt.hint) base.hint = attempt.hint;
-  return base;
-}
-
-function finishAttempt(
-  attempt: OAuthAttempt,
-  phase: ClaudeOAuthStatus['phase'],
-  hint?: string
-): void {
-  attempt.phase = phase;
-  attempt.finishedAtMs = Date.now();
-  attempt.verifier = '';
-  attempt.state = '';
-  if (hint) attempt.hint = hint;
+export function claudeVerificationUrlFrom(verifier: string, state: string): string {
+  return buildAuthorizeUrl(base64url(createHash('sha256').update(verifier).digest()), state);
 }
 
 export function createClaudeOAuthService(
   app: AppLike,
   db: TenantScopeAwareDatabase,
-  coordinator = new InMemoryClaudeOAuthCoordinator(),
+  /** Omitted for a standalone daemon, which keeps attempts in process memory. */
+  store: ClaudeOAuthAttemptStore = new InMemoryClaudeOAuthAttemptStore(),
   runtimeIsolationAvailable: () => boolean = sandboxManagedCredentialIsolationAvailable
 ) {
-  const { attempts } = coordinator;
-
-  /** True while `attempt` is still the live attempt for its user. */
-  function isCurrent(attempt: OAuthAttempt): boolean {
-    return !attempt.cancelled && attempts.get(attempt.key) === attempt;
-  }
-
-  /**
-   * Move an attempt to a terminal phase and drop its secrets promptly — the
-   * verifier and state are useless after the attempt ends and should not linger
-   * in memory until the TTL sweep evicts the record.
-   */
-  function finish(attempt: OAuthAttempt, phase: ClaudeOAuthStatus['phase'], hint?: string): void {
-    finishAttempt(attempt, phase, hint);
-  }
-
-  /**
-   * Expire overdue awaiting-code attempts, then evict long-finished ones.
-   * Without the expiry step an abandoned link would report `awaiting_code`
-   * forever and never be pruned. `exchanging` attempts are left alone — an
-   * in-flight exchange is bounded by the fetch timeout, not this clock.
-   */
-  function expireAndPrune(): void {
-    const now = Date.now();
-    const cutoff = now - TERMINAL_ATTEMPT_TTL_MS;
-    for (const [key, attempt] of attempts) {
-      if (attempt.phase === 'awaiting_code' && now >= attempt.expiresAtMs) {
-        finish(attempt, 'expired', 'The sign-in link expired — start over to get a fresh one.');
-      }
-      const terminal = attempt.phase !== 'awaiting_code' && attempt.phase !== 'exchanging';
-      if (terminal && (attempt.finishedAtMs ?? 0) < cutoff) attempts.delete(key);
-    }
-  }
-
   async function requireContext(params?: AuthenticatedParams): Promise<{
     authUser: NonNullable<AuthenticatedParams['user']>;
     userId: UserID;
     tenantId: TenantID | string;
-    key: string;
+    ctx: ClaudeOAuthAttemptContext;
   }> {
     const authUser = params?.user;
     if (!authUser?.user_id) {
@@ -591,196 +479,202 @@ export function createClaudeOAuthService(
     const tenantId = getCurrentTenantId();
     if (!tenantId) throw new Error('Missing active tenant context for Claude OAuth');
     const userId = authUser.user_id as UserID;
-    return { authUser, userId, tenantId, key: `${tenantId}:${userId}` };
+    return { authUser, userId, tenantId, ctx: { tenantId: String(tenantId), userId } };
   }
 
-  async function persist(attempt: OAuthAttempt, tokens: ExchangedTokens): Promise<void> {
-    await coordinator.runCredentialMutation(
-      claudeCredentialMutationKey(app.get('config'), attempt.tenantId, attempt.userId),
-      async (generation) => {
-        // Final ownership gate immediately before the write: a replacement
-        // attempt registered during the exchange must not have its freshly written
-        // credential clobbered by this older one.
-        if (!isCurrent(attempt)) return;
+  const routeFor = (userId: UserID, tenantId: TenantID | string) =>
+    resolveCodexCredentialRoute(
+      userId,
+      <T>(work: (tenantDb: TenantScopedDatabase) => Promise<T>) =>
+        runWithTenantDatabaseScope(db, tenantId, work),
+      app.get('config')
+    );
 
-        // Re-resolve immediately before handling tokens. An admin may have moved
-        // the user's execution home while the browser was approving. Never write
-        // a credential to the stale (possibly reassigned) home pinned at start.
-        const withTenantDatabase = <T>(work: (tenantDb: TenantScopedDatabase) => Promise<T>) =>
-          runWithTenantDatabaseScope(db, attempt.tenantId, work);
-        const identity = await resolveCodexCredentialRoute(
-          attempt.userId,
-          withTenantDatabase,
-          app.get('config')
-        );
-        if (
-          !identity.ok ||
-          identity.delegatedHomeKey !== attempt.delegatedHomeKey ||
-          identity.claudeConfigDir !== attempt.claudeConfigDir
-        ) {
-          throw new BadRequest(
-            'The execution home for this Claude login changed while signing in. Start over.'
-          );
-        }
-
-        try {
-          await writeClaudeAuthViaExecutor(
-            buildClaudeCredentialsJson(tokens),
-            {
-              delegatedHomeKey: identity.delegatedHomeKey,
-              userId: identity.userId,
-              ...(identity.claudeConfigDir ? { claudeConfigDir: identity.claudeConfigDir } : {}),
-            },
-            generation
-          );
-        } catch (err) {
-          // The error may carry sudo/bash stderr; log a class-level summary only
-          // so token material never reaches daemon logs.
-          console.error(
-            `[ClaudeOAuth] Failed to write .credentials.json${
-              attempt.delegatedHomeKey ? ` as ${attempt.delegatedHomeKey}` : ''
-            }: ${err instanceof Error ? err.constructor.name : 'unknown error'}`
-          );
-          throw new BadRequest(
-            'Could not write the Claude credentials file on the server. Check daemon logs, or use an API key instead.'
-          );
-        }
-
-        // Flip to managed `subscription` AND drop any previously pasted token.
-        // Task resolution will now read/refresh the canonical file daemon-side
-        // and inject only its short-lived access token; `null` deletes just the
-        // old pasted field and leaves other Claude settings intact.
-        const usersService = app.service('users') as UsersServiceLike;
-        try {
-          const patchParams = { user: attempt.authUser, authenticated: true };
-          markTrustedUserMutation(patchParams, 'claude-auth');
-          await usersService.patch(
-            attempt.userId,
-            {
-              // Send only this tool's method; UsersService merges against its fresh
-              // row so concurrent Codex changes cannot be overwritten.
-              agentic_auth_methods: { 'claude-code': 'subscription' },
-              agentic_credential_sources: { 'claude-code': 'managed_file' },
-              agentic_tools: { 'claude-code': { CLAUDE_CODE_OAUTH_TOKEN: null } },
-            },
-            patchParams
-          );
-        } catch (error) {
-          // The filesystem write precedes the short metadata transaction. If its
-          // write gate or DB commit fails, remove the just-written generation so
-          // no hidden credential remains active while metadata says API-key.
-          try {
-            await deleteClaudeAuthViaExecutor(
-              {
-                delegatedHomeKey: identity.delegatedHomeKey,
-                userId: identity.userId,
-                ...(identity.claudeConfigDir ? { claudeConfigDir: identity.claudeConfigDir } : {}),
-              },
-              generation
-            );
-          } catch (cleanupError) {
-            console.error(
-              `[ClaudeOAuth] Credential compensation failed: ${
-                cleanupError instanceof Error ? cleanupError.constructor.name : 'unknown error'
-              }`
-            );
-          }
-          // Preserve the tenant freeze/write-gate status so callers receive the
-          // required 503. Other repository/driver errors are internal details and
-          // must not be reflected to the browser.
-          if (error instanceof Unavailable) throw error;
-          throw new BadRequest(
-            'Could not finish saving the Claude login. Start over, or ask an administrator to check daemon logs.'
-          );
-        }
-      }
+  async function claimRouteIsCurrent(
+    ctx: ClaudeOAuthAttemptContext,
+    claim: Pick<ClaudeOAuthExchangeClaim, 'delegatedHomeKey' | 'claudeConfigDir'>
+  ): Promise<boolean> {
+    const identity = await routeFor(ctx.userId, ctx.tenantId);
+    return (
+      identity.ok &&
+      identity.delegatedHomeKey === claim.delegatedHomeKey &&
+      identity.claudeConfigDir === claim.claudeConfigDir
     );
   }
 
-  async function submit(key: string, pasted: string): Promise<ClaudeOAuthStatus> {
-    const attempt = attempts.get(key);
-    if (attempt?.phase !== 'awaiting_code') {
-      throw new BadRequest('No sign-in is in progress — start over to get a fresh link.');
-    }
-    if (Date.now() >= attempt.expiresAtMs) {
-      finish(attempt, 'expired', 'The sign-in link expired — start over to get a fresh one.');
-      throw new BadRequest('The sign-in link expired — start over to get a fresh one.');
-    }
-    // Validate the paste BEFORE reserving the attempt, so a malformed/wrong-state
-    // paste leaves the attempt in `awaiting_code` for a legitimate retry.
-    const { code, state } = parsePastedCode(pasted);
-    if (!constantTimeEqual(state, attempt.state)) {
-      throw new BadRequest('The pasted code did not match this sign-in — start over.');
-    }
+  /** Finalize under the store's tenant/user + filesystem generation authority. */
+  async function persist(
+    ctx: ClaudeOAuthAttemptContext,
+    claim: ClaudeOAuthExchangeClaim,
+    authUser: NonNullable<AuthenticatedParams['user']>,
+    tokens: ExchangedTokens
+  ): Promise<ClaudeOAuthStatus | false> {
+    const outcome = await store.finalize(ctx, claim, async (generation) => {
+      // The attempt fixed its destination home when it started. Re-resolve and
+      // compare rather than trusting either value alone: a mid-flow identity
+      // change would otherwise silently redirect the credential to a home the
+      // user's sessions do not read.
+      if (!(await claimRouteIsCurrent(ctx, claim))) {
+        throw new BadRequest(
+          'The execution home this sign-in would be saved to changed while you were approving it. ' +
+            'Start over so the login is written to the right place.'
+        );
+      }
 
-    // Reserve the attempt before the network round-trip: a concurrent submit now
-    // sees `exchanging` (not `awaiting_code`) and is rejected instead of racing a
-    // second exchange of the same code.
-    const { verifier, state: attemptState } = attempt;
-    attempt.phase = 'exchanging';
+      try {
+        await writeClaudeAuthViaExecutor(
+          buildClaudeCredentialsJson(tokens),
+          {
+            delegatedHomeKey: claim.delegatedHomeKey,
+            userId: ctx.userId,
+            ...(claim.claudeConfigDir ? { claudeConfigDir: claim.claudeConfigDir } : {}),
+          },
+          generation
+        );
+      } catch (err) {
+        // The error may carry launcher stderr; log a class-level summary only
+        // so token material never reaches daemon logs.
+        console.error(
+          `[ClaudeOAuth] Failed to write .credentials.json${
+            claim.delegatedHomeKey ? ` as ${claim.delegatedHomeKey}` : ''
+          }: ${err instanceof Error ? err.constructor.name : 'unknown error'}`
+        );
+        throw new BadRequest(
+          'Could not write the Claude credentials file on the server. Check daemon logs and sudo configuration, or use an API key instead.'
+        );
+      }
+
+      // Flip to managed `subscription` AND drop any previously pasted token.
+      // Task resolution will now read/refresh the canonical file daemon-side
+      // and inject only its short-lived access token; `null` deletes just the
+      // old pasted field and leaves other Claude settings intact.
+      const usersService = app.service('users') as UsersServiceLike;
+      // Select the explicit `managed_file` source and drop any previously
+      // pasted CLAUDE_CODE_OAUTH_TOKEN. The source is the authority that makes
+      // resolveTenantAgenticTool choose native on-disk auth; deleting the token
+      // prevents a dormant higher-precedence env value from shadowing the
+      // managed, refreshing file. `null` deletes only that credential field.
+      try {
+        const patchParams = {
+          user: authUser,
+          authenticated: true,
+          [CLAUDE_AUTH_TRUSTED_USER_MUTATION]: true,
+          [CODEX_AUTH_DEFER_USER_REALTIME]: true,
+        };
+        markTrustedUserMutation(patchParams, 'claude-auth');
+        await usersService.patch(
+          ctx.userId,
+          {
+            // Send only this tool's key. The users service merges against its
+            // fresh row, so a concurrent Codex auth change is not overwritten
+            // by a stale read/whole-map write.
+            agentic_auth_methods: { 'claude-code': 'subscription' },
+            agentic_credential_sources: { 'claude-code': 'managed_file' },
+            agentic_tools: { 'claude-code': { CLAUDE_CODE_OAUTH_TOKEN: null } },
+          },
+          patchParams
+        );
+      } catch {
+        // The file write may have committed. Never path-delete here: a newer
+        // mutation on another replica may already own that same path. The
+        // generation tombstone prevents older writers, and the attempt is
+        // terminalized as ambiguous by the caller.
+        throw new BadRequest(
+          'Could not finish saving the Claude login metadata. Start over or disconnect to reconcile it.'
+        );
+      }
+      return { value: true, subscriptionType: tokens.subscriptionType };
+    });
+    return outcome.outcome === 'committed' ? store.status(ctx, claim.attemptId) : false;
+  }
+
+  async function submit(
+    ctx: ClaudeOAuthAttemptContext,
+    authUser: NonNullable<AuthenticatedParams['user']>,
+    attemptId: string | undefined,
+    pasted: string
+  ): Promise<ClaudeOAuthStatus> {
+    // Validate the paste BEFORE reserving the attempt, so a malformed paste
+    // leaves the attempt awaiting a real code for a legitimate retry.
+    const { code, state } = parsePastedCode(pasted);
+
+    // One atomic reservation decides who exchanges. A second submit — on this
+    // replica or any other — loses here rather than racing a second exchange
+    // of the same one-time code.
+    const claimed = await store.claimForExchange(ctx, attemptId, state);
+    switch (claimed.outcome) {
+      case 'state_mismatch':
+        throw new BadRequest('The pasted code did not match this sign-in — start over.');
+      case 'expired':
+        throw new BadRequest('The sign-in link expired — start over to get a fresh one.');
+      case 'already_claimed':
+        throw new BadRequest('This sign-in is already being completed — wait for it to finish.');
+      case 'not_pending':
+        throw new BadRequest('No sign-in is in progress — start over to get a fresh link.');
+    }
+    const claim = claimed.claim;
+
+    // Avoid consuming a one-time provider code after a route mutation that won
+    // before this submit. A mutation that wins after this check still
+    // invalidates/fences finalization, which rechecks under credential authority.
+    if (!(await claimRouteIsCurrent(ctx, claim))) {
+      await store.finish(ctx, claim, {
+        status: 'failed',
+        failureCode: 'execution_home_changed',
+        hint: 'The execution home changed — start over to save the login in the new home.',
+      });
+      throw new BadRequest(
+        'The execution home changed while this sign-in was open. Start over before using the code.'
+      );
+    }
 
     let tokens: ExchangedTokens;
     try {
-      tokens = await exchangeCodeForTokens(code, verifier, attemptState);
+      tokens = await exchangeCodeForTokens(code, claim.verifier, claim.state);
     } catch (err) {
-      // The code has now been POSTed to Anthropic, so this exact `code#state` must
-      // never be exchanged again — a definitive 4xx killed it, and a network/5xx/
-      // contract failure may have consumed it server-side. So we do NOT return to
-      // `awaiting_code` (which previously let the user replay the same, possibly
-      // spent, code); the attempt goes terminal and the user starts over.
-      // Malformed-paste / wrong-state submissions never reach here — they are
-      // rejected earlier, while the attempt is still `awaiting_code`.
-      if (isCurrent(attempt)) {
-        const rejected = err instanceof TokenExchangeError && err.disposition === 'rejected';
-        finish(
-          attempt,
-          'error',
-          rejected
-            ? 'Claude rejected the sign-in code — start over to get a fresh link.'
-            : 'Sign-in could not be completed and the code may be used up — start over to get a fresh link.'
-        );
-      }
+      // The code has now been POSTed to Anthropic, so this exact `code#state`
+      // must never be exchanged again — a definitive 4xx killed it, and a
+      // network/5xx/contract failure may have consumed it server-side. The
+      // attempt goes terminal and the user starts over.
+      const rejected = err instanceof TokenExchangeError && err.disposition === 'rejected';
+      await store.finish(ctx, claim, {
+        status: rejected ? 'failed' : 'ambiguous',
+        failureCode: rejected ? 'provider_rejected_code' : 'exchange_failed',
+        hint: rejected
+          ? 'Claude rejected the sign-in code — start over to get a fresh link.'
+          : 'Sign-in could not be completed and the code may be used up — start over to get a fresh link.',
+      });
       throw err;
     }
 
-    // Ownership gate after the exchange (persist re-checks again right before the
-    // write): a replacement `create({})` during the exchange wins.
-    if (!isCurrent(attempt)) return statusOf(attempts.get(key));
-
+    let persisted: ClaudeOAuthStatus | false;
     try {
-      await persist(attempt, tokens);
+      persisted = await persist(ctx, claim, authUser, tokens);
     } catch (err) {
-      if (isCurrent(attempt)) {
-        finish(attempt, 'error', 'Signing in succeeded but saving the login failed — try again.');
-      }
+      await store.finish(ctx, claim, {
+        status: 'ambiguous',
+        failureCode: 'credential_persistence_ambiguous',
+        hint: 'Signing in succeeded but saving the login could not be confirmed — start over or disconnect.',
+      });
       throw err;
     }
+    // A superseded or logged-out attempt wrote nothing; report whatever the
+    // store now considers current rather than claiming success.
+    if (!persisted) return store.status(ctx, claim.attemptId);
 
-    if (!isCurrent(attempt)) return statusOf(attempts.get(key));
-    finish(
-      attempt,
-      'success',
-      tokens.subscriptionType
-        ? `Signed in with Claude (${tokens.subscriptionType}).`
-        : 'Signed in with Claude.'
-    );
-    attempt.subscriptionType = tokens.subscriptionType;
-    return statusOf(attempt);
+    return persisted;
   }
 
   return {
     async create(
-      data: { code?: string },
+      data: { code?: string; attemptId?: string },
       params?: AuthenticatedParams
     ): Promise<ClaudeOAuthStatus> {
-      const { authUser, userId, tenantId, key } = await requireContext(params);
+      const { authUser, userId, tenantId, ctx } = await requireContext(params);
       assertClaudeSubscriptionOAuthEnabled(app);
-      expireAndPrune();
 
-      const withTenantDatabase = <T>(work: (tenantDb: TenantScopedDatabase) => Promise<T>) =>
-        runWithTenantDatabaseScope(db, tenantId, work);
       if (
-        !(await withTenantDatabase((tenantDb) =>
+        !(await runWithTenantDatabaseScope(db, tenantId, (tenantDb) =>
           isTenantAgenticToolEnabled('claude-code', tenantDb)
         ))
       ) {
@@ -807,55 +701,57 @@ export function createClaudeOAuthService(
         ) {
           throw new BadRequest('Paste the complete Claude authorization code, or start over.');
         }
-        return submit(key, data.code);
+        if (typeof data.attemptId !== 'string' || !data.attemptId) {
+          throw new BadRequest('The Claude sign-in attempt id is required. Start over.');
+        }
+        return submit(ctx, authUser, data.attemptId, data.code);
       }
 
       // ── Start step: issue a fresh authorize URL, replacing any prior attempt. ──
-      return coordinator.runCredentialMutation(
-        claudeCredentialMutationKey(config, tenantId, userId),
-        async () => {
-          // Resolve before invalidating the old attempt. A transient routing
-          // failure must not destroy an otherwise valid paste-back flow.
-          const identity = await resolveCodexCredentialRoute(userId, withTenantDatabase, config);
-          if (!identity.ok) {
+      // Resolve the destination identity up front so a user with no resolvable
+      // execution home fails fast instead of after approving in the browser.
+      const identity = await routeFor(userId, tenantId);
+      if (!identity.ok) {
+        throw new BadRequest(
+          `Cannot determine which Unix account should hold this Claude login: ${identity.message}`
+        );
+      }
+
+      const pkce = generatePkce();
+      const state = base64url(randomBytes(32));
+      const started = await store.start(ctx, {
+        verifier: pkce.verifier,
+        state,
+        delegatedHomeKey: identity.delegatedHomeKey,
+        ...(identity.claudeConfigDir ? { claudeConfigDir: identity.claudeConfigDir } : {}),
+        validateRoute: async () => {
+          const current = await routeFor(userId, tenantId);
+          if (
+            !current.ok ||
+            current.delegatedHomeKey !== identity.delegatedHomeKey ||
+            current.claudeConfigDir !== identity.claudeConfigDir
+          ) {
             throw new BadRequest(
-              `Cannot determine which Unix account should hold this Claude login: ${identity.message}`
+              'The execution home changed before sign-in started. Start again to use the current home.'
             );
           }
-
-          const prior = attempts.get(key);
-          if (prior) {
-            prior.cancelled = true;
-            finish(prior, 'error', 'This sign-in was replaced by a newer attempt.');
-          }
-
-          const pkce = generatePkce();
-          const state = base64url(randomBytes(32));
-          const attempt: OAuthAttempt = {
-            key,
-            userId,
-            tenantId,
-            authUser,
-            delegatedHomeKey: identity.delegatedHomeKey,
-            ...(identity.claudeConfigDir ? { claudeConfigDir: identity.claudeConfigDir } : {}),
-            phase: 'awaiting_code',
-            verifier: pkce.verifier,
-            state,
-            verificationUrl: buildAuthorizeUrl(pkce.challenge, state),
-            expiresAtMs: Date.now() + ATTEMPT_LIFETIME_MS,
-            cancelled: false,
-          };
-          attempts.set(key, attempt);
-          return statusOf(attempt);
-        }
-      );
+          return true;
+        },
+        buildVerificationUrl: claudeVerificationUrlFrom,
+      });
+      return {
+        phase: 'awaiting_code',
+        attemptId: started.attemptId,
+        verificationUrl: started.verificationUrl,
+        expiresAt: new Date(started.expiresAtMs).toISOString(),
+      };
     },
 
     async find(params?: AuthenticatedParams): Promise<ClaudeOAuthStatus> {
-      const { key } = await requireContext(params);
+      const { ctx } = await requireContext(params);
       assertClaudeSubscriptionOAuthEnabled(app);
-      expireAndPrune();
-      return statusOf(attempts.get(key));
+      const attemptId = (params?.query as { attemptId?: string } | undefined)?.attemptId;
+      return store.status(ctx, attemptId);
     },
   };
 }

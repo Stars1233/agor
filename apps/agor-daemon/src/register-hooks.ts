@@ -639,6 +639,8 @@ export const CONSTRAINED_HA_PROCESS_AFFINE_SERVICE_GATES = [
   ['codex-auth/device', 'codexDeviceAuth'],
   ['codex-auth/import', 'codexAuth'],
   ['codex-auth/logout', 'codexAuth'],
+  // Claude is admitted only when the resolved HA capability proves its durable
+  // attempt authority plus exact-user generation-fenced writer route.
   ['claude-auth/oauth', 'claudeOAuth'],
   ['claude-auth/logout', 'claudeAuth'],
   ['opencode-auth', 'openCodeAuth'],

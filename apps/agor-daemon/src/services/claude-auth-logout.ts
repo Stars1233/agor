@@ -1,14 +1,15 @@
 /**
  * Claude Auth Logout Service
  *
- * Removes the current user's Claude subscription login from THIS server: deletes
+ * Removes the current user's Claude subscription login from this Agor deployment: deletes
  * `~/.claude/.credentials.json` from the home of the Unix identity that runs
  * Claude for this user, clears any stored `CLAUDE_CODE_OAUTH_TOKEN`, and clears
  * `agentic_auth_methods['claude-code']` so executors stop resolving native auth
  * and the UI re-probes to a disconnected state (the `patched` event drives that).
  *
  * DELETE-ONLY BY DESIGN: an Agor-scoped action mirroring the Codex logout and the
- * API-key "Clear" precedent — it signs Claude out on THIS server only and does
+ * API-key "Clear" precedent — it signs Claude out from the configured execution
+ * credential home only and does
  * NOT revoke the OAuth tokens. Authoritative revocation lives in the Claude
  * account's settings or `/logout` on a machine where the user is signed in.
  *
@@ -38,11 +39,13 @@ import type {
   UserID,
 } from '@agor/core/types';
 import { deleteClaudeAuthViaExecutor } from '../utils/executor-claude-auth.js';
+import { CLAUDE_AUTH_TRUSTED_USER_MUTATION } from './claude-credential-mutation-trust.js';
+import type { ClaudeOAuthAttemptStore } from './claude-oauth-attempt-store.js';
 import {
-  type ClaudeCredentialMutationCoordinator,
-  claudeCredentialMutationKey,
-} from './claude-oauth.js';
-import { type AppLike, resolveCodexCredentialRoute } from './codex-auth-shared.js';
+  type AppLike,
+  CODEX_AUTH_DEFER_USER_REALTIME,
+  resolveCodexCredentialRoute,
+} from './codex-auth-shared.js';
 import { markTrustedUserMutation } from './user-mutation-trust.js';
 
 /** Minimal users-service surface — mirrors the Claude OAuth service's typing. */
@@ -61,7 +64,8 @@ interface UsersServiceLike {
 export function createClaudeAuthLogoutService(
   app: AppLike,
   db: TenantScopeAwareDatabase,
-  coordinator?: ClaudeCredentialMutationCoordinator
+  /** Shared with the OAuth service so logout fences its in-flight attempts. */
+  attemptStore?: ClaudeOAuthAttemptStore
 ) {
   return {
     async create(_data: unknown, params?: AuthenticatedParams): Promise<ClaudeAuthLogoutResult> {
@@ -75,8 +79,8 @@ export function createClaudeAuthLogoutService(
       if (!tenantId) throw new Error('Missing active tenant context for Claude auth logout');
       const withTenantDatabase = <T>(work: (tenantDb: TenantScopedDatabase) => Promise<T>) =>
         runWithTenantDatabaseScope(db, tenantId, work);
+      const attemptContext = { tenantId: String(tenantId), userId };
 
-      const key = `${tenantId}:${userId}`;
       const remove = async (generation?: number): Promise<ClaudeAuthLogoutResult> => {
         const identity = await resolveCodexCredentialRoute(
           userId,
@@ -89,23 +93,18 @@ export function createClaudeAuthLogoutService(
           );
         }
 
-        // Fence a provider exchange before touching the file. If completion is
-        // already persisting, the shared mutation lock waits for it and logout
-        // linearizes afterward, so the old writer cannot resurrect the login.
-        coordinator?.invalidate(key, 'This sign-in was cancelled by signing out.');
-
         // Delete the local login (idempotent — a missing file is success). A
         // genuine delete failure is a real server problem worth surfacing, and we
         // do NOT clear the method/token in that case so a login we couldn't remove
         // keeps working. Log the error class only — never token bytes.
         try {
-          const routing = {
+          const route = {
             delegatedHomeKey: identity.delegatedHomeKey,
             userId: identity.userId,
             ...(identity.claudeConfigDir ? { claudeConfigDir: identity.claudeConfigDir } : {}),
           };
-          if (generation === undefined) await deleteClaudeAuthViaExecutor(routing);
-          else await deleteClaudeAuthViaExecutor(routing, generation);
+          if (generation === undefined) await deleteClaudeAuthViaExecutor(route);
+          else await deleteClaudeAuthViaExecutor(route, generation);
         } catch (err) {
           console.error(
             `[ClaudeAuth] Failed to delete .credentials.json${
@@ -113,7 +112,7 @@ export function createClaudeAuthLogoutService(
             }: ${err instanceof Error ? err.constructor.name : 'unknown error'}`
           );
           throw new BadRequest(
-            'Could not remove the Claude credentials file on the server. Check daemon logs.'
+            'Could not remove the Claude credentials file on the server. Check daemon logs and sudo configuration.'
           );
         }
 
@@ -124,7 +123,12 @@ export function createClaudeAuthLogoutService(
         // record — preserving any concurrently-updated method for another tool.
         const usersService = app.service('users') as UsersServiceLike;
         try {
-          const patchParams = { user: authUser, authenticated: true };
+          const patchParams = {
+            user: authUser,
+            authenticated: true,
+            [CLAUDE_AUTH_TRUSTED_USER_MUTATION]: true,
+            ...(generation === undefined ? {} : { [CODEX_AUTH_DEFER_USER_REALTIME]: true }),
+          };
           markTrustedUserMutation(patchParams, 'claude-auth');
           await usersService.patch(
             userId,
@@ -138,7 +142,7 @@ export function createClaudeAuthLogoutService(
         } catch (error) {
           // The generation-fenced file deletion has already made native auth
           // unavailable. Preserve a write-gate 503, but do not leak database
-          // errors. A subsequent Recheck/Disconnect reconciles stale metadata.
+          // errors. A later Disconnect can reconcile stale metadata.
           if (error instanceof Unavailable) throw error;
           throw new BadRequest(
             'The Claude login file was removed, but account metadata could not be updated. Recheck or disconnect again.'
@@ -148,11 +152,8 @@ export function createClaudeAuthLogoutService(
         return { status: 'removed' };
       };
 
-      return coordinator
-        ? coordinator.runCredentialMutation(
-            claudeCredentialMutationKey(app.get('config'), tenantId, userId),
-            remove
-          )
+      return attemptStore
+        ? attemptStore.runCredentialMutation(attemptContext, 'signed_out', remove)
         : remove();
     },
   };

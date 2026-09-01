@@ -1,11 +1,16 @@
 import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BoardRepository, UsersRepository } from '@agor/core/db';
+import { BoardRepository, runWithTenantContext, UsersRepository } from '@agor/core/db';
 import { feathers } from '@agor/core/feathers';
 import type { AuthenticatedParams, Params, User, UserID, UserRole } from '@agor/core/types';
 import { describe, expect, vi } from 'vitest';
 import { dbTest } from '../../../../packages/core/src/db/test-helpers';
+import {
+  CLAUDE_AUTH_TRUSTED_USER_MUTATION,
+  createClaudeUserCredentialPatchCoordinator,
+} from './claude-credential-mutation';
+import { InMemoryClaudeOAuthAttemptStore } from './claude-oauth-attempt-store';
 import { markTrustedUserMutation } from './user-mutation-trust';
 import { createUsersService, UsersService } from './users';
 
@@ -350,113 +355,185 @@ describe('UsersService role authority', () => {
 });
 
 describe('UsersService Claude credential-source authority', () => {
-  dbTest('serializes source and route changes with managed runtime refresh', async ({ db }) => {
-    const runCredentialMutation = vi.fn(
-      async <T>(_key: string, work: (generation: number) => Promise<T>) => work(11)
-    );
+  dbTest(
+    'lets nested standalone OAuth metadata patch pass a waiting external source change',
+    async ({ db }) => {
+      const config = { deployment: { mode: 'standalone' } } as const;
+      const app = { get: () => config, service: () => undefined };
+      const store = new InMemoryClaudeOAuthAttemptStore();
+      let externalLockRequested!: () => void;
+      const externalRequested = new Promise<void>((resolve) => {
+        externalLockRequested = resolve;
+      });
+      const service = new UsersService(
+        db,
+        app as never,
+        config as never,
+        createClaudeUserCredentialPatchCoordinator(app as never, db, {
+          lockExternalUserMutation: (...args) => {
+            externalLockRequested();
+            return store.lockExternalUserMutation(...args);
+          },
+          completeExternalUserMutation: (...args) => store.completeExternalUserMutation(...args),
+        })
+      );
+      const user = await createUser(service, 'member', 'standalone-lock-order');
+
+      await runWithTenantContext('default', async () => {
+        let ownerEntered!: () => void;
+        const entered = new Promise<void>((resolve) => {
+          ownerEntered = resolve;
+        });
+        let allowNested!: () => void;
+        const allowed = new Promise<void>((resolve) => {
+          allowNested = resolve;
+        });
+        const owner = store.runCredentialRefresh(
+          { tenantId: 'default', userId: user.user_id },
+          async () => {
+            ownerEntered();
+            await allowed;
+            const trustedParams = { ...externalParams(user), provider: undefined } as Params & {
+              [CLAUDE_AUTH_TRUSTED_USER_MUTATION]: boolean;
+            };
+            trustedParams[CLAUDE_AUTH_TRUSTED_USER_MUTATION] = true;
+            markTrustedUserMutation(trustedParams, 'claude-auth');
+            return service.patch(
+              user.user_id,
+              {
+                agentic_auth_methods: { 'claude-code': 'subscription' },
+                agentic_credential_sources: { 'claude-code': 'managed_file' },
+              },
+              trustedParams
+            );
+          }
+        );
+        await entered;
+        const external = service.patch(
+          user.user_id,
+          { agentic_auth_methods: { 'claude-code': 'api_key' } },
+          externalParams(user)
+        );
+        await externalRequested;
+        allowNested();
+
+        await expect(
+          Promise.race([
+            owner,
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('nested users patch deadlocked')), 250)
+            ),
+          ])
+        ).resolves.toMatchObject({
+          agentic_auth_methods: { 'claude-code': 'subscription' },
+        });
+        await expect(external).resolves.toMatchObject({
+          user_id: user.user_id,
+        });
+      });
+    }
+  );
+
+  dbTest('serializes SQLite actor demotion with destructive route cleanup', async ({ db }) => {
+    let enterCleanup!: () => void;
+    const cleanupEntered = new Promise<void>((resolve) => {
+      enterCleanup = resolve;
+    });
+    let releaseCleanup!: () => void;
+    const cleanupReleased = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
+    });
+    const cleanupRouteBeforePatch = vi.fn(async () => {
+      enterCleanup();
+      await cleanupReleased;
+    });
     const service = new UsersService(db, undefined, undefined, {
-      runCredentialMutation,
-      tombstoneCurrentCredential: vi.fn(async () => undefined),
+      applies: (data) => Object.hasOwn(data, 'filesystem_home'),
+      changesSource: () => false,
+      changesRoute: (data) => Object.hasOwn(data, 'filesystem_home'),
+      coordinatesRemoval: () => true,
+      lock: vi.fn(async () => undefined),
+      complete: vi.fn(async () => undefined),
+      cleanupRouteBeforePatch,
+      cleanupRouteBeforeRemove: vi.fn(async () => undefined),
+    });
+    const actor = await createUser(service, 'superadmin', 'cleanup-actor');
+    const demoter = await createUser(service, 'superadmin', 'cleanup-demoter');
+    const target = await createUser(service, 'admin', 'cleanup-target');
+
+    await runWithTenantContext('default', async () => {
+      const targetPatch = service.patch(
+        target.user_id as UserID,
+        { filesystem_home: '/tmp/serialized-cleanup-home' },
+        externalParams(actor)
+      );
+      await cleanupEntered;
+
+      let demotionCompleted = false;
+      const demotion = service
+        .patch(actor.user_id as UserID, { role: 'member' }, externalParams(demoter))
+        .then((value) => {
+          demotionCompleted = true;
+          return value;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(demotionCompleted).toBe(false);
+
+      releaseCleanup();
+      await expect(targetPatch).resolves.toMatchObject({
+        user_id: target.user_id,
+      });
+      await expect(demotion).resolves.toMatchObject({ role: 'member' });
+    });
+    expect(cleanupRouteBeforePatch).toHaveBeenCalledTimes(1);
+  });
+
+  dbTest('serializes source and route changes with managed runtime refresh', async ({ db }) => {
+    const lock = vi.fn(async () => undefined);
+    const complete = vi.fn(async () => undefined);
+    const cleanupRouteBeforePatch = vi.fn(async () => undefined);
+    const service = new UsersService(db, undefined, undefined, {
+      applies: (data) =>
+        Object.hasOwn(data, 'filesystem_home') ||
+        Object.hasOwn(data.agentic_tools ?? {}, 'claude-code'),
+      changesSource: (data) => Object.hasOwn(data.agentic_tools ?? {}, 'claude-code'),
+      changesRoute: (data) => Object.hasOwn(data, 'filesystem_home'),
+      coordinatesRemoval: () => true,
+      lock,
+      complete,
+      cleanupRouteBeforePatch,
+      cleanupRouteBeforeRemove: vi.fn(async () => undefined),
     });
     const user = await createUser(service, 'admin', 'claude-coordinated-source');
     const params = externalParams(user);
 
-    await service.patch(
-      user.user_id as UserID,
-      {
-        agentic_tools: {
-          'claude-code': { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-coordinated' },
-        },
-      },
-      params
-    );
-    await service.patch(
-      user.user_id as UserID,
-      { filesystem_home: '/tmp/claude-coordinated-home' },
-      params
-    );
-    await service.patch(user.user_id as UserID, { name: 'not-credential-related' }, params);
-
-    expect(runCredentialMutation).toHaveBeenCalledTimes(2);
-  });
-
-  dbTest(
-    'generation-tombstones the old external home before a route change or user deletion',
-    async ({ db }) => {
-      const observations: Array<{ tenantId: string; userId: UserID; home: string | null }> = [];
-      const mutations = {
-        runCredentialMutation: vi.fn(
-          async <T>(_key: string, work: (generation: number) => Promise<T>) => work(73)
-        ),
-        tombstoneCurrentCredential: vi.fn(
-          async (input: { tenantId: string; userId: UserID; generation: number }) => {
-            const current = await new UsersRepository(db).findById(input.userId);
-            observations.push({
-              tenantId: input.tenantId,
-              userId: input.userId,
-              home: current?.filesystem_home ?? null,
-            });
-            expect(input.generation).toBe(73);
-          }
-        ),
-      };
-      const config = {
-        execution: {
-          unix_user_mode: 'sandbox' as const,
-          executor_storage: { user_home: 'persistent-per-user' as const },
-          sandbox: { enabled: true, home_mode: 'per_user' as const },
-        },
-      };
-      const service = new UsersService(db, undefined, config, mutations);
-      const admin = await createUser(service, 'admin', 'claude-cleanup-admin');
-      const moving = await createUser(service, 'member', 'claude-cleanup-moving');
-      const deleting = await createUser(service, 'member', 'claude-cleanup-deleting');
-      const params = {
-        ...externalParams(admin),
-        tenant: { tenant_id: 'tenant-a' },
-      } as AuthenticatedParams;
-      const trusted = { ...params, provider: undefined } as Params;
-      markTrustedUserMutation(trusted, 'claude-auth');
-      for (const user of [moving, deleting]) {
-        await service.patch(
-          user.user_id as UserID,
-          { filesystem_home: `/srv/old-${user.user_id}` },
-          params
-        );
-        await service.patch(
-          user.user_id as UserID,
-          {
-            agentic_auth_methods: { 'claude-code': 'subscription' },
-            agentic_credential_sources: { 'claude-code': 'managed_file' },
-          },
-          trusted
-        );
-      }
+    await runWithTenantContext('default', async () => {
       await service.patch(
-        moving.user_id as UserID,
-        { filesystem_home: `/srv/old-${moving.user_id}` },
+        user.user_id as UserID,
+        {
+          agentic_tools: {
+            'claude-code': { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-coordinated' },
+          },
+        },
         params
       );
-      await service.patch(moving.user_id as UserID, { unix_username: 'sandbox-home-key' }, params);
-      expect(mutations.tombstoneCurrentCredential).not.toHaveBeenCalled();
-      await service.patch(moving.user_id as UserID, { filesystem_home: '/srv/new-home' }, params);
-      await service.remove(deleting.user_id as UserID, params);
+      await service.patch(
+        user.user_id as UserID,
+        { filesystem_home: '/tmp/claude-coordinated-home' },
+        params
+      );
+      await service.patch(
+        user.user_id as UserID,
+        { filesystem_home: '/tmp/claude-coordinated-home' },
+        params
+      );
+      await service.patch(user.user_id as UserID, { name: 'not-credential-related' }, params);
+    });
 
-      expect(observations).toEqual([
-        {
-          tenantId: 'tenant-a',
-          userId: moving.user_id,
-          home: `/srv/old-${moving.user_id}`,
-        },
-        {
-          tenantId: 'tenant-a',
-          userId: deleting.user_id,
-          home: `/srv/old-${deleting.user_id}`,
-        },
-      ]);
-      expect(mutations.tombstoneCurrentCredential).toHaveBeenCalledTimes(2);
-    }
-  );
+    expect(lock).toHaveBeenCalledTimes(3);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(cleanupRouteBeforePatch).toHaveBeenCalledTimes(1);
+  });
 
   dbTest(
     'preserves managed credentials across canonical-equivalent sandbox home updates',
@@ -467,121 +544,52 @@ describe('UsersService Claude credential-source authority', () => {
         const aliasHome = join(root, 'alias-home');
         await mkdir(realHome);
         await symlink(realHome, aliasHome, 'dir');
-        const mutations = {
-          runCredentialMutation: vi.fn(
-            async <T>(_key: string, work: (generation: number) => Promise<T>) => work(79)
-          ),
-          tombstoneCurrentCredential: vi.fn(async () => undefined),
-        };
+        const cleanupRouteBeforePatch = vi.fn(async () => undefined);
         const config = {
           execution: {
             unix_user_mode: 'sandbox' as const,
-            executor_storage: { user_home: 'persistent-per-user' as const },
             sandbox: { enabled: true, home_mode: 'per_user' as const },
           },
         };
-        const service = new UsersService(db, undefined, config, mutations);
-        const admin = await createUser(service, 'admin', 'claude-canonical-route-admin');
-        const member = await createUser(service, 'member', 'claude-canonical-route-member');
-        const params = {
-          ...externalParams(admin),
-          tenant: { tenant_id: 'tenant-a' },
-        } as AuthenticatedParams;
-        const trusted = { ...params, provider: undefined } as Params;
-        markTrustedUserMutation(trusted, 'claude-auth');
-        await service.patch(member.user_id as UserID, { filesystem_home: realHome }, params);
-        await service.patch(
-          member.user_id as UserID,
-          {
-            agentic_auth_methods: { 'claude-code': 'subscription' },
-            agentic_credential_sources: { 'claude-code': 'managed_file' },
-          },
-          trusted
-        );
+        const service = new UsersService(db, undefined, config, {
+          applies: (data) => Object.hasOwn(data, 'filesystem_home'),
+          changesSource: () => false,
+          changesRoute: (data) => Object.hasOwn(data, 'filesystem_home'),
+          coordinatesRemoval: () => true,
+          lock: vi.fn(async () => undefined),
+          complete: vi.fn(async () => undefined),
+          cleanupRouteBeforePatch,
+          cleanupRouteBeforeRemove: vi.fn(async () => undefined),
+        });
+        const user = await createUser(service, 'admin', 'claude-canonical-route');
+        const params = externalParams(user);
 
-        for (const equivalent of [`${realHome}/`, `${root}/./real-home`, aliasHome]) {
-          await service.patch(member.user_id as UserID, { filesystem_home: equivalent }, params);
-        }
+        await runWithTenantContext('default', async () => {
+          await service.patch(user.user_id as UserID, { filesystem_home: realHome }, params);
+          const trusted = { ...params, provider: undefined } as Params & {
+            [CLAUDE_AUTH_TRUSTED_USER_MUTATION]: boolean;
+          };
+          trusted[CLAUDE_AUTH_TRUSTED_USER_MUTATION] = true;
+          markTrustedUserMutation(trusted, 'claude-auth');
+          await service.patch(
+            user.user_id as UserID,
+            {
+              agentic_auth_methods: { 'claude-code': 'subscription' },
+              agentic_credential_sources: { 'claude-code': 'managed_file' },
+            },
+            trusted
+          );
+          cleanupRouteBeforePatch.mockClear();
 
-        expect(mutations.tombstoneCurrentCredential).not.toHaveBeenCalled();
+          for (const equivalent of [`${realHome}/`, `${root}/./real-home`, aliasHome]) {
+            await service.patch(user.user_id as UserID, { filesystem_home: equivalent }, params);
+          }
+        });
+
+        expect(cleanupRouteBeforePatch).not.toHaveBeenCalled();
       } finally {
         await rm(root, { recursive: true, force: true });
       }
-    }
-  );
-
-  dbTest(
-    'serializes blocked SQLite cleanup with actor demotion across different target users',
-    async ({ db }) => {
-      let cleanupEntered!: () => void;
-      const entered = new Promise<void>((resolve) => {
-        cleanupEntered = resolve;
-      });
-      let releaseCleanup!: () => void;
-      const release = new Promise<void>((resolve) => {
-        releaseCleanup = resolve;
-      });
-      const mutations = {
-        runCredentialMutation: vi.fn(
-          async <T>(_key: string, work: (generation: number) => Promise<T>) => work(91)
-        ),
-        tombstoneCurrentCredential: vi.fn(async () => {
-          cleanupEntered();
-          await release;
-        }),
-      };
-      const config = {
-        execution: {
-          unix_user_mode: 'sandbox' as const,
-          executor_storage: { user_home: 'persistent-per-user' as const },
-          sandbox: { enabled: true, home_mode: 'per_user' as const },
-        },
-      };
-      const service = new UsersService(db, undefined, config, mutations);
-      const superadmin = await createUser(service, 'superadmin', 'cleanup-race-superadmin');
-      const admin = await createUser(service, 'admin', 'cleanup-race-admin');
-      const member = await createUser(service, 'member', 'cleanup-race-member');
-      const tenant = { tenant_id: 'cleanup-race-tenant' };
-      const superadminParams = { ...externalParams(superadmin), tenant } as AuthenticatedParams;
-      const adminParams = { ...externalParams(admin), tenant } as AuthenticatedParams;
-      const trusted = { ...superadminParams, provider: undefined } as Params;
-      markTrustedUserMutation(trusted, 'claude-auth');
-      await service.patch(
-        member.user_id as UserID,
-        { filesystem_home: '/srv/cleanup-race-old' },
-        superadminParams
-      );
-      await service.patch(
-        member.user_id as UserID,
-        {
-          agentic_auth_methods: { 'claude-code': 'subscription' },
-          agentic_credential_sources: { 'claude-code': 'managed_file' },
-        },
-        trusted
-      );
-
-      const cleanup = service.patch(
-        member.user_id as UserID,
-        { filesystem_home: '/srv/cleanup-race-new' },
-        adminParams
-      );
-      await entered;
-      let demotionSettled = false;
-      const demotion = service
-        .patch(admin.user_id as UserID, { role: 'member' }, superadminParams)
-        .finally(() => {
-          demotionSettled = true;
-        });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(demotionSettled).toBe(false);
-
-      releaseCleanup();
-      await expect(cleanup).resolves.toMatchObject({ user_id: member.user_id });
-      await expect(demotion).resolves.toMatchObject({ role: 'member' });
-      await expect(
-        new UsersRepository(db).findById(member.user_id as UserID)
-      ).resolves.toMatchObject({ filesystem_home: '/srv/cleanup-race-new' });
-      expect(mutations.tombstoneCurrentCredential).toHaveBeenCalledTimes(1);
     }
   );
 

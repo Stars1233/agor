@@ -1,6 +1,10 @@
+import { mkdtemp, readFile, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   deleteClaudeAuthViaExecutor,
+  fenceClaudeAuthCredential,
   inspectClaudeAuthViaExecutor,
   writeClaudeAuthViaExecutor,
 } from './executor-claude-auth.js';
@@ -34,6 +38,33 @@ describe('executor Claude auth dispatch', () => {
       })
     );
   });
+
+  it.runIf(process.platform === 'linux')(
+    'contains generation-authorized HA writes in the daemon and fences stale mutations',
+    async () => {
+      const home = await mkdtemp(join(tmpdir(), 'agor-claude-contained-'));
+      const route = {
+        delegatedHomeKey: null,
+        userId: 'user-1' as const,
+        claudeConfigDir: join(home, '.claude'),
+      };
+      const credentialPath = join(route.claudeConfigDir, '.credentials.json');
+      const generationPath = join(route.claudeConfigDir, '.agor-auth-generation');
+      await writeClaudeAuthViaExecutor('credential-a', route, 10);
+      expect(requestExecutorMock).not.toHaveBeenCalled();
+      await expect(readFile(credentialPath, 'utf8')).resolves.toBe('credential-a');
+      const credentialInode = (await stat(credentialPath)).ino;
+      const generationInode = (await stat(generationPath)).ino;
+
+      await fenceClaudeAuthCredential(route, 11);
+      await expect(readFile(credentialPath, 'utf8')).resolves.toBe('credential-a');
+      await expect(writeClaudeAuthViaExecutor('stale', route, 10)).rejects.toThrow(/superseded/);
+      await expect(deleteClaudeAuthViaExecutor(route, 12)).resolves.toBeUndefined();
+      expect(await stat(credentialPath)).toMatchObject({ ino: credentialInode, size: 0 });
+      expect(await stat(generationPath)).toMatchObject({ ino: generationInode });
+      await expect(readFile(generationPath, 'utf8')).resolves.toBe('12\n');
+    }
+  );
 
   it('maps absent separately from unreadable without exposing executor errors', async () => {
     const routing = { delegatedHomeKey: 'alice', userId: 'user-1' };

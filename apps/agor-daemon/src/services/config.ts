@@ -199,6 +199,11 @@ export class ConfigService {
           'Managed Claude subscription login is unavailable for this task. Use an API key or pasted subscription token.'
         );
       }
+      // The token is short-lived, but it is still the prompter's credential.
+      // Do not inject it into a session executing in another user's home; the
+      // same identity agreement that protected native-file auth remains the
+      // task-runtime credential boundary after canonical-file masking.
+      await this.assertNativeAuthHomeMatchesSession(tool, userId, sessionId, internalParams);
       const managed = await this.claudeRuntimeCredentials.resolve(tenantId, userId);
       result = {
         ...result,
@@ -250,11 +255,12 @@ export class ConfigService {
         config: this.config,
         withTenantDatabase: (work) => runWithTenantDatabaseScope(this.db, tenantId, work),
       });
-    const requireCanonicalCodexHome = tool === 'codex' && this.config.deployment?.mode === 'ha';
-    let prompterHome = requireCanonicalCodexHome ? await homeOf(promptingUserId) : undefined;
+    const requireCanonicalProviderHome =
+      (tool === 'codex' || tool === 'claude-code') && this.config.deployment?.mode === 'ha';
+    let prompterHome = requireCanonicalProviderHome ? await homeOf(promptingUserId) : undefined;
     if (prompterHome?.homeStoreSource === 'override') {
       throw new BadRequest(
-        'HA Codex subscription auth requires Agor’s canonical tenant/user home. ' +
+        'HA subscription auth requires Agor’s canonical tenant/user home. ' +
           'Remove the filesystem_home override for this account or use an API key.'
       );
     }
@@ -291,9 +297,9 @@ export class ConfigService {
         delegatedHomeKey: session?.unix_username ?? null,
       };
     }
-    if (requireCanonicalCodexHome && ownerHome.homeStoreSource === 'override') {
+    if (requireCanonicalProviderHome && ownerHome.homeStoreSource === 'override') {
       throw new BadRequest(
-        'HA Codex subscription auth requires the session owner’s canonical tenant/user home. ' +
+        'HA subscription auth requires the session owner’s canonical tenant/user home. ' +
           'Remove the filesystem_home override or use an API key.'
       );
     }

@@ -5486,19 +5486,16 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         // Gated behind auth like the rest of this block (any authenticated
         // user, matching the existing `database`/`execution` fields below —
         // not admin-only).
-        const migrations = await probePendingMigrations(db);
-        const mcpEgressMode = await getMCPEgressGatewayMode(db);
         const healthTenantId =
           (params as AuthenticatedParams | undefined)?.tenant?.tenant_id ?? getCurrentTenantId();
-        const mcpEgressRuntime = healthTenantId
-          ? mcpEgressGateway.status(healthTenantId)
-          : {
-              inFlightRequests: 0,
-              activeRequests: 0,
-              providerInFlightRequests: 0,
-              reservedRequests: 0,
-              oldestRequestMs: 0,
-            };
+        if (!healthTenantId) {
+          throw new NotAuthenticated('Missing tenant context for authenticated health');
+        }
+        const migrations = await probePendingMigrations(db);
+        const mcpEgressMode = await runWithTenantDatabaseScope(db, healthTenantId, (tenantDb) =>
+          getMCPEgressGatewayMode(tenantDb)
+        );
+        const mcpEgressRuntime = mcpEgressGateway.status(healthTenantId);
 
         return {
           ...publicResponse,

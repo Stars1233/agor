@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const configMocks = vi.hoisted(() => ({
+  hasCrossReplicaExecutorCredentialLock: vi.fn(() => false),
   hasExactUserExecutorCredentialHome: vi.fn(() => false),
   loadConfig: vi.fn(async () => ({})),
   resolveApiKey: vi.fn(),
@@ -21,6 +22,7 @@ const dbMocks = vi.hoisted(() => ({
   runWithTenantDatabaseScope: vi.fn(
     async (db: unknown, _tenantId: unknown, work: (db: unknown) => unknown) => work(db)
   ),
+  UsersRepository: vi.fn(),
 }));
 
 vi.mock('@agor/core/config', () => configMocks);
@@ -34,6 +36,7 @@ import { ConfigService } from './config.js';
 describe('ConfigService.resolveApiKey', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    configMocks.hasCrossReplicaExecutorCredentialLock.mockReturnValue(false);
     configMocks.hasExactUserExecutorCredentialHome.mockReturnValue(false);
     homeMocks.resolveExecutionCredentialHome.mockImplementation(async ({ userId }) => ({
       delegatedHomeKey: null,
@@ -291,6 +294,7 @@ describe('ConfigService.resolveApiKey', () => {
         { taskId: 'task-1' as TaskID, keyName: 'OPENAI_API_KEY', tool: 'codex' },
         {
           provider: 'socketio',
+          tenant: { tenant_id: 'tenant-1' },
           user: { user_id: 'creator-1' },
           authentication: {
             strategy: 'jwt',
@@ -400,6 +404,7 @@ describe('ConfigService.resolveApiKey', () => {
         { taskId: 'task-1' as TaskID, keyName: 'ANTHROPIC_API_KEY', tool: 'codex' },
         {
           provider: 'socketio',
+          tenant: { tenant_id: 'tenant-1' },
           user: { user_id: 'creator-1' },
           authentication: {
             strategy: 'jwt',
@@ -415,6 +420,147 @@ describe('ConfigService.resolveApiKey', () => {
     ).rejects.toBeInstanceOf(Forbidden);
 
     expect(configMocks.resolveApiKey).not.toHaveBeenCalled();
+  });
+
+  describe('managed Claude runtime credential-home agreement', () => {
+    const DELEGATED = {
+      execution: { unix_user_mode: 'delegated' },
+    };
+
+    const managedRuntime = () => ({
+      resolve: vi.fn(async () => ({
+        connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-managed' },
+        useNativeAuth: false as const,
+      })),
+    });
+
+    /** Executor asking for the daemon-contained Claude login of `prompter`. */
+    const resolveNative = (
+      service: ConfigService,
+      opts: { prompter: string; owner: string; sessionHomeKey?: string | null }
+    ) => {
+      service.app = {
+        service(name: string) {
+          if (name === 'tasks') {
+            return {
+              get: vi.fn(async () => ({ created_by: opts.prompter, session_id: 'session-1' })),
+            };
+          }
+          if (name === 'sessions') {
+            return {
+              get: vi.fn(async () => ({
+                agentic_tool: 'claude-code',
+                created_by: opts.owner,
+                unix_username: opts.sessionHomeKey ?? opts.owner,
+              })),
+            };
+          }
+          throw new Error(`unexpected service ${name}`);
+        },
+      } as never;
+      return service.resolveApiKey(
+        { taskId: 'task-1' as TaskID, keyName: 'ANTHROPIC_API_KEY', tool: 'claude-code' },
+        {
+          provider: 'socketio',
+          tenant: { tenant_id: 'tenant-1' },
+          user: { user_id: opts.prompter },
+          authentication: {
+            strategy: 'jwt',
+            payload: {
+              type: 'executor-session',
+              purpose: 'executor-task',
+              task_id: 'task-1',
+              session_id: 'session-1',
+            },
+          },
+        } as never
+      );
+    };
+
+    beforeEach(() => {
+      configMocks.resolveApiKey.mockResolvedValue({
+        apiKey: null,
+        source: 'user',
+        useNativeAuth: true,
+      });
+      homeMocks.resolveExecutionCredentialHome.mockImplementation(async ({ userId }) => ({
+        delegatedHomeKey: userId,
+        homeStore: null,
+        homeStoreSource: null,
+      }));
+      homeMocks.sameExecutionCredentialHome.mockImplementation(
+        (a, b) => a.delegatedHomeKey === b.delegatedHomeKey && a.homeStore === b.homeStore
+      );
+    });
+
+    it('refuses native auth when the prompter and session owner have different homes', async () => {
+      // Reachable via dangerously_allow_session_sharing: the child session kept
+      // the parent creator's identity, so bob's sign-in wrote into bob's home
+      // while the session still executes in alice's. Without this the executor
+      // is told "read the on-disk login" and silently finds none.
+      const service = new ConfigService({} as never, DELEGATED as never, managedRuntime() as never);
+
+      await expect(resolveNative(service, { prompter: 'bob', owner: 'alice' })).rejects.toThrow(
+        /different execution home/
+      );
+    });
+
+    it('allows native auth when the prompter owns the session', async () => {
+      const service = new ConfigService({} as never, DELEGATED as never, managedRuntime() as never);
+
+      await expect(
+        resolveNative(service, { prompter: 'alice', owner: 'alice' })
+      ).resolves.toMatchObject({
+        useNativeAuth: false,
+        connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-managed' },
+      });
+      // The current route is compared with the Session's immutable stamp.
+      expect(homeMocks.resolveExecutionCredentialHome).toHaveBeenCalled();
+    });
+
+    it('refuses native auth when an owner current home drifted from the Session stamp', async () => {
+      const service = new ConfigService({} as never, DELEGATED as never, managedRuntime() as never);
+
+      await expect(
+        resolveNative(service, {
+          prompter: 'alice',
+          owner: 'alice',
+          sessionHomeKey: 'alice-before-rename',
+        })
+      ).rejects.toThrow(/different execution home/);
+    });
+
+    it('allows cross-user native auth in simple mode, where the home is shared', async () => {
+      homeMocks.resolveExecutionCredentialHome.mockResolvedValue({
+        delegatedHomeKey: null,
+        homeStore: '/daemon-home',
+        homeStoreSource: 'canonical',
+      });
+      const service = new ConfigService(
+        {} as never,
+        {
+          execution: { unix_user_mode: 'simple' },
+        } as never,
+        managedRuntime() as never
+      );
+
+      await expect(
+        resolveNative(service, { prompter: 'bob', owner: 'alice' })
+      ).resolves.toMatchObject({ useNativeAuth: false });
+    });
+
+    it('leaves API-key resolution untouched when the homes differ', async () => {
+      configMocks.resolveApiKey.mockResolvedValue({
+        apiKey: 'resolved-test-key',
+        source: 'user',
+        useNativeAuth: false,
+      });
+      const service = new ConfigService({} as never, DELEGATED as never);
+
+      await expect(
+        resolveNative(service, { prompter: 'bob', owner: 'alice' })
+      ).resolves.toMatchObject({ apiKey: 'resolved-test-key' });
+    });
   });
 
   it('rejects executor runtime tokens for tools without a canonical API key mapping', async () => {
@@ -591,7 +737,7 @@ describe('ConfigService.resolveApiKey', () => {
     ).rejects.toBeInstanceOf(BadRequest);
   });
 
-  it('keeps Claude native subscription auth fail-closed in HA', async () => {
+  it('keeps Claude native subscription auth fail-closed in HA without a cross-replica lock', async () => {
     configMocks.resolveApiKey.mockResolvedValue({
       apiKey: null,
       source: 'user',
@@ -654,6 +800,85 @@ describe('ConfigService.resolveApiKey', () => {
         } as never
       )
     ).rejects.toBeInstanceOf(BadRequest);
+  });
+
+  it('injects a contained short-lived Claude token in HA instead of native auth', async () => {
+    configMocks.resolveApiKey.mockResolvedValue({
+      apiKey: null,
+      source: 'user',
+      useNativeAuth: true,
+    });
+    configMocks.hasExactUserExecutorCredentialHome.mockReturnValue(true);
+    configMocks.hasCrossReplicaExecutorCredentialLock.mockReturnValue(true);
+    const service = new ConfigService(
+      {} as never,
+      {
+        deployment: { mode: 'ha' },
+        multi_tenancy: { mode: 'required_from_auth' },
+        execution: {
+          unix_user_mode: 'sandbox',
+          executor_storage: {
+            user_home: 'persistent-per-user',
+            user_home_locking: 'cross-replica-flock',
+          },
+          sandbox: { enabled: true, home_mode: 'per_user' },
+        },
+      } as never,
+      {
+        resolve: vi.fn(async () => ({
+          connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-ha-managed' },
+          useNativeAuth: false,
+        })),
+      }
+    );
+    service.app = {
+      service(name: string) {
+        if (name === 'tasks') {
+          return {
+            get: vi.fn(async () => ({
+              created_by: 'creator-1' as UserID,
+              session_id: 'session-1',
+            })),
+          };
+        }
+        if (name === 'sessions') {
+          return {
+            get: vi.fn(async () => ({
+              agentic_tool: 'claude-code',
+              created_by: 'creator-1',
+            })),
+          };
+        }
+        throw new Error(`unexpected service ${name}`);
+      },
+    } as never;
+
+    await expect(
+      service.resolveApiKey(
+        {
+          taskId: 'task-1' as TaskID,
+          keyName: 'ANTHROPIC_API_KEY',
+          tool: 'claude-code',
+        },
+        {
+          provider: 'socketio',
+          tenant: { tenant_id: 'tenant-1' },
+          user: { user_id: 'creator-1' },
+          authentication: {
+            strategy: 'jwt',
+            payload: {
+              type: 'executor-session',
+              purpose: 'executor-task',
+              task_id: 'task-1',
+              session_id: 'session-1',
+            },
+          },
+        } as never
+      )
+    ).resolves.toMatchObject({
+      useNativeAuth: false,
+      connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-ha-managed' },
+    });
   });
 
   it.each([

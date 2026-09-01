@@ -39,7 +39,7 @@ describe.skipIf(!postgresUrl || !usesPostgresSchema)(
       await (raw as RawDatabase & { $client: { end: () => Promise<void> } }).$client.end();
     });
 
-    it('mutates no file while frozen and holds no transaction during admitted executor I/O', async () => {
+    it('mutates no file while frozen and releases the admission transaction before handler I/O', async () => {
       const tenantId = `claude-auth-gate-${randomUUID()}`;
       const gate = await acquireTenantWriteGate(raw, tenantId, {
         holder: 'claude-auth-test',

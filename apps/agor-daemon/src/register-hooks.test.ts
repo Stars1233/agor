@@ -710,10 +710,9 @@ describe('tenant-owned service registration', () => {
     ]);
   });
 
-  // claude-auth/oauth holds the same in-memory `attempts` map as codex-auth/device
-  // (create → find → create), and claude-auth/logout deletes a credential file
-  // like codex-auth/logout — both must stick to one replica in constrained HA.
-  it('gates the Claude OAuth attempt flow and credential-file logout in HA', () => {
+  // These remain in the capability-gate inventory, but a safe constrained-HA
+  // deployment resolves both capabilities true and admits the durable paths.
+  it('capability-gates the Claude OAuth attempt flow and credential-file logout in HA', () => {
     expect(CONSTRAINED_HA_PROCESS_AFFINE_SERVICE_GATES).toContainEqual([
       'claude-auth/oauth',
       'claudeOAuth',

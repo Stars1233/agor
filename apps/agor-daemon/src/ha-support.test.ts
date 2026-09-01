@@ -29,6 +29,8 @@ describe('constrained HA support profile', () => {
       githubInstall: true as const,
       codexCredentialFiles: true,
       codexDeviceAuth: true,
+      claudeAuth: true,
+      claudeOAuth: true,
       processAffineAuth: false as const,
       gatewayListeners: true as const,
       gatewayOutboundExactlyOnce: false as const,
@@ -150,18 +152,28 @@ describe('constrained HA support profile', () => {
     ).toBe(true);
   });
 
-  it('keeps standalone Claude credential mutation and OAuth gated in constrained HA', () => {
-    expect(isHaFeatureUnavailable(ha, 'claudeAuth')).toBe(true);
-    expect(isHaFeatureUnavailable(ha, 'claudeOAuth')).toBe(true);
+  it('admits Claude only with its exact-user generation-fenced HA capabilities', () => {
+    expect(isHaFeatureUnavailable(ha, 'claudeAuth')).toBe(false);
+    expect(isHaFeatureUnavailable(ha, 'claudeOAuth')).toBe(false);
     expect(
       isHaFeatureUnavailable(
-        { ...ha, capabilities: { ...ha.capabilities, codexCredentialFiles: false } },
+        { ...ha, capabilities: { ...ha.capabilities, claudeAuth: false } },
         'claudeAuth'
+      )
+    ).toBe(true);
+    expect(
+      isHaFeatureUnavailable(
+        { ...ha, capabilities: { ...ha.capabilities, claudeOAuth: false } },
+        'claudeOAuth'
       )
     ).toBe(true);
   });
 
   it('does not mistake the immutable runtime authority layout for HA mutation ownership', () => {
+    const containedWithoutDurableAuthority = {
+      ...ha,
+      capabilities: { ...ha.capabilities, claudeAuth: false, claudeOAuth: false },
+    };
     expect(
       hasClaudeSubscriptionOAuthCapability(
         {
@@ -175,34 +187,47 @@ describe('constrained HA support profile', () => {
             sandbox: { enabled: true, home_mode: 'per_user' },
           },
         },
-        ha
+        containedWithoutDurableAuthority
       )
     ).toBe(false);
-    expect(isHaFeatureUnavailable(ha, 'claudeAuth')).toBe(true);
-    expect(isHaFeatureUnavailable(ha, 'claudeOAuth')).toBe(true);
+    expect(isHaFeatureUnavailable(containedWithoutDurableAuthority, 'claudeAuth')).toBe(true);
+    expect(isHaFeatureUnavailable(containedWithoutDurableAuthority, 'claudeOAuth')).toBe(true);
   });
 
   it('requires operator authorization and topology support for the Claude OAuth capability', () => {
     const standalone = { mode: 'standalone' as const };
+    const authorizedContained = {
+      agentic_tools: { claude_subscription_oauth: true },
+      execution: {
+        unix_user_mode: 'sandbox' as const,
+        executor_storage: { user_home: 'persistent-per-user' as const },
+        sandbox: { enabled: true, home_mode: 'per_user' as const },
+      },
+    };
     expect(hasClaudeSubscriptionOAuthCapability({}, standalone)).toBe(false);
-    expect(
-      hasClaudeSubscriptionOAuthCapability(
-        {
-          agentic_tools: { claude_subscription_oauth: true },
-          execution: {
-            unix_user_mode: 'sandbox',
-            executor_storage: { user_home: 'persistent-per-user' },
-            sandbox: { enabled: true, home_mode: 'per_user' },
-          },
+    expect(hasClaudeSubscriptionOAuthCapability(authorizedContained, standalone)).toBe(true);
+    expect(hasClaudeSubscriptionOAuthCapability(authorizedContained, ha)).toBe(true);
+    expect(hasClaudeSubscriptionOAuthCapability({}, ha)).toBe(false);
+    const writableEscape = {
+      ...authorizedContained,
+      execution: {
+        ...authorizedContained.execution,
+        sandbox: {
+          ...authorizedContained.execution.sandbox,
+          extra_allow_write: ['/home/agor/.agor'],
         },
-        standalone
-      )
-    ).toBe(true);
+      },
+    };
+    // An extra writable bind can re-expose an initially hidden physical owner
+    // store after alias analysis. Reject every such topology rather than
+    // advertising a containment guarantee that depends on path coincidence.
+    expect(hasClaudeSubscriptionOAuthCapability(writableEscape, standalone)).toBe(false);
+    expect(hasClaudeSubscriptionOAuthCapability(writableEscape, ha)).toBe(false);
     expect(
-      hasClaudeSubscriptionOAuthCapability(
-        { agentic_tools: { claude_subscription_oauth: true } },
-        ha
-      )
+      hasClaudeSubscriptionOAuthCapability(authorizedContained, {
+        ...ha,
+        capabilities: { ...ha.capabilities, claudeOAuth: false },
+      })
     ).toBe(false);
   });
 

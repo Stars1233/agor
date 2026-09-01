@@ -22,7 +22,7 @@ export interface ClaudeOAuthSignInProps {
    * only when autoStart is true (the wizard reflecting a verified state).
    */
   autoStart?: boolean;
-  /** Cancels caller-private OAuth continuations when socket authority changes. */
+  /** Cancels caller-private attempts and pasted-code state on authority changes. */
   operationScope?: readonly unknown[] | null;
 }
 
@@ -63,25 +63,29 @@ export const ClaudeOAuthSignIn = memo(function ClaudeOAuthSignIn({
     () =>
       client
         ? (client.service('claude-auth/oauth') as unknown as {
-            create(data: { code?: string }): Promise<unknown>;
-            find(): Promise<unknown>;
+            create(data: { code?: string; attemptId?: string }): Promise<unknown>;
+            find(params?: { query?: { attemptId?: string } }): Promise<unknown>;
           })
         : null,
     [client]
   );
-  const effectiveOperationScope =
-    operationScope === undefined ? ([service] as const) : operationScope;
-  const operationAvailable = effectiveOperationScope !== null;
 
   // Guard every request against the service the pane currently talks to: an
   // in-flight call issued against a swapped-out client must not land its state
   // over the replacement's.
-  const { run } = useIdentityGuardedAsync([service, ...(effectiveOperationScope ?? [null])], () => {
-    setStarting(false);
-    setStatus({ phase: 'idle' });
-    setCode('');
-    setSubmitError(null);
-  });
+  const effectiveOperationScope =
+    operationScope === undefined ? ([service] as const) : operationScope;
+  const operationAvailable = effectiveOperationScope !== null;
+  const { run, isCurrent } = useIdentityGuardedAsync(
+    [service, ...(effectiveOperationScope ?? [null])],
+    () => {
+      setStarting(false);
+      setSubmitting(false);
+      setStatus({ phase: 'idle' });
+      setCode('');
+      setSubmitError(null);
+    }
+  );
 
   const requestLink = useCallback(async () => {
     if (!service || !operationAvailable) return;
@@ -102,7 +106,7 @@ export const ClaudeOAuthSignIn = memo(function ClaudeOAuthSignIn({
     } finally {
       setStarting(false);
     }
-  }, [service, run, operationAvailable]);
+  }, [service, operationAvailable, run]);
 
   // On mount (and on client swap), adopt a still-live attempt instead of burning
   // a fresh link; otherwise request one when autoStart is set.
@@ -142,7 +146,13 @@ export const ClaudeOAuthSignIn = memo(function ClaudeOAuthSignIn({
 
     const poll = async () => {
       try {
-        const latest = (await run(() => service.find())) as ClaudeOAuthStatus;
+        // Discovery on mount may ask for the caller's current attempt, but once
+        // this pane owns an id every continuation is exact. Otherwise a stale
+        // tab polling an older exchange could silently adopt a replacement
+        // attempt started on another replica.
+        const latest = (await run(() =>
+          service.find({ query: { attemptId: status.attemptId } })
+        )) as ClaudeOAuthStatus;
         if (cancelled) return;
         setStatus(latest);
         if (latest.phase === 'exchanging') timer = setTimeout(poll, 500);
@@ -156,14 +166,16 @@ export const ClaudeOAuthSignIn = memo(function ClaudeOAuthSignIn({
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [service, status.phase, run, operationAvailable]);
+  }, [service, status.phase, status.attemptId, run, operationAvailable]);
 
   const submitCode = useCallback(async () => {
     if (!service || !operationAvailable || !code.trim()) return;
     setSubmitting(true);
     setSubmitError(null);
     try {
-      const next = (await run(() => service.create({ code: code.trim() }))) as ClaudeOAuthStatus;
+      const next = (await run(() =>
+        service.create({ code: code.trim(), attemptId: status.attemptId })
+      )) as ClaudeOAuthStatus;
       setStatus(next);
       if (next.phase === 'success') setCode('');
     } catch (err) {
@@ -191,11 +203,11 @@ export const ClaudeOAuthSignIn = memo(function ClaudeOAuthSignIn({
     } finally {
       setSubmitting(false);
     }
-  }, [service, code, run, operationAvailable]);
+  }, [service, operationAvailable, code, status.attemptId, run]);
 
   useEffect(() => {
-    if (status.phase === 'success') onVerified();
-  }, [status.phase, onVerified]);
+    if (status.phase === 'success' && isCurrent()) onVerified();
+  }, [status.phase, onVerified, isCurrent]);
 
   if (starting || (status.phase === 'idle' && autoStart)) {
     return (
@@ -237,6 +249,13 @@ export const ClaudeOAuthSignIn = memo(function ClaudeOAuthSignIn({
             Open the Claude sign-in page
           </Button>
         )}
+        {!status.verificationUrl && (
+          <Alert
+            type="warning"
+            showIcon
+            message="This browser no longer has the original sign-in link. Start over to get a fresh one."
+          />
+        )}
         <Space.Compact style={{ width: '100%' }}>
           <Input
             aria-label="Claude authorization code"
@@ -251,6 +270,11 @@ export const ClaudeOAuthSignIn = memo(function ClaudeOAuthSignIn({
           </Button>
         </Space.Compact>
         {submitError && <Alert type="error" showIcon message={submitError} />}
+        {!busy && !status.verificationUrl && (
+          <div>
+            <Button onClick={requestLink}>Start over</Button>
+          </div>
+        )}
       </Space>
     );
   }

@@ -37,7 +37,10 @@ export function hasExactUserExecutorCredentialHome(config: Pick<AgorConfig, 'exe
  * Whether a Claude runtime is confined away from the daemon-owned canonical
  * OAuth grant and its mutation sidecars. The containment is a concrete
  * bubblewrap immutable-parent plus leaf-mask boundary, not merely a storage
- * declaration: only the local per-user sandbox policy emits it.
+ * declaration: only the local per-user sandbox policy emits it. Templated
+ * execution bypasses that local wrapper, and any `extra_allow_write` path may
+ * re-expose the physical store outside the derived alias set, so both fail
+ * closed here.
  *
  * Keep this separate from {@link hasExactUserExecutorCredentialHome}. Exact
  * routing says where a credential belongs; this predicate says the untrusted
@@ -51,8 +54,10 @@ export function hasContainedClaudeRuntimeCredentials(
   return (
     config.execution?.unix_user_mode === 'sandbox' &&
     hasExactUserExecutorCredentialHome(config) &&
+    !config.execution?.executor_command_template &&
     config.execution?.sandbox?.enabled === true &&
-    config.execution.sandbox.home_mode === 'per_user'
+    config.execution.sandbox.home_mode === 'per_user' &&
+    (config.execution.sandbox.extra_allow_write?.length ?? 0) === 0
   );
 }
 

@@ -15,9 +15,11 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { probeBwrapBindFd } from '../unix/bwrap';
 import {
+  advanceCredentialFileGeneration,
   CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES,
   compareAndSwapCredentialFile,
   ensureCredentialAuthorityLayout,
+  ensureCredentialAuthorityLayoutSync,
   mutateCredentialFile,
   openCredentialFileForBind,
   readCredentialAuthorityFile,
@@ -110,6 +112,51 @@ describe('credential file directory capability', () => {
   );
 
   it.runIf(process.platform === 'linux')(
+    'synchronously prepares stable authority leaves and fails closed on aliases',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'agor-credential-layout-sync-'));
+      const target = join(root, 'home', '.claude', '.credentials.json');
+      ensureCredentialAuthorityLayoutSync(target);
+      const paths = [
+        target,
+        ...CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES.map((name) =>
+          join(root, 'home', '.claude', name)
+        ),
+      ];
+      for (const path of paths) {
+        expect((await lstat(path)).isFile()).toBe(true);
+        expect((await stat(path)).mode & 0o777).toBe(0o600);
+      }
+      await writeFile(target, 'existing-authority');
+      const originalInodes = await Promise.all(paths.map(async (path) => (await stat(path)).ino));
+      ensureCredentialAuthorityLayoutSync(target);
+      expect(await readFile(target, 'utf8')).toBe('existing-authority');
+      expect(await Promise.all(paths.map(async (path) => (await stat(path)).ino))).toEqual(
+        originalInodes
+      );
+
+      const symlinkRoot = join(root, 'symlink-home');
+      const other = join(root, 'other');
+      await mkdir(other);
+      await mkdir(symlinkRoot);
+      await symlink(other, join(symlinkRoot, '.claude'));
+      expect(() =>
+        ensureCredentialAuthorityLayoutSync(join(symlinkRoot, '.claude', '.credentials.json'))
+      ).toThrow();
+
+      const hardlinkDir = join(root, 'hardlink-home', '.claude');
+      const outside = join(root, 'outside');
+      await mkdir(hardlinkDir, { recursive: true });
+      await writeFile(outside, 'must-not-change');
+      await link(outside, join(hardlinkDir, '.credentials.json'));
+      expect(() =>
+        ensureCredentialAuthorityLayoutSync(join(hardlinkDir, '.credentials.json'))
+      ).toThrow(/singly-linked/);
+      expect(await readFile(outside, 'utf8')).toBe('must-not-change');
+    }
+  );
+
+  it.runIf(process.platform === 'linux')(
     'safely materializes real authority leaves without truncating existing bytes',
     async () => {
       const home = await mkdtemp(join(tmpdir(), 'agor-credential-layout-'));
@@ -181,7 +228,7 @@ describe('credential file directory capability', () => {
   );
 
   it.runIf(process.platform === 'linux')(
-    'keeps authority inodes stable across contained Claude write, CAS, and tombstone',
+    'keeps authority inodes stable across contained Claude write, CAS, fence, and tombstone',
     async () => {
       const home = await mkdtemp(join(tmpdir(), 'agor-credential-stable-inodes-'));
       const target = join(home, '.claude', '.credentials.json');
@@ -210,9 +257,17 @@ describe('credential file directory capability', () => {
         })
       ).resolves.toEqual({ outcome: 'written' });
       await expect(
-        mutateCredentialFile({
+        advanceCredentialFileGeneration({
           target,
           generation: 3,
+          preserveAuthorityInodes: true,
+        })
+      ).resolves.toBe('applied');
+      expect(await readFile(target, 'utf8')).toBe('second');
+      await expect(
+        mutateCredentialFile({
+          target,
+          generation: 4,
           preserveAuthorityInodes: true,
         })
       ).resolves.toBe('applied');
@@ -223,7 +278,7 @@ describe('credential file directory capability', () => {
       expect(await readFile(target, 'utf8')).toBe('');
       expect(
         await readFile(join(home, '.claude', CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES[0]), 'utf8')
-      ).toBe('3\n');
+      ).toBe('4\n');
     }
   );
 
@@ -309,6 +364,29 @@ describe('credential file directory capability', () => {
     ).resolves.toEqual({ outcome: 'changed' });
     await expect(readFile(target, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
+
+  it.runIf(process.platform === 'linux')(
+    'advances a tombstone without changing credentials and rejects a delayed lower-generation writer',
+    async () => {
+      const home = await mkdtemp(join(tmpdir(), 'agor-credential-fence-'));
+      const target = join(home, '.credentials.json');
+      await expect(
+        mutateCredentialFile({ target, content: 'existing-credential', generation: 3 })
+      ).resolves.toBe('applied');
+      await expect(advanceCredentialFileGeneration({ target, generation: 4 })).resolves.toBe(
+        'applied'
+      );
+      await expect(readFile(target, 'utf8')).resolves.toBe('existing-credential');
+      await expect(
+        mutateCredentialFile({ target, content: 'delayed-oauth', generation: 3 })
+      ).resolves.toBe('stale');
+      await expect(readFile(target, 'utf8')).resolves.toBe('existing-credential');
+      await expect(
+        mutateCredentialFile({ target, content: 'newer-oauth', generation: 5 })
+      ).resolves.toBe('applied');
+      await expect(readFile(target, 'utf8')).resolves.toBe('newer-oauth');
+    }
+  );
 
   it.runIf(process.platform === 'linux')(
     'does not let a retry steal the lock from a still-live writer',

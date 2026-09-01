@@ -1,8 +1,16 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { constants } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+} from 'node:fs';
 import { type FileHandle, lstat, mkdir, open, realpath, rename, rm } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, parse, resolve, sep } from 'node:path';
 import { parseCodexAuthJson } from './auth-file.js';
 import {
   CREDENTIAL_AUTHORITY_GENERATION_FILENAME,
@@ -52,6 +60,28 @@ async function openPath(path: string, flags: string | number, mode?: number): Pr
 // can write; the leaf stays O_NOFOLLOW.
 async function resolveCanonicalDirectory(path: string): Promise<string> {
   return realpath(path);
+}
+
+async function resolveCanonicalDirectoryAnchor(path: string): Promise<{
+  path: string;
+  missingComponents: string[];
+}> {
+  let candidate = resolve(path);
+  const missingComponents: string[] = [];
+  while (true) {
+    try {
+      return {
+        path: await resolveCanonicalDirectory(candidate),
+        missingComponents,
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = dirname(candidate);
+      if (parent === candidate) throw error;
+      missingComponents.unshift(basename(candidate));
+      candidate = parent;
+    }
+  }
 }
 
 async function createDirectory(
@@ -106,24 +136,28 @@ async function openLinuxDirectory(
   create: boolean
 ): Promise<CredentialDirectory> {
   const absolute = resolve(rawDirectory);
-  const parent = await resolveCanonicalDirectory(dirname(absolute));
+  const parent = await resolveCanonicalDirectoryAnchor(dirname(absolute));
   const leaf = basename(absolute);
-  // `parent` is canonical (symlink-free) and its terminal node is not
-  // sandbox-renamable, so following it here is safe; the leaf below stays
-  // O_NOFOLLOW.
-  let current = await openPath(parent, constants.O_RDONLY | constants.O_DIRECTORY);
+  // The existing anchor is canonical (symlink-free) and its terminal node is
+  // not sandbox-renamable, so following it here is safe. Any not-yet-created
+  // tenant/home suffix and the credential leaf are then walked relative to an
+  // open descriptor with O_NOFOLLOW, retaining the original recursive-create
+  // behavior without following a user-controlled replacement.
+  let current = await openPath(parent.path, constants.O_RDONLY | constants.O_DIRECTORY);
   try {
-    const child = join('/proc/self/fd', String(current.fd), leaf);
-    if (create) {
-      try {
-        await createDirectory(child, { mode: 0o700 });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    for (const component of [...parent.missingComponents, leaf]) {
+      const child = join('/proc/self/fd', String(current.fd), component);
+      if (create) {
+        try {
+          await createDirectory(child, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
       }
+      const next = await openPath(child, linuxDirectoryFlags());
+      await current.close();
+      current = next;
     }
-    const next = await openPath(child, linuxDirectoryFlags());
-    await current.close();
-    current = next;
     if (create) await current.chmod(0o700);
     return { handle: current, path: `/proc/self/fd/${current.fd}` };
   } catch (error) {
@@ -367,6 +401,65 @@ export async function ensureCredentialAuthorityLayout(target: string): Promise<v
   }
 }
 
+/**
+ * Synchronous pre-spawn form of {@link ensureCredentialAuthorityLayout}.
+ *
+ * Executor launch is intentionally fire-and-forget and process tracking starts
+ * in its synchronous `onSpawn` callback. An asynchronous layout-preparation
+ * gap would let Stop observe no child and settle the task before a delayed
+ * continuation spawns it. Keep this small filesystem-only operation inside the
+ * launch chokepoint so either preparation fails or the child is tracked before
+ * `spawnExecutor` returns.
+ */
+export function ensureCredentialAuthorityLayoutSync(target: string): void {
+  if (process.platform !== 'linux') {
+    throw new Error('Credential authority sandbox layout requires Linux');
+  }
+
+  const absoluteDirectory = resolve(dirname(resolve(target)));
+  const root = parse(absoluteDirectory).root;
+  let directoryFd = openSync(root, linuxDirectoryFlags());
+  try {
+    for (const component of absoluteDirectory.slice(root.length).split(sep).filter(Boolean)) {
+      const child = join('/proc/self/fd', String(directoryFd), component);
+      try {
+        mkdirSync(child, { mode: 0o700 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      const nextFd = openSync(child, linuxDirectoryFlags());
+      closeSync(directoryFd);
+      directoryFd = nextFd;
+    }
+    fchmodSync(directoryFd, 0o700);
+
+    const directoryPath = `/proc/self/fd/${directoryFd}`;
+    for (const name of [basename(resolve(target)), ...CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES]) {
+      const leafFd = openSync(
+        join(directoryPath, name),
+        constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW,
+        0o600
+      );
+      try {
+        const metadata = fstatSync(leafFd);
+        if (!metadata.isFile() || metadata.nlink !== 1) {
+          throw new Error('Credential authority path must be a singly-linked regular file');
+        }
+        fchmodSync(leafFd, 0o600);
+      } finally {
+        closeSync(leafFd);
+      }
+    }
+    try {
+      fsyncSync(directoryFd);
+    } catch {
+      // Match the async arm: not every local filesystem permits directory fsync.
+    }
+  } finally {
+    closeSync(directoryFd);
+  }
+}
+
 /** Read one credential file without following its directory or file symlinks. */
 export async function readCredentialFile(
   target: string,
@@ -521,6 +614,41 @@ export async function mutateCredentialFile(
   }
 }
 
+/**
+ * Advance only the per-home credential generation tombstone. The credential
+ * bytes are preserved. This fences an in-flight lower-generation OAuth writer
+ * when a newer API-key/token/method choice is committed in PostgreSQL.
+ */
+export async function advanceCredentialFileGeneration(options: {
+  target: string;
+  generation: number;
+  /** Keep the Claude generation mountpoint attached across live sandboxes. */
+  preserveAuthorityInodes?: boolean;
+}): Promise<'applied' | 'stale'> {
+  if (!Number.isSafeInteger(options.generation) || options.generation <= 0) {
+    throw new Error('Credential mutation generation is invalid');
+  }
+  const directory = await openCredentialDirectory(options.target, true);
+  try {
+    const lock = await acquireLock(directory);
+    try {
+      const generationPath = join(directory.path, CREDENTIAL_AUTHORITY_GENERATION_FILENAME);
+      if (options.generation < (await currentGeneration(generationPath))) return 'stale';
+      await writeAuthorityLeaf(
+        directory,
+        CREDENTIAL_AUTHORITY_GENERATION_FILENAME,
+        `${options.generation}\n`,
+        options.preserveAuthorityInodes === true
+      );
+      return 'applied';
+    } finally {
+      await lock.release();
+    }
+  } finally {
+    await directory.handle.close();
+  }
+}
+
 export type CredentialFileCompareAndSwapResult =
   | { outcome: 'written' }
   | { outcome: 'changed'; content?: string };
@@ -539,11 +667,15 @@ export async function compareAndSwapCredentialFile(options: {
   target: string;
   expectedContent: string;
   content: string;
-  generation: number;
+  /** HA supplies its durable authority generation; standalone uses only the locked byte CAS. */
+  generation?: number;
   /** Keep Claude authority mountpoints attached across live sandboxes. */
   preserveAuthorityInodes?: boolean;
 }): Promise<CredentialFileCompareAndSwapResult> {
-  if (!Number.isSafeInteger(options.generation) || options.generation <= 0) {
+  if (
+    options.generation !== undefined &&
+    (!Number.isSafeInteger(options.generation) || options.generation <= 0)
+  ) {
     throw new Error('Credential mutation generation is invalid');
   }
   const directory = await openCredentialDirectory(options.target, true);
@@ -564,16 +696,18 @@ export async function compareAndSwapCredentialFile(options: {
           : { outcome: 'changed', content: current };
       }
 
-      const generationPath = join(directory.path, CREDENTIAL_AUTHORITY_GENERATION_FILENAME);
-      if (options.generation < (await currentGeneration(generationPath))) {
-        return { outcome: 'changed', content: current };
+      if (options.generation !== undefined) {
+        const generationPath = join(directory.path, CREDENTIAL_AUTHORITY_GENERATION_FILENAME);
+        if (options.generation < (await currentGeneration(generationPath))) {
+          return { outcome: 'changed', content: current };
+        }
+        await writeAuthorityLeaf(
+          directory,
+          CREDENTIAL_AUTHORITY_GENERATION_FILENAME,
+          `${options.generation}\n`,
+          options.preserveAuthorityInodes === true
+        );
       }
-      await writeAuthorityLeaf(
-        directory,
-        CREDENTIAL_AUTHORITY_GENERATION_FILENAME,
-        `${options.generation}\n`,
-        options.preserveAuthorityInodes === true
-      );
       await writeAuthorityLeaf(
         directory,
         targetName,

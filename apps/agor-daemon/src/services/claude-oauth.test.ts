@@ -16,6 +16,7 @@ let identityResult: unknown = {
   claudeConfigDir: '/homes/user-A/.claude',
 };
 vi.mock('./codex-auth-shared.js', () => ({
+  CODEX_AUTH_DEFER_USER_REALTIME: Symbol('defer-user-realtime'),
   resolveCodexCredentialRoute: vi.fn(async () => identityResult),
 }));
 
@@ -51,22 +52,34 @@ vi.mock('@agor/core/db', () => ({
 import {
   buildAuthorizeUrl,
   buildClaudeCredentialsJson,
-  claudeCredentialMutationKey,
   constantTimeEqual,
   createClaudeOAuthService,
   exchangeCodeForTokens,
   generatePkce,
-  InMemoryClaudeOAuthCoordinator,
   parsePastedCode,
   refreshClaudeTokens,
   TokenExchangeError,
 } from './claude-oauth.js';
+import {
+  type ClaudeOAuthAttemptStore,
+  InMemoryClaudeOAuthAttemptStore,
+} from './claude-oauth-attempt-store.js';
 
 const base64urlOf = (buf: Buffer) =>
   buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
-function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 400) {
-  return { ok, status, json: async () => body } as unknown as Response;
+function jsonResponse(
+  body: unknown,
+  ok = true,
+  status = ok ? 200 : 400,
+  headers: Record<string, string> = {}
+) {
+  return {
+    ok,
+    status,
+    headers: new Headers(headers),
+    json: async () => body,
+  } as unknown as Response;
 }
 
 /** Drain the microtask queue so an in-flight `create()` reaches its fetch await. */
@@ -81,17 +94,20 @@ const TOKENS = {
 
 // Drive an attempt to `awaiting_code` and pull the `state` back out of the URL.
 async function startAndGetState(svc: {
-  create: (d: { code?: string }, p?: unknown) => Promise<{ verificationUrl?: string }>;
+  create: (
+    d: { code?: string; attemptId?: string },
+    p?: unknown
+  ) => Promise<{ attemptId?: string; verificationUrl?: string }>;
 }) {
   const status = await svc.create({}, { user: { user_id: 'user-A' } });
   const state = new URL(status.verificationUrl as string).searchParams.get('state');
-  return state as string;
+  return { state: state as string, attemptId: status.attemptId as string };
 }
 
 function makeService(
-  coordinator?: InMemoryClaudeOAuthCoordinator,
+  coordinator?: ClaudeOAuthAttemptStore,
   config: Record<string, unknown> = {},
-  runtimeIsolationAvailable = true
+  runtimeIsolationAvailable = () => true
 ) {
   const usersGet = vi.fn(async () => ({ agentic_auth_methods: {} }));
   const usersPatch = vi.fn(async () => ({}));
@@ -104,7 +120,7 @@ function makeService(
     app as unknown as Parameters<typeof createClaudeOAuthService>[0],
     {} as unknown as Parameters<typeof createClaudeOAuthService>[1],
     coordinator,
-    () => runtimeIsolationAvailable
+    runtimeIsolationAvailable
   );
   return { svc, usersGet, usersPatch, app };
 }
@@ -318,47 +334,23 @@ describe('refreshClaudeTokens contract validation', () => {
       expect(fetch).toHaveBeenCalledTimes(1);
     }
   );
+
+  it('preserves Retry-After on a throttled ambiguous refresh', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({}, false, 429, { 'retry-after': '7' }))
+    );
+    await expect(refreshClaudeTokens('sk-ant-ort01-old', current)).rejects.toMatchObject({
+      disposition: 'ambiguous',
+      retryAfterMs: 7000,
+    });
+  });
 });
 
 describe('createClaudeOAuthService — flow + security', () => {
-  it('serializes one credential route without blocking an unrelated tenant/user route', async () => {
-    const coordinator = new InMemoryClaudeOAuthCoordinator();
-    let release!: () => void;
-    const events: string[] = [];
-    const first = coordinator.runCredentialMutation('tenant-a:user-a', async () => {
-      events.push('a-start');
-      await new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      events.push('a-end');
-    });
-    await vi.waitFor(() => expect(events).toEqual(['a-start']));
-
-    const sameRoute = coordinator.runCredentialMutation('tenant-a:user-a', async () => {
-      events.push('same-route');
-    });
-    const otherRoute = coordinator.runCredentialMutation('tenant-b:user-b', async () => {
-      events.push('other-route');
-    });
-    await vi.waitFor(() => expect(events).toContain('other-route'));
-    expect(events).not.toContain('same-route');
-
-    release();
-    await Promise.all([first, sameRoute, otherRoute]);
-    expect(events).toEqual(['a-start', 'other-route', 'a-end', 'same-route']);
-  });
-
-  it('retains one global mutation key for shared-home layouts', () => {
-    exactUserHome = false;
-    const shared = { execution: { unix_user_mode: 'simple' as const } };
-    expect(claudeCredentialMutationKey(shared, 'tenant-a', 'user-a' as never)).toBe('shared-home');
-    expect(claudeCredentialMutationKey(shared, 'tenant-b', 'user-b' as never)).toBe('shared-home');
-  });
-
-  it('fails closed before issuing a link when PID namespaces are unavailable', async () => {
-    const { svc } = makeService(undefined, {}, false);
+  it('rejects OAuth when private PID isolation is unavailable', async () => {
+    const { svc } = makeService(undefined, {}, () => false);
     await expect(svc.create({}, asUserA)).rejects.toThrow(/private PID namespace/);
-    expect(writeClaudeAuthViaExecutor).not.toHaveBeenCalled();
   });
 
   it('fails closed when the deployment has not authorized Claude subscription OAuth', async () => {
@@ -379,15 +371,20 @@ describe('createClaudeOAuthService — flow + security', () => {
     const status = await svc.create({}, asUserA);
     expect(status.phase).toBe('awaiting_code');
     expect(status.verificationUrl).toContain('https://claude.com/cai/oauth/authorize');
-    expect(Object.keys(status).sort()).toEqual(['expiresAt', 'phase', 'verificationUrl']);
+    expect(Object.keys(status).sort()).toEqual([
+      'attemptId',
+      'expiresAt',
+      'phase',
+      'verificationUrl',
+    ]);
     expect(JSON.stringify(status)).not.toMatch(/verifier|accessToken|refreshToken|code_verifier/);
   });
 
   it('completes a valid paste-back: writes creds as the resolved identity and clears the pasted token', async () => {
     const { svc, usersPatch } = makeService();
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
 
-    const status = await svc.create({ code: `AUTHCODE#${state}` }, asUserA);
+    const status = await svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA);
     expect(status.phase).toBe('success');
     // No token material in the status returned to the caller/UI.
     expect(JSON.stringify(status)).not.toMatch(/sk-ant-|ACCESS|REFRESH/);
@@ -401,7 +398,7 @@ describe('createClaudeOAuthService — flow + security', () => {
       claudeConfigDir: '/homes/user-A/.claude',
     });
     expect(JSON.parse(content as string).claudeAiOauth.accessToken).toBe(TOKENS.access_token);
-    expect(generation).toEqual(expect.any(Number));
+    expect(generation).toBeUndefined();
 
     // Flips to subscription AND deletes the stale pasted token (null) in one patch.
     expect(usersPatch).toHaveBeenCalledWith(
@@ -415,24 +412,16 @@ describe('createClaudeOAuthService — flow + security', () => {
     );
   });
 
-  it('generation-fenced deletes the new file when the metadata patch fails', async () => {
+  it('does not path-delete after an ambiguous metadata failure', async () => {
     const { svc, usersPatch } = makeService();
     usersPatch.mockRejectedValueOnce(new Error('database unavailable'));
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
 
-    await expect(svc.create({ code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
+    await expect(svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
       /Could not finish saving/
     );
     expect(writeClaudeAuthViaExecutor).toHaveBeenCalledTimes(1);
-    const generation = writeClaudeAuthViaExecutor.mock.calls[0]?.[2];
-    expect(deleteClaudeAuthViaExecutor).toHaveBeenCalledWith(
-      {
-        delegatedHomeKey: null,
-        userId: 'user-A',
-        claudeConfigDir: '/homes/user-A/.claude',
-      },
-      generation
-    );
+    expect(deleteClaudeAuthViaExecutor).not.toHaveBeenCalled();
     expect((await svc.find(asUserA)).phase).toBe('error');
   });
 
@@ -441,16 +430,18 @@ describe('createClaudeOAuthService — flow + security', () => {
       expect(tenantDatabaseScopeDepth).toBe(0);
     });
     const { svc } = makeService();
-    const state = await startAndGetState(svc);
-    await expect(svc.create({ code: `AUTHCODE#${state}` }, asUserA)).resolves.toMatchObject({
+    const { state, attemptId } = await startAndGetState(svc);
+    await expect(
+      svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA)
+    ).resolves.toMatchObject({
       phase: 'success',
     });
   });
 
   it('rejects a wrong state without exchanging, leaving the attempt retryable', async () => {
     const { svc } = makeService();
-    await startAndGetState(svc);
-    await expect(svc.create({ code: 'AUTHCODE#WRONGSTATE' }, asUserA)).rejects.toThrow(
+    const { attemptId } = await startAndGetState(svc);
+    await expect(svc.create({ attemptId, code: 'AUTHCODE#WRONGSTATE' }, asUserA)).rejects.toThrow(
       /did not match/
     );
     expect(fetch).not.toHaveBeenCalled();
@@ -460,14 +451,16 @@ describe('createClaudeOAuthService — flow + security', () => {
 
   it('rejects a bare code (no #state) — CSRF guard', async () => {
     const { svc } = makeService();
-    await startAndGetState(svc);
-    await expect(svc.create({ code: 'AUTHCODE' }, asUserA)).rejects.toThrow(/whole code/);
+    const { attemptId } = await startAndGetState(svc);
+    await expect(svc.create({ attemptId, code: 'AUTHCODE' }, asUserA)).rejects.toThrow(
+      /whole code/
+    );
     expect(fetch).not.toHaveBeenCalled();
   });
 
   it('a concurrent submit is rejected while the first is exchanging', async () => {
     const { svc } = makeService();
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
     let release!: () => void;
     vi.stubGlobal(
       'fetch',
@@ -478,10 +471,10 @@ describe('createClaudeOAuthService — flow + security', () => {
           })
       )
     );
-    const first = svc.create({ code: `AUTHCODE#${state}` }, asUserA);
+    const first = svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA);
     await flush();
-    await expect(svc.create({ code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
-      /No sign-in is in progress/
+    await expect(svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
+      /already being completed/
     );
     release();
     expect((await first).phase).toBe('success');
@@ -489,7 +482,7 @@ describe('createClaudeOAuthService — flow + security', () => {
 
   it('a replacement start invalidates an in-flight submit (no clobber)', async () => {
     const { svc } = makeService();
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
     let release!: () => void;
     vi.stubGlobal(
       'fetch',
@@ -500,7 +493,7 @@ describe('createClaudeOAuthService — flow + security', () => {
           })
       )
     );
-    const stale = svc.create({ code: `AUTHCODE#${state}` }, asUserA);
+    const stale = svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA);
     await flush();
     // A fresh start replaces the attempt while the exchange is in flight.
     await svc.create({}, asUserA);
@@ -512,15 +505,15 @@ describe('createClaudeOAuthService — flow + security', () => {
   });
 
   it('serializes a replacement requested while the credential write is in flight', async () => {
-    const coordinator = new InMemoryClaudeOAuthCoordinator();
+    const coordinator = new InMemoryClaudeOAuthAttemptStore();
     const { svc } = makeService(coordinator);
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
     let releaseWrite!: () => void;
     writeClaudeAuthViaExecutor.mockImplementationOnce(
       () => new Promise<void>((resolve) => (releaseWrite = resolve))
     );
 
-    const submit = svc.create({ code: `AUTHCODE#${state}` }, asUserA);
+    const submit = svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA);
     await vi.waitFor(() => expect(writeClaudeAuthViaExecutor).toHaveBeenCalledTimes(1));
     const replacement = svc.create({}, asUserA);
     await flush();
@@ -530,6 +523,32 @@ describe('createClaudeOAuthService — flow + security', () => {
     await submit;
     expect((await replacement).phase).toBe('awaiting_code');
     expect((await svc.find(asUserA)).phase).toBe('awaiting_code');
+  });
+
+  it.each([
+    ['execution-home change', 'execution_home_changed'],
+    ['user removal', 'user_removed'],
+  ] as const)('serializes standalone %s against OAuth finalization', async (_label, reason) => {
+    const coordinator = new InMemoryClaudeOAuthAttemptStore();
+    const { svc } = makeService(coordinator);
+    const { state, attemptId } = await startAndGetState(svc);
+    const release = await coordinator.lockExternalUserMutation('tenant-1', 'user-A');
+    expect(release).toBeTypeOf('function');
+
+    const submit = svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA);
+    await flush();
+    expect(writeClaudeAuthViaExecutor).not.toHaveBeenCalled();
+
+    await coordinator.completeExternalUserMutation(
+      'tenant-1',
+      'user-A',
+      async () => undefined,
+      reason
+    );
+    await release?.();
+
+    await expect(submit).resolves.toMatchObject({ phase: 'error', attemptId });
+    expect(writeClaudeAuthViaExecutor).not.toHaveBeenCalled();
   });
 
   it('retains the prior attempt when replacement routing fails', async () => {
@@ -542,14 +561,14 @@ describe('createClaudeOAuthService — flow + security', () => {
 
   it('refuses to persist when the execution home changes during approval', async () => {
     const { svc } = makeService();
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
     identityResult = {
       ok: true,
       delegatedHomeKey: null,
       userId: 'user-A',
       claudeConfigDir: '/homes/reassigned/.claude',
     };
-    await expect(svc.create({ code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
+    await expect(svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
       /execution home.*changed/i
     );
     expect(writeClaudeAuthViaExecutor).not.toHaveBeenCalled();
@@ -557,12 +576,12 @@ describe('createClaudeOAuthService — flow + security', () => {
 
   it('a malformed provider response ends the attempt in error with no token leak and no write', async () => {
     const { svc } = makeService();
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => jsonResponse({ nope: true }))
     );
-    await expect(svc.create({ code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
+    await expect(svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
       /missing tokens/
     );
     expect(writeClaudeAuthViaExecutor).not.toHaveBeenCalled();
@@ -574,7 +593,7 @@ describe('createClaudeOAuthService — flow + security', () => {
 
   it('a network timeout ends the attempt terminally and forbids replay of the same code', async () => {
     const { svc } = makeService();
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
     // The POST may have reached Anthropic and consumed the one-time code before
     // the connection dropped. Nothing about that is retryable with the same code.
     vi.stubGlobal(
@@ -583,7 +602,7 @@ describe('createClaudeOAuthService — flow + security', () => {
         throw Object.assign(new Error('aborted'), { name: 'AbortError' });
       })
     );
-    await expect(svc.create({ code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
+    await expect(svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
       /Could not reach Claude/
     );
     expect(writeClaudeAuthViaExecutor).not.toHaveBeenCalled();
@@ -596,7 +615,7 @@ describe('createClaudeOAuthService — flow + security', () => {
       'fetch',
       vi.fn(async () => jsonResponse(TOKENS))
     );
-    await expect(svc.create({ code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
+    await expect(svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
       /No sign-in is in progress/
     );
     expect(fetch).not.toHaveBeenCalled();
@@ -605,12 +624,12 @@ describe('createClaudeOAuthService — flow + security', () => {
 
   it('a definitive 4xx rejection ends the attempt terminally (no silent retry loop)', async () => {
     const { svc } = makeService();
-    const state = await startAndGetState(svc);
+    const { state, attemptId } = await startAndGetState(svc);
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => jsonResponse({ error: 'invalid_grant' }, false))
     );
-    await expect(svc.create({ code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
+    await expect(svc.create({ attemptId, code: `AUTHCODE#${state}` }, asUserA)).rejects.toThrow(
       /rejected the sign-in code/
     );
     expect(writeClaudeAuthViaExecutor).not.toHaveBeenCalled();
@@ -622,10 +641,12 @@ describe('createClaudeOAuthService — flow + security', () => {
 
   it('a malformed local paste (bad #state) leaves the attempt awaiting a real code', async () => {
     const { svc } = makeService();
-    await startAndGetState(svc);
+    const { attemptId } = await startAndGetState(svc);
     // Missing/garbled halves are caught locally, BEFORE any provider call, so the
     // legitimate browser can still paste the genuine code against this attempt.
-    await expect(svc.create({ code: 'AUTHCODE#' }, asUserA)).rejects.toThrow(/whole code/);
+    await expect(svc.create({ attemptId, code: 'AUTHCODE#' }, asUserA)).rejects.toThrow(
+      /whole code/
+    );
     expect(fetch).not.toHaveBeenCalled();
     expect((await svc.find(asUserA)).phase).toBe('awaiting_code');
   });
@@ -634,12 +655,14 @@ describe('createClaudeOAuthService — flow + security', () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     const { svc } = makeService();
-    await svc.create({}, asUserA);
+    const started = await svc.create({}, asUserA);
     expect((await svc.find(asUserA)).phase).toBe('awaiting_code');
     vi.setSystemTime(11 * 60 * 1000);
     expect((await svc.find(asUserA)).phase).toBe('expired');
     // Submitting against an expired link is refused.
-    await expect(svc.create({ code: 'AUTHCODE#s' }, asUserA)).rejects.toThrow(/No sign-in/);
+    await expect(
+      svc.create({ attemptId: started.attemptId, code: 'AUTHCODE#s' }, asUserA)
+    ).rejects.toThrow(/No sign-in/);
   });
 
   it('isolates attempts per user (no cross-user visibility)', async () => {

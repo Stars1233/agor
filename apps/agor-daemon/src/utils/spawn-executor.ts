@@ -24,7 +24,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ensureCredentialAuthorityLayout } from '@agor/core/codex/credential-file';
+import { ensureCredentialAuthorityLayoutSync } from '@agor/core/codex/credential-file';
 import {
   type AgorExecutionSettings,
   buildAllowlistedEnv,
@@ -596,19 +596,21 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
     // primitive walks directories without following symlinks and preserves
     // existing bytes/inodes, so a malformed owner store fails before bwrap can
     // create an empty mountpoint or follow a task-controlled `.claude` symlink.
-    void ensureCredentialAuthorityLayout(
-      path.join(sandboxHomeStore, '.claude', '.credentials.json')
-    )
-      .then(() => spawnExecutorLocalPrepared(payload, options))
-      .catch((error) => {
-        const logPrefix = options.logPrefix ?? '[Executor]';
-        console.error(
-          `${logPrefix} Sandbox credential authority preparation failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-        observeExitCallback(options.onExit, 126, { mode: 'local' }, logPrefix);
-      });
+    try {
+      ensureCredentialAuthorityLayoutSync(
+        path.join(sandboxHomeStore, '.claude', '.credentials.json')
+      );
+    } catch (error) {
+      const logPrefix = options.logPrefix ?? '[Executor]';
+      console.error(
+        `${logPrefix} Sandbox credential authority preparation failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      observeExitCallback(options.onExit, 126, { mode: 'local' }, logPrefix);
+      return;
+    }
+    spawnExecutorLocalPrepared(payload, options);
     return;
   }
 

@@ -67,7 +67,9 @@ export interface ClaudeAuthSettingsProps {
   allowSubscriptionLogin?: boolean;
   /** Deployment capability for daemon-driven Claude OAuth. Fail-closed by default. */
   allowOAuthSignIn?: boolean;
+  /** Caller-private draft lifecycle key, forwarded to credential inputs. */
   identityKey?: string | null;
+  /** Cancels async continuations when caller/connection authority changes. */
   operationScope?: readonly unknown[] | null;
 }
 
@@ -142,6 +144,8 @@ export function ClaudeAuthSettings({
     () => {
       setProbe(null);
       setProbing(false);
+      setRemoving(false);
+      setRemoveError(null);
     }
   );
   const runProbe = useCallback(async () => {

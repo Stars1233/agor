@@ -164,11 +164,18 @@ import { createCardTypesService } from './services/card-types.js';
 import { createCardsService } from './services/cards.js';
 import { createCheckAuthService } from './services/check-auth.js';
 import { createClaudeAuthLogoutService } from './services/claude-auth-logout.js';
-import { createClaudeModelsService } from './services/claude-models.js';
 import {
-  createClaudeOAuthService,
-  InMemoryClaudeOAuthCoordinator,
-} from './services/claude-oauth.js';
+  canManageClaudeCredentialRoute,
+  createClaudeUserCredentialPatchCoordinator,
+  needsUserCredentialRouteCoordinator,
+} from './services/claude-credential-mutation.js';
+import { createClaudeModelsService } from './services/claude-models.js';
+import { createClaudeOAuthService } from './services/claude-oauth.js';
+import { ClaudeOAuthAttemptAuthority } from './services/claude-oauth-attempt-authority.js';
+import {
+  DurableClaudeOAuthAttemptStore,
+  InMemoryClaudeOAuthAttemptStore,
+} from './services/claude-oauth-attempt-store.js';
 import { ClaudeRuntimeCredentialResolver } from './services/claude-runtime-credential.js';
 import { createCodexAuthImportService } from './services/codex-auth-import.js';
 import { createCodexAuthLogoutService } from './services/codex-auth-logout.js';
@@ -281,7 +288,6 @@ import { requestExecutorTermination } from './termination-coordinator.js';
 import { appendSystemMessage } from './utils/append-system-message.js';
 import { requireMinimumRole } from './utils/authorization.js';
 import { emitServiceEvent } from './utils/emit-service-event.js';
-import { deleteClaudeAuthViaExecutor } from './utils/executor-claude-auth.js';
 import { renderOAuthResultPage } from './utils/html.js';
 import { emitMarketplaceInvalidation } from './utils/marketplace-invalidation.js';
 import { createAuthorityGuardedMCPFetch } from './utils/mcp-authority-fetch.js';
@@ -760,13 +766,18 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // ============================================================================
 
   // One authority owns OAuth completion, logout, user source/route changes,
-  // and task-time refresh. Provider refresh I/O happens outside this queue;
-  // only the final source/route re-read and generation CAS run inside it.
-  const claudeOAuthCoordinator = new InMemoryClaudeOAuthCoordinator();
+  // and task-time refresh. Provider refresh I/O happens outside this boundary;
+  // only the final source/route re-read and generation CAS run inside it. HA
+  // uses the same durable tenant/user authority as paste-back finalization.
+  const claudeOAuthAuthority =
+    ctx.deployment.mode === 'ha' ? new ClaudeOAuthAttemptAuthority(db) : undefined;
+  const claudeOAuthStore = claudeOAuthAuthority
+    ? new DurableClaudeOAuthAttemptStore(claudeOAuthAuthority)
+    : new InMemoryClaudeOAuthAttemptStore();
   const claudeRuntimeCredentials = new ClaudeRuntimeCredentialResolver(
     db,
     config,
-    claudeOAuthCoordinator
+    claudeOAuthStore
   );
   const configService = createConfigService(db, config, claudeRuntimeCredentials);
   configService.app = app;
@@ -795,6 +806,10 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
 
   registerOpenCodeServices(ctx);
 
+  // Claude's standalone store also supplies the process-global credential
+  // route queue used by standalone Codex finalization and users route changes.
+  // In HA, each provider uses its durable authority over the same advisory
+  // tenant/user lock instead.
   // Imports a pasted Codex CLI auth.json for the authenticated user — writes
   // it 0600 into the resolved Codex credential home and flips the caller's auth
   // method to subscription. Token material never leaves the daemon.
@@ -809,27 +824,30 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
       ? invalidateLiveBranchCodexCredentialBinds({ app, db, ...input })
       : Promise.resolve();
 
-  app.use(
-    '/codex-auth/import',
-    createCodexAuthImportService(app, db, codexDeviceAttempts, invalidateCodexCredentialBinds)
-  );
-  app.service('/codex-auth/import').hooks({ before: { create: [ctx.requireAuth] } });
-
   // ChatGPT device-code sign-in: create starts an attempt (code + verification
   // URL back to the UI, daemon polls OpenAI for approval); find reports the
   // caller's attempt status. Tokens stay daemon-side end to end.
+  const standaloneCodexDeviceService = codexDeviceAttempts
+    ? undefined
+    : createCodexDeviceAuthService(app, db, claudeOAuthStore, invalidateCodexCredentialBinds);
+  const codexDeviceService = codexDeviceAttempts
+    ? createDurableCodexDeviceAuthService(
+        app,
+        db,
+        codexDeviceAttempts,
+        undefined,
+        invalidateCodexCredentialBinds
+      )
+    : standaloneCodexDeviceService!;
+  const codexCredentialMutations = codexDeviceAttempts ?? standaloneCodexDeviceService!;
+
   app.use(
-    '/codex-auth/device',
-    codexDeviceAttempts
-      ? createDurableCodexDeviceAuthService(
-          app,
-          db,
-          codexDeviceAttempts,
-          undefined,
-          invalidateCodexCredentialBinds
-        )
-      : createCodexDeviceAuthService(app, db, invalidateCodexCredentialBinds)
+    '/codex-auth/import',
+    createCodexAuthImportService(app, db, codexCredentialMutations, invalidateCodexCredentialBinds)
   );
+  app.service('/codex-auth/import').hooks({ before: { create: [ctx.requireAuth] } });
+
+  app.use('/codex-auth/device', codexDeviceService);
   app.service('/codex-auth/device').hooks({
     before: { create: [ctx.requireAuth], find: [ctx.requireAuth], remove: [ctx.requireAuth] },
   });
@@ -840,7 +858,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // grant, so other machines stay signed in.
   app.use(
     '/codex-auth/logout',
-    createCodexAuthLogoutService(app, db, codexDeviceAttempts, invalidateCodexCredentialBinds)
+    createCodexAuthLogoutService(app, db, codexCredentialMutations, invalidateCodexCredentialBinds)
   );
   app.service('/codex-auth/logout').hooks({ before: { create: [ctx.requireAuth] } });
 
@@ -850,7 +868,19 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // writes ~/.claude/.credentials.json 0600 as the right Unix identity; find
   // reports status. Tokens stay daemon-side end to end.
   // See context/explorations/claude-code-oauth-signin.md.
-  app.use('/claude-auth/oauth', createClaudeOAuthService(app, db, claudeOAuthCoordinator));
+  if (claudeOAuthAuthority) {
+    const maintenance = setInterval(() => {
+      void claudeOAuthAuthority.maintain().catch((error) => {
+        console.error(
+          `[ClaudeOAuth] Attempt maintenance failed: ${
+            error instanceof Error ? error.constructor.name : 'unknown error'
+          }`
+        );
+      });
+    }, 60_000);
+    maintenance.unref?.();
+  }
+  app.use('/claude-auth/oauth', createClaudeOAuthService(app, db, claudeOAuthStore));
   app
     .service('/claude-auth/oauth')
     .hooks({ before: { create: [ctx.requireAuth], find: [ctx.requireAuth] } });
@@ -858,8 +888,8 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Removes the caller's Claude subscription login — deletes their
   // ~/.claude/.credentials.json as the right Unix identity and clears the stored
   // token + claude auth method (emitting `patched` so the UI re-probes to
-  // disconnected). Server-local only; does not revoke the OAuth grant.
-  app.use('/claude-auth/logout', createClaudeAuthLogoutService(app, db, claudeOAuthCoordinator));
+  // disconnected). Deployment credential-home only; does not revoke the OAuth grant.
+  app.use('/claude-auth/logout', createClaudeAuthLogoutService(app, db, claudeOAuthStore));
   app.service('/claude-auth/logout').hooks({ before: { create: [ctx.requireAuth] } });
 
   // Claude dynamic model discovery via @anthropic-ai/sdk's models.list().
@@ -1008,34 +1038,23 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Users service
   // ============================================================================
 
-  const usersService = createUsersService(db, app, config, {
-    runCredentialMutation: (key, work) => claudeOAuthCoordinator.runCredentialMutation(key, work),
-    tombstoneCurrentCredential: async ({ tenantId, userId, generation }) => {
-      const attemptKey = `${tenantId}:${userId}`;
-      claudeOAuthCoordinator.invalidate(
-        attemptKey,
-        'This sign-in was cancelled because the execution home or account changed.'
-      );
-      const route = await resolveCodexCredentialRoute(
-        userId,
-        (work) => runWithTenantDatabaseScope(db, tenantId, work),
-        config
-      );
-      if (!route.ok) {
-        throw new BadRequest(
-          `Cannot remove the prior Claude login before changing the account: ${route.message}`
-        );
-      }
-      await deleteClaudeAuthViaExecutor(
+  // Standalone users mutations share the in-process store's credential queue;
+  // HA mutations share the durable tenant/user authority whenever either
+  // provider admits a credential-file writer. A delegated Codex-only profile
+  // still needs unix_username lifecycle coordination, but must not gain Claude
+  // path deletion when exact-home Claude auth is capability-gated.
+  const userCredentialRouteCoordinator = needsUserCredentialRouteCoordinator(ctx.deployment)
+    ? createClaudeUserCredentialPatchCoordinator(
+        app,
+        db,
+        claudeOAuthStore,
+        codexDeviceAttempts ?? standaloneCodexDeviceService,
         {
-          delegatedHomeKey: route.delegatedHomeKey,
-          userId: route.userId,
-          ...(route.claudeConfigDir ? { claudeConfigDir: route.claudeConfigDir } : {}),
-        },
-        generation
-      );
-    },
-  });
+          manageClaudeRoute: canManageClaudeCredentialRoute(ctx.deployment, config),
+        }
+      )
+    : undefined;
+  const usersService = createUsersService(db, app, config, userCredentialRouteCoordinator);
   // UsersService implements find/get/create/patch/remove (no `update`), plus
   // avatar sync helpers. Listing `update` here makes Feathers' hook
   // wiring throw "Can not apply hooks. 'update' is not a function" at startup.

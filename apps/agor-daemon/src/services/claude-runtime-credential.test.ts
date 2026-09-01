@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const configMocks = vi.hoisted(() => ({
-  contained: true,
-  credentialSource: 'managed_file' as 'managed_file' | 'api_key' | 'none',
+  contained: true as boolean | undefined,
   resolveProviderConnection: vi.fn(async () => ({
     source: 'user',
     useNativeAuth: true,
@@ -20,20 +19,21 @@ const routeMocks = vi.hoisted(() => ({
 }));
 const dbMocks = vi.hoisted(() => ({ depth: 0, tenants: [] as string[] }));
 
-vi.mock('@agor/core/config', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@agor/core/config')>()),
-  hasContainedClaudeRuntimeCredentials: () => configMocks.contained,
-  resolveProviderConnection: configMocks.resolveProviderConnection,
-}));
+vi.mock('@agor/core/config', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agor/core/config')>();
+  return {
+    ...actual,
+    hasContainedClaudeRuntimeCredentials: (
+      config: Parameters<typeof actual.hasContainedClaudeRuntimeCredentials>[0]
+    ) =>
+      configMocks.contained === undefined
+        ? actual.hasContainedClaudeRuntimeCredentials(config)
+        : configMocks.contained,
+    resolveProviderConnection: configMocks.resolveProviderConnection,
+  };
+});
 vi.mock('@agor/core/db', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@agor/core/db')>()),
-  UsersRepository: class {
-    async findById() {
-      return {
-        agentic_credential_sources: { 'claude-code': configMocks.credentialSource },
-      };
-    }
-  },
   runWithTenantDatabaseScope: async (
     db: unknown,
     _tenantId: string,
@@ -73,10 +73,11 @@ function credential(access: string, expiresAt: number, refresh = 'sk-ant-ort01-r
 }
 
 function authority() {
-  const runCredentialMutation = vi.fn(
-    async <T>(_key: string, work: (generation: number) => Promise<T>) => work(42)
+  const runCredentialResolution = vi.fn(async <T>(_ctx: unknown, work: () => Promise<T>) => work());
+  const runCredentialRefresh = vi.fn(
+    async <T>(_ctx: unknown, work: (generation: number) => Promise<T>) => work(42)
   );
-  return { runCredentialMutation, invalidate: vi.fn() };
+  return { runCredentialResolution, runCredentialRefresh, invalidate: vi.fn() };
 }
 
 function resolver(options: {
@@ -114,24 +115,9 @@ function resolver(options: {
 }
 
 describe('ClaudeRuntimeCredentialResolver', () => {
-  it('refuses managed tokens for every user when the live sandbox lacks a PID namespace', async () => {
-    const read = vi.fn(async () => credential('sk-ant-oat01-secret', NOW + 8 * 60 * 60 * 1000));
-    const subject = resolver({ read, runtimeIsolationAvailable: () => false });
-
-    await expect(subject.instance.resolve('tenant-a', USER)).rejects.toThrow(
-      /private PID namespace/
-    );
-    await expect(subject.instance.resolve('tenant-a', 'user-2' as UserID)).rejects.toThrow(
-      /private PID namespace/
-    );
-    expect(read).not.toHaveBeenCalled();
-    expect(routeMocks.resolve).not.toHaveBeenCalled();
-  });
-
   beforeEach(() => {
     vi.clearAllMocks();
     configMocks.contained = true;
-    configMocks.credentialSource = 'managed_file';
     routeMocks.claudeConfigDir = '/homes/user-1/.claude';
     dbMocks.depth = 0;
     dbMocks.tenants = [];
@@ -142,7 +128,44 @@ describe('ClaudeRuntimeCredentialResolver', () => {
     });
   });
 
-  it('takes the fresh fast path without network after authority revalidation', async () => {
+  it('rejects a re-exposed writable store before resolving or reading managed credentials', async () => {
+    configMocks.contained = undefined;
+    const read = vi.fn(async () => credential('sk-ant-oat01-hidden', NOW + 2 * 60 * 60 * 1000));
+    const subject = resolver({
+      read,
+      config: {
+        execution: {
+          unix_user_mode: 'sandbox',
+          executor_storage: { user_home: 'persistent-per-user' },
+          sandbox: {
+            enabled: true,
+            home_mode: 'per_user',
+            extra_allow_write: ['/home/agor/.agor'],
+          },
+        },
+      },
+    });
+
+    await expect(subject.instance.resolve('tenant-1', USER)).rejects.toThrow(
+      /requires a contained per-user sandbox/
+    );
+    expect(routeMocks.resolve).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(subject.refresh).not.toHaveBeenCalled();
+  });
+
+  it('rejects before route resolution when private PID isolation is unavailable', async () => {
+    const read = vi.fn(async () => credential('sk-ant-oat01-hidden', NOW + 2 * 60 * 60 * 1000));
+    const subject = resolver({ read, runtimeIsolationAvailable: () => false });
+
+    await expect(subject.instance.resolve('tenant-1', USER)).rejects.toThrow(
+      /private PID namespace/
+    );
+    expect(routeMocks.resolve).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('takes the fresh path without network after revalidating credential authority', async () => {
     const read = vi.fn(async () => credential('sk-ant-oat01-fresh', NOW + 2 * 60 * 60 * 1000));
     const subject = resolver({ read });
 
@@ -151,90 +174,27 @@ describe('ClaudeRuntimeCredentialResolver', () => {
       useNativeAuth: false,
     });
     expect(subject.refresh).not.toHaveBeenCalled();
-    expect(subject.auth.runCredentialMutation).toHaveBeenCalledTimes(1);
+    expect(subject.auth.runCredentialResolution).toHaveBeenCalledTimes(1);
+    expect(subject.auth.runCredentialRefresh).not.toHaveBeenCalled();
     expect(subject.compareAndSwap).not.toHaveBeenCalled();
   });
 
-  it('lets a source switch queued ahead of a fresh return suppress the old identity', async () => {
-    const fresh = credential('sk-ant-oat01-old-identity', NOW + 2 * 60 * 60 * 1000);
-    let releaseAuthority!: () => void;
-    const ahead = new Promise<void>((resolve) => {
-      releaseAuthority = resolve;
-    });
+  it('does not inject a fresh token after its source is superseded', async () => {
+    const read = vi.fn(async () => credential('sk-ant-oat01-stale', NOW + 2 * 60 * 60 * 1000));
     const auth = authority();
-    auth.runCredentialMutation.mockImplementation(async (_key, work) => {
-      await ahead;
-      return work(42);
+    auth.runCredentialResolution.mockImplementation(async (_ctx, work) => {
+      configMocks.resolveProviderConnection.mockResolvedValueOnce({
+        source: 'workspace',
+        useNativeAuth: false,
+        connection: {},
+      });
+      return work();
     });
-    const subject = resolver({ read: vi.fn(async () => fresh), auth });
-    const resolving = subject.instance.resolve('tenant-1', USER);
-
-    await vi.waitFor(() => expect(auth.runCredentialMutation).toHaveBeenCalledTimes(1));
-    configMocks.credentialSource = 'api_key';
-    configMocks.resolveProviderConnection.mockResolvedValue({
-      source: 'user',
-      useNativeAuth: false,
-      connection: { ANTHROPIC_API_KEY: 'replacement-key' },
-    });
-    releaseAuthority();
-
-    await expect(resolving).rejects.toThrow(/authentication method changed/i);
-  });
-
-  it('lets logout queued ahead of a fresh return suppress the deleted login', async () => {
-    const fresh = credential('sk-ant-oat01-logged-out', NOW + 2 * 60 * 60 * 1000);
-    let releaseAuthority!: () => void;
-    const ahead = new Promise<void>((resolve) => {
-      releaseAuthority = resolve;
-    });
-    const auth = authority();
-    auth.runCredentialMutation.mockImplementation(async (_key, work) => {
-      await ahead;
-      return work(42);
-    });
-    const read = vi.fn(async () => fresh);
     const subject = resolver({ read, auth });
-    const resolving = subject.instance.resolve('tenant-1', USER);
-
-    await vi.waitFor(() => expect(auth.runCredentialMutation).toHaveBeenCalledTimes(1));
-    configMocks.credentialSource = 'none';
-    configMocks.resolveProviderConnection.mockResolvedValue({
-      source: 'none',
-      useNativeAuth: false,
-      connection: {},
-    });
-    releaseAuthority();
-
-    await expect(resolving).rejects.toThrow(/authentication method changed/i);
-    expect(read).toHaveBeenCalledTimes(1);
-  });
-
-  it('rejects a fresh credential replaced before authority revalidation', async () => {
-    const old = credential('sk-ant-oat01-old-identity', NOW + 2 * 60 * 60 * 1000);
-    const replacement = credential('sk-ant-oat01-new-identity', NOW + 2 * 60 * 60 * 1000);
-    const read = vi.fn().mockResolvedValueOnce(old).mockResolvedValueOnce(replacement);
-    const subject = resolver({ read });
 
     await expect(subject.instance.resolve('tenant-1', USER)).rejects.toThrow(
-      /managed Claude login changed/i
+      /changed while the task started/
     );
-    expect(subject.refresh).not.toHaveBeenCalled();
-  });
-
-  it('revalidates the second fresh path when another task refreshed before the flight', async () => {
-    const expiring = credential('sk-ant-oat01-expiring', NOW + 5 * 60 * 1000);
-    const fresh = credential('sk-ant-oat01-other-task', NOW + 2 * 60 * 60 * 1000);
-    const read = vi
-      .fn()
-      .mockResolvedValueOnce(expiring)
-      .mockResolvedValueOnce(fresh)
-      .mockResolvedValueOnce(fresh);
-    const subject = resolver({ read });
-
-    await expect(subject.instance.resolve('tenant-1', USER)).resolves.toMatchObject({
-      connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-other-task' },
-    });
-    expect(subject.auth.runCredentialMutation).toHaveBeenCalledTimes(1);
     expect(subject.refresh).not.toHaveBeenCalled();
   });
 
@@ -264,7 +224,7 @@ describe('ClaudeRuntimeCredentialResolver', () => {
       useNativeAuth: false,
     });
     expect(subject.refresh).toHaveBeenCalledTimes(1);
-    expect(subject.auth.runCredentialMutation).toHaveBeenCalledTimes(1);
+    expect(subject.auth.runCredentialRefresh).toHaveBeenCalledTimes(1);
     expect(subject.compareAndSwap).toHaveBeenCalledWith(
       expect.objectContaining({
         target: '/homes/user-1/.claude/.credentials.json',
@@ -278,7 +238,7 @@ describe('ClaudeRuntimeCredentialResolver', () => {
     const old = credential('sk-ant-oat01-old', NOW + 5 * 60 * 1000);
     const auth = authority();
     let authorityDepth = 0;
-    auth.runCredentialMutation.mockImplementation(async (_key, work) => {
+    auth.runCredentialRefresh.mockImplementation(async (_ctx, work) => {
       authorityDepth += 1;
       try {
         return await work(42);
@@ -328,7 +288,7 @@ describe('ClaudeRuntimeCredentialResolver', () => {
     expect(
       results.every((item) => item.connection.CLAUDE_CODE_OAUTH_TOKEN === 'sk-ant-oat01-winner')
     ).toBe(true);
-    expect(subject.auth.runCredentialMutation).toHaveBeenCalledTimes(1);
+    expect(subject.auth.runCredentialRefresh).toHaveBeenCalledTimes(1);
   });
 
   it('does not share refresh flights across tenants with the same user id', async () => {
@@ -368,7 +328,7 @@ describe('ClaudeRuntimeCredentialResolver', () => {
     });
 
     await expect(subject.instance.resolve('tenant-1', USER)).rejects.toBeInstanceOf(ErrorType);
-    expect(subject.auth.runCredentialMutation).toHaveBeenCalledTimes(1);
+    expect(subject.auth.runCredentialRefresh).toHaveBeenCalledTimes(1);
     expect(subject.compareAndSwap).not.toHaveBeenCalled();
   });
 
@@ -454,10 +414,25 @@ describe('ClaudeRuntimeCredentialResolver', () => {
     expect(read).not.toHaveBeenCalled();
   });
 
-  it('fails closed in HA even when the local sandbox is otherwise contained', async () => {
+  it('fails closed in HA without the proven cross-replica credential lock', async () => {
     const read = vi.fn();
     const subject = resolver({ read, config: { deployment: { mode: 'ha' } } });
     await expect(subject.instance.resolve('tenant-1', USER)).rejects.toBeInstanceOf(BadRequest);
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it('resolves contained managed credentials in HA with a cross-replica lock', async () => {
+    const read = vi.fn(async () => credential('sk-ant-oat01-ha', NOW + 2 * 60 * 60 * 1000));
+    const subject = resolver({
+      read,
+      config: {
+        deployment: { mode: 'ha' },
+        execution: { executor_storage: { user_home_locking: 'cross-replica-flock' } },
+      },
+    });
+    await expect(subject.instance.resolve('tenant-1', USER)).resolves.toMatchObject({
+      connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-ha' },
+      useNativeAuth: false,
+    });
   });
 });

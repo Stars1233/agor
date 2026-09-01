@@ -19,9 +19,9 @@ export const HA_UNSUPPORTED_FEATURES = {
   codexDeviceAuth:
     'Codex device authentication without durable attempt ownership, exact per-user credential routing, and execution.executor_storage.user_home_locking: cross-replica-flock',
   claudeAuth:
-    'Claude credential mutation without cross-replica writer serialization and generation fencing',
+    'Claude credential mutation without exact local per-user routing, cross-replica writer serialization, and generation fencing',
   claudeOAuth:
-    'Claude subscription OAuth without durable attempt ownership and cross-replica credential mutation authority',
+    'Claude subscription OAuth without durable attempt ownership, exact per-user routing, cross-replica credential mutation authority, and concrete runtime credential containment',
   openCodeAuth: 'OpenCode OAuth/native authentication flows',
   artifactRuntime: 'synchronous artifact runtime introspection',
 } as const;
@@ -48,10 +48,8 @@ export function isHaFeatureUnavailable(
   if (!isConstrainedHa(deployment)) return false;
   if (feature === 'codexAuth') return !deployment.capabilities.codexCredentialFiles;
   if (feature === 'codexDeviceAuth') return !deployment.capabilities.codexDeviceAuth;
-  // A consistent home is not sufficient for Claude: the standalone services
-  // have neither durable attempt ownership nor the generation-fenced mutation
-  // authority used by Codex. Keep start/completion and logout fail-closed in HA.
-  if (feature === 'claudeAuth' || feature === 'claudeOAuth') return true;
+  if (feature === 'claudeAuth') return !deployment.capabilities.claudeAuth;
+  if (feature === 'claudeOAuth') return !deployment.capabilities.claudeOAuth;
   return true;
 }
 

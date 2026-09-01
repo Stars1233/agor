@@ -3,7 +3,10 @@ import { runWithTenantContext } from '@agor/core/db';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { deleteClaudeAuthViaExecutor } from '../utils/executor-claude-auth.js';
 import { createClaudeAuthLogoutService } from './claude-auth-logout';
-import { InMemoryClaudeOAuthCoordinator } from './claude-oauth';
+import {
+  type ClaudeOAuthAttemptStore,
+  InMemoryClaudeOAuthAttemptStore,
+} from './claude-oauth-attempt-store';
 
 vi.mock('@agor/core/config', async () => {
   const actual = await vi.importActual<typeof import('@agor/core/config')>('@agor/core/config');
@@ -39,7 +42,7 @@ function makeApp(
   return { app: { get: () => loadConfigSyncMock(), service: () => usersService }, usersService };
 }
 
-function service(app: { service: () => unknown }, coordinator?: InMemoryClaudeOAuthCoordinator) {
+function service(app: { service: () => unknown }, coordinator?: ClaudeOAuthAttemptStore) {
   const delegate = createClaudeAuthLogoutService(app as never, TEST_DB, coordinator);
   return {
     create: (...args: Parameters<typeof delegate.create>) =>
@@ -94,11 +97,12 @@ describe('claude-auth-logout', () => {
   });
 
   it('shares the OAuth coordinator so logout linearizes after an in-flight credential write', async () => {
-    const coordinator = new InMemoryClaudeOAuthCoordinator();
+    const coordinator = new InMemoryClaudeOAuthAttemptStore();
     let releaseWrite!: () => void;
     const events: string[] = [];
     const write = coordinator.runCredentialMutation(
-      'shared-home',
+      { tenantId: 'tenant-test', userId: 'user-1' as never },
+      'credentials_changed',
       () =>
         new Promise<void>((resolve) => {
           events.push('write-start');
@@ -122,7 +126,7 @@ describe('claude-auth-logout', () => {
     await write;
     await logout;
     expect(events).toEqual(['write-start', 'write-end', 'delete']);
-    expect(deleteClaudeAuthViaExecutorMock.mock.calls[0]?.[1]).toEqual(expect.any(Number));
+    expect(deleteClaudeAuthViaExecutorMock.mock.calls[0]?.[1]).toBeUndefined();
   });
 
   it('surfaces a friendly error and does NOT clear anything if the delete fails', async () => {
