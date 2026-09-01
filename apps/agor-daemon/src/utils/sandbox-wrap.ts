@@ -23,6 +23,7 @@
 
 import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES } from '@agor/core/codex/credential-file';
 import {
   type AgorSandboxSettings,
   resolveBwrapArgs,
@@ -72,7 +73,7 @@ function bwrapAvailable(): boolean {
 // once so operators know the /proc process-side vector isn't closed on this
 // host (in a container the container itself is the isolation boundary).
 let pidNsCache: boolean | undefined;
-function pidNamespaceAvailable(): boolean {
+export function sandboxPidNamespaceAvailable(): boolean {
   if (pidNsCache === undefined) {
     pidNsCache = probeBwrapPidNamespace();
     if (!pidNsCache) {
@@ -85,6 +86,11 @@ function pidNamespaceAvailable(): boolean {
     }
   }
   return pidNsCache;
+}
+
+/** Host capability required before a managed Claude token may enter a runtime. */
+export function sandboxManagedCredentialIsolationAvailable(): boolean {
+  return process.platform === 'linux' && bwrapAvailable() && sandboxPidNamespaceAvailable();
 }
 
 /**
@@ -192,7 +198,7 @@ export function buildSandboxWrap(params: {
     branchAccess,
     branchSdkHomeDir,
     branchSdkCredentialBinds,
-    pidNamespace: pidNamespaceAvailable(),
+    pidNamespace: sandboxPidNamespaceAvailable(),
     homeDir: home,
     canonicalHomeDir: canonicalizeExistingPath(home),
     dataHome,
@@ -209,7 +215,30 @@ export function buildSandboxWrap(params: {
     agorDbPath: runtimePaths.agorDbPath,
   };
 
-  const bwrapArgs = dropMasksForMissingTargets(resolveBwrapArgs(sandbox, ctx));
+  // These destinations are created inside the writable per-user overlay even
+  // when they do not exist in the daemon's host home. They must survive the
+  // generic missing-host-target filter or an absent host-side file would
+  // silently remove the Claude credential containment boundary.
+  const materializedFileMasks = new Set<string>();
+  if (perUser) {
+    const authorityFilenames = [
+      '.credentials.json',
+      ...CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES,
+    ] as const;
+    const authorityDirectories = [join(home, '.claude'), join(ownerHomeStore as string, '.claude')];
+    if (sandbox.preserve_canonical_home_alias === true && ctx.canonicalHomeDir) {
+      authorityDirectories.push(join(ctx.canonicalHomeDir, '.claude'));
+    }
+    for (const directory of authorityDirectories) {
+      for (const filename of authorityFilenames) {
+        materializedFileMasks.add(join(directory, filename));
+      }
+    }
+  }
+  const bwrapArgs = dropMasksForMissingTargets(
+    resolveBwrapArgs(sandbox, ctx),
+    materializedFileMasks
+  );
   return {
     cmd: 'bwrap',
     args: [...bwrapArgs, '--', cmd, ...args],
@@ -224,7 +253,10 @@ export function buildSandboxWrap(params: {
  * abort. Drop such entries — a path that doesn't exist has nothing to hide.
  * (Real targets like /tmp and the worktrees root exist and are kept.)
  */
-function dropMasksForMissingTargets(args: string[]): string[] {
+function dropMasksForMissingTargets(
+  args: string[],
+  materializedFileMasks: ReadonlySet<string> = new Set()
+): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; ) {
     const a = args[i];
@@ -234,7 +266,9 @@ function dropMasksForMissingTargets(args: string[]): string[] {
       i += 2;
     } else if ((a === '--ro-bind' || a === '--ro-bind-try') && args[i + 1] === '/dev/null') {
       const dest = args[i + 2];
-      if (dest && existsSync(dest)) out.push(a, '/dev/null', dest);
+      if (dest && (existsSync(dest) || materializedFileMasks.has(dest))) {
+        out.push(a, '/dev/null', dest);
+      }
       i += 3;
     } else {
       out.push(a);

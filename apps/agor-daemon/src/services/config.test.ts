@@ -117,6 +117,52 @@ describe('ConfigService.resolveApiKey', () => {
     });
   });
 
+  it.each([
+    [
+      'pasted subscription token',
+      {
+        apiKey: null,
+        connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-pasted' },
+        source: 'user',
+        useNativeAuth: false,
+      },
+    ],
+    [
+      'API key',
+      {
+        apiKey: 'sk-ant-api03-key',
+        connection: { ANTHROPIC_API_KEY: 'sk-ant-api03-key' },
+        source: 'user',
+        useNativeAuth: false,
+      },
+    ],
+  ])('leaves the Claude %s path unchanged', async (_case, resolved) => {
+    configMocks.resolveApiKey.mockResolvedValue(resolved);
+    const managed = { resolve: vi.fn() };
+    const service = new ConfigService({} as never, {}, managed as never);
+    service.app = {
+      service(name: string) {
+        expect(name).toBe('tasks');
+        return { get: vi.fn(async () => ({ created_by: 'creator-1' as UserID })) };
+      },
+    } as never;
+
+    await expect(
+      service.resolveApiKey(
+        {
+          taskId: 'task-1' as TaskID,
+          keyName: 'ANTHROPIC_API_KEY',
+          tool: 'claude-code',
+        },
+        {
+          provider: 'socketio',
+          user: { user_id: 'executor-service', _isServiceAccount: true },
+        } as never
+      )
+    ).resolves.toMatchObject(resolved);
+    expect(managed.resolve).not.toHaveBeenCalled();
+  });
+
   it('allows task-scoped executor runtime tokens for the matching session tool', async () => {
     const service = new ConfigService({} as never);
     service.app = {
@@ -407,7 +453,145 @@ describe('ConfigService.resolveApiKey', () => {
     expect(configMocks.resolveApiKey).not.toHaveBeenCalled();
   });
 
-  it('admits hosted Codex native auth only on the exact-user sandbox route', async () => {
+  it.each([
+    ['codex', 'OPENAI_API_KEY'],
+    ['claude-code', 'ANTHROPIC_API_KEY'],
+  ] as const)(
+    'admits hosted %s native auth only on the exact-user sandbox route',
+    async (tool, keyName) => {
+      configMocks.resolveApiKey.mockResolvedValue({
+        apiKey: null,
+        source: 'user',
+        useNativeAuth: true,
+      });
+      configMocks.hasExactUserExecutorCredentialHome.mockReturnValue(true);
+      const service = new ConfigService(
+        {} as never,
+        {
+          multi_tenancy: { mode: 'required_from_auth' },
+          execution: {
+            unix_user_mode: 'sandbox',
+            executor_storage: { user_home: 'persistent-per-user' },
+          },
+        } as never,
+        tool === 'claude-code'
+          ? ({
+              resolve: vi.fn(async () => ({
+                connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-managed' },
+                useNativeAuth: false,
+              })),
+            } as never)
+          : undefined
+      );
+      service.app = {
+        service(name: string) {
+          if (name === 'tasks') {
+            return {
+              get: vi.fn(async () => ({
+                created_by: 'creator-1' as UserID,
+                session_id: 'session-1',
+              })),
+            };
+          }
+          if (name === 'sessions') {
+            return {
+              get: vi.fn(async () => ({ agentic_tool: tool, created_by: 'creator-1' })),
+            };
+          }
+          throw new Error(`unexpected service ${name}`);
+        },
+      } as never;
+
+      await expect(
+        service.resolveApiKey({ taskId: 'task-1' as TaskID, keyName, tool }, {
+          provider: 'socketio',
+          tenant: { tenant_id: 'tenant-1' },
+          user: { user_id: 'creator-1' },
+          authentication: {
+            strategy: 'jwt',
+            payload: {
+              type: 'executor-session',
+              purpose: 'executor-task',
+              task_id: 'task-1',
+              session_id: 'session-1',
+            },
+          },
+        } as never)
+      ).resolves.toMatchObject({
+        useNativeAuth: tool === 'codex',
+        ...(tool === 'claude-code'
+          ? { connection: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-managed' } }
+          : {}),
+      });
+    }
+  );
+
+  it('rejects native auth when a delegated same-owner session retains an older home key', async () => {
+    configMocks.resolveApiKey.mockResolvedValue({
+      apiKey: null,
+      source: 'user',
+      useNativeAuth: true,
+    });
+    homeMocks.resolveExecutionCredentialHome.mockResolvedValue({
+      delegatedHomeKey: 'new-home',
+      homeStore: null,
+      homeStoreSource: null,
+    });
+    homeMocks.sameExecutionCredentialHome.mockImplementation(
+      (a, b) => a.delegatedHomeKey === b.delegatedHomeKey && a.homeStore === b.homeStore
+    );
+    const service = new ConfigService(
+      {} as never,
+      { execution: { unix_user_mode: 'delegated' } } as never
+    );
+    service.app = {
+      service(name: string) {
+        if (name === 'tasks') {
+          return {
+            get: vi.fn(async () => ({
+              created_by: 'creator-1' as UserID,
+              session_id: 'session-1',
+            })),
+          };
+        }
+        if (name === 'sessions') {
+          return {
+            get: vi.fn(async () => ({
+              agentic_tool: 'claude-code',
+              created_by: 'creator-1',
+              unix_username: 'old-home',
+            })),
+          };
+        }
+        throw new Error(`unexpected service ${name}`);
+      },
+    } as never;
+
+    await expect(
+      service.resolveApiKey(
+        {
+          taskId: 'task-1' as TaskID,
+          keyName: 'ANTHROPIC_API_KEY',
+          tool: 'claude-code',
+        },
+        {
+          provider: 'socketio',
+          user: { user_id: 'creator-1' },
+          authentication: {
+            strategy: 'jwt',
+            payload: {
+              type: 'executor-session',
+              purpose: 'executor-task',
+              task_id: 'task-1',
+              session_id: 'session-1',
+            },
+          },
+        } as never
+      )
+    ).rejects.toBeInstanceOf(BadRequest);
+  });
+
+  it('keeps Claude native subscription auth fail-closed in HA', async () => {
     configMocks.resolveApiKey.mockResolvedValue({
       apiKey: null,
       source: 'user',
@@ -417,6 +601,7 @@ describe('ConfigService.resolveApiKey', () => {
     const service = new ConfigService(
       {} as never,
       {
+        deployment: { mode: 'ha' },
         multi_tenancy: { mode: 'required_from_auth' },
         execution: {
           unix_user_mode: 'sandbox',
@@ -436,7 +621,10 @@ describe('ConfigService.resolveApiKey', () => {
         }
         if (name === 'sessions') {
           return {
-            get: vi.fn(async () => ({ agentic_tool: 'codex', created_by: 'creator-1' })),
+            get: vi.fn(async () => ({
+              agentic_tool: 'claude-code',
+              created_by: 'creator-1',
+            })),
           };
         }
         throw new Error(`unexpected service ${name}`);
@@ -445,7 +633,11 @@ describe('ConfigService.resolveApiKey', () => {
 
     await expect(
       service.resolveApiKey(
-        { taskId: 'task-1' as TaskID, keyName: 'OPENAI_API_KEY', tool: 'codex' },
+        {
+          taskId: 'task-1' as TaskID,
+          keyName: 'ANTHROPIC_API_KEY',
+          tool: 'claude-code',
+        },
         {
           provider: 'socketio',
           tenant: { tenant_id: 'tenant-1' },
@@ -461,7 +653,7 @@ describe('ConfigService.resolveApiKey', () => {
           },
         } as never
       )
-    ).resolves.toMatchObject({ useNativeAuth: true });
+    ).rejects.toBeInstanceOf(BadRequest);
   });
 
   it.each([

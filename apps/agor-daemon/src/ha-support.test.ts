@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   assertHaTaskPermissionSupported,
   HA_UNSUPPORTED_FEATURES,
+  hasClaudeSubscriptionOAuthCapability,
   haUnavailable,
   isHaFeatureUnavailable,
   isHaNonInteractivePermission,
@@ -119,6 +120,8 @@ describe('constrained HA support profile', () => {
       'mcpOAuth',
       'codexAuth',
       'codexDeviceAuth',
+      'claudeAuth',
+      'claudeOAuth',
       'openCodeAuth',
       'artifactRuntime',
     ]);
@@ -145,6 +148,62 @@ describe('constrained HA support profile', () => {
         'codexDeviceAuth'
       )
     ).toBe(true);
+  });
+
+  it('keeps standalone Claude credential mutation and OAuth gated in constrained HA', () => {
+    expect(isHaFeatureUnavailable(ha, 'claudeAuth')).toBe(true);
+    expect(isHaFeatureUnavailable(ha, 'claudeOAuth')).toBe(true);
+    expect(
+      isHaFeatureUnavailable(
+        { ...ha, capabilities: { ...ha.capabilities, codexCredentialFiles: false } },
+        'claudeAuth'
+      )
+    ).toBe(true);
+  });
+
+  it('does not mistake the immutable runtime authority layout for HA mutation ownership', () => {
+    expect(
+      hasClaudeSubscriptionOAuthCapability(
+        {
+          agentic_tools: { claude_subscription_oauth: true },
+          execution: {
+            unix_user_mode: 'sandbox',
+            executor_storage: {
+              user_home: 'persistent-per-user',
+              user_home_locking: 'cross-replica-flock',
+            },
+            sandbox: { enabled: true, home_mode: 'per_user' },
+          },
+        },
+        ha
+      )
+    ).toBe(false);
+    expect(isHaFeatureUnavailable(ha, 'claudeAuth')).toBe(true);
+    expect(isHaFeatureUnavailable(ha, 'claudeOAuth')).toBe(true);
+  });
+
+  it('requires operator authorization and topology support for the Claude OAuth capability', () => {
+    const standalone = { mode: 'standalone' as const };
+    expect(hasClaudeSubscriptionOAuthCapability({}, standalone)).toBe(false);
+    expect(
+      hasClaudeSubscriptionOAuthCapability(
+        {
+          agentic_tools: { claude_subscription_oauth: true },
+          execution: {
+            unix_user_mode: 'sandbox',
+            executor_storage: { user_home: 'persistent-per-user' },
+            sandbox: { enabled: true, home_mode: 'per_user' },
+          },
+        },
+        standalone
+      )
+    ).toBe(true);
+    expect(
+      hasClaudeSubscriptionOAuthCapability(
+        { agentic_tools: { claude_subscription_oauth: true } },
+        ha
+      )
+    ).toBe(false);
   });
 
   it('gives gated Codex routes actionable cross-replica lock guidance', () => {

@@ -208,6 +208,7 @@ import {
 } from './utils/session-task-state.js';
 import {
   createTenantDatabaseScopeAroundHook,
+  createTenantWriteAdmissionAroundHook,
   deferWithTenantContext,
   enforceTenantWriteGateForHook,
 } from './utils/tenant-db-scope.js';
@@ -539,6 +540,14 @@ export const TENANT_IDENTITY_ONLY_SERVICE_PATHS = [
   'codex-auth/device',
   'codex-auth/import',
   'codex-auth/logout',
+  // Same shape as codex-auth/device: it exchanges a pasted code against
+  // Anthropic and opens short tenant units of work at the call site, then reads
+  // getCurrentTenantId(); without ambient tenant identity its create/find throw
+  // "Missing active tenant context for Claude OAuth".
+  'claude-auth/oauth',
+  // Delete-only logout — reads getCurrentTenantId() to resolve the target home
+  // and clear the stored method; needs the same ambient identity.
+  'claude-auth/logout',
   'opencode-auth',
   'opencode-models',
   'claude-models',
@@ -559,6 +568,12 @@ export const TENANT_IDENTITY_ONLY_SERVICE_PATHS = [
   // short tenant DB units around metadata phases and never holds one across
   // that provider call.
   'gateway-channels',
+] as const;
+
+/** Identity-only Claude endpoints that must clear the tenant freeze before side effects. */
+export const CLAUDE_CREDENTIAL_WRITE_ADMISSION_SERVICE_PATHS = [
+  'claude-auth/oauth',
+  'claude-auth/logout',
 ] as const;
 
 /**
@@ -624,6 +639,8 @@ export const CONSTRAINED_HA_PROCESS_AFFINE_SERVICE_GATES = [
   ['codex-auth/device', 'codexDeviceAuth'],
   ['codex-auth/import', 'codexAuth'],
   ['codex-auth/logout', 'codexAuth'],
+  ['claude-auth/oauth', 'claudeOAuth'],
+  ['claude-auth/logout', 'claudeAuth'],
   ['opencode-auth', 'openCodeAuth'],
   ['opencode-models', 'openCodeAuth'],
 ] as const satisfies ReadonlyArray<readonly [string, Parameters<typeof rejectInConstrainedHa>[1]]>;
@@ -1153,6 +1170,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     jwtSecret,
     transaction: false,
   });
+  const tenantWriteAdmissionAround = createTenantWriteAdmissionAroundHook(db);
 
   const ensureTenantContext = async (context: HookContext): Promise<HookContext> => {
     try {
@@ -1211,6 +1229,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   const registerTenantIdentityHooks = (): void => {
     for (const path of TENANT_IDENTITY_ONLY_SERVICE_PATHS) {
       safeService(path)?.hooks({ around: { all: [tenantIdentityAround] } });
+    }
+    // These caller-bound credential endpoints cross the executor/provider
+    // boundary. Reject a frozen tenant in a short transaction before any file
+    // or network side effect; later users-service writes perform their own gate
+    // check and OAuth compensates if a freeze begins during the external I/O.
+    for (const path of CLAUDE_CREDENTIAL_WRITE_ADMISSION_SERVICE_PATHS) {
+      safeService(path)?.hooks({ around: { create: [tenantWriteAdmissionAround] } });
     }
   };
 

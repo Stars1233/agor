@@ -1085,6 +1085,7 @@ export const users = sqliteTable(
           opencode?: Record<string, never>;
         };
         agentic_auth_methods?: import('../types/user').AgenticAuthMethods;
+        agentic_credential_sources?: import('../types/user').AgenticCredentialSources;
         // Encrypted environment variables with scope metadata.
         //
         // Two stored value shapes are tolerated on read:

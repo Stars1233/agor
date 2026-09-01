@@ -137,6 +137,36 @@ describe('setupQuery - Local Settings Support', () => {
     }
   });
 
+  it('keeps canonical Claude state for fork/resume while credentials use executor env', async () => {
+    const deps = createMockDeps();
+    const now = new Date().toISOString();
+    vi.mocked(deps.sessionsRepo.findById)
+      .mockResolvedValueOnce({
+        session_id: 'fork-session' as SessionID,
+        branch_id: 'test-branch' as BranchID,
+        created_at: now,
+        last_updated: now,
+        genealogy: { forked_from_session_id: 'parent-session' as SessionID },
+      } as any)
+      .mockResolvedValueOnce({
+        session_id: 'parent-session' as SessionID,
+        branch_id: 'test-branch' as BranchID,
+        sdk_session_id: 'parent-sdk-session',
+      } as any);
+
+    await setupQuery('fork-session' as SessionID, 'continue from parent', deps);
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(callArgs.options).toMatchObject({
+      resume: 'parent-sdk-session',
+      forkSession: true,
+      settingSources: expect.arrayContaining(['user', 'project', 'local']),
+    });
+    // Runtime containment keeps the canonical .claude state directory writable
+    // while masking only credential authority leaves. It must not redirect
+    // CLAUDE_CONFIG_DIR, which would strand path-keyed transcripts/settings.
+    expect(callArgs.options).not.toHaveProperty('env.CLAUDE_CONFIG_DIR');
+  });
+
   it('retains only UTF-8 byte metadata from provider stderr', async () => {
     const deps = createMockDeps();
     const setup = await setupQuery('test-session' as SessionID, 'test prompt', deps);

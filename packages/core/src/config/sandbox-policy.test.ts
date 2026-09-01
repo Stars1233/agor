@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES } from '../codex/credential-file';
 import { resolveBwrapArgs, type SandboxPathContext } from './sandbox-policy';
 
 const CTX: SandboxPathContext = {
@@ -252,6 +253,49 @@ describe('resolveBwrapArgs — home_mode: per_user', () => {
     agenticToolsPath: '/home/agor/.agor/agentic-tools',
   };
 
+  it('binds the Claude parent and masks every authority leaf from the shared source of truth', () => {
+    const args = resolveBwrapArgs({ home_mode: 'per_user' }, PER_USER_CTX);
+    expect(hasTriple(args, '--bind', `${STORE}/.claude`, `${PER_USER_CTX.homeDir}/.claude`)).toBe(
+      true
+    );
+    for (const filename of ['.credentials.json', ...CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES]) {
+      expect(
+        hasTriple(args, '--ro-bind', '/dev/null', `${PER_USER_CTX.homeDir}/.claude/${filename}`)
+      ).toBe(true);
+    }
+    expect(
+      args.some(
+        (arg, index) =>
+          arg === '--ro-bind-try' &&
+          args[index + 1] === '/dev/null' &&
+          args[index + 2]?.includes('/.claude/')
+      )
+    ).toBe(false);
+    expect(args).not.toContain(`${PER_USER_CTX.homeDir}/.codex/auth.json`);
+    expect(args).not.toContain(`${PER_USER_CTX.homeDir}/.claude/settings.json`);
+    expect(args).not.toContain(`${PER_USER_CTX.homeDir}/.claude/projects`);
+  });
+
+  it('applies operator denials after the Claude parent re-bind', () => {
+    const denied = `${PER_USER_CTX.homeDir}/.claude/settings.json`;
+    const args = resolveBwrapArgs(
+      { home_mode: 'per_user', extra_deny_read: [denied] },
+      PER_USER_CTX
+    );
+    const parentBind = args.findIndex(
+      (arg, index) =>
+        arg === '--bind' &&
+        args[index + 1] === `${STORE}/.claude` &&
+        args[index + 2] === `${PER_USER_CTX.homeDir}/.claude`
+    );
+    const denial = args.findIndex(
+      (arg, index) =>
+        arg === '--ro-bind' && args[index + 1] === '/dev/null' && args[index + 2] === denied
+    );
+    expect(parentBind).toBeGreaterThanOrEqual(0);
+    expect(denial).toBeGreaterThan(parentBind);
+  });
+
   it('overlays the owner store at the passwd home and sets HOME', () => {
     const args = resolveBwrapArgs({ home_mode: 'per_user' }, PER_USER_CTX);
     expect(hasTriple(args, '--bind', STORE, '/home/agor')).toBe(true);
@@ -326,6 +370,52 @@ describe('resolveBwrapArgs — home_mode: per_user', () => {
     expect(hasPair(args, '--tmpfs', tenantsBase)).toBe(true);
   });
 
+  it('hides a physical filesystem_home outside all deployment data roots', () => {
+    const ownerHomeStore = '/srv/customer-homes/alice';
+    const args = resolveBwrapArgs({ home_mode: 'per_user' }, { ...PER_USER_CTX, ownerHomeStore });
+    const physicalParent = args.findIndex(
+      (arg, index) =>
+        arg === '--bind' &&
+        args[index + 1] === `${ownerHomeStore}/.claude` &&
+        args[index + 2] === `${ownerHomeStore}/.claude`
+    );
+    const overlay = args.findIndex(
+      (arg, index) =>
+        arg === '--bind' &&
+        args[index + 1] === ownerHomeStore &&
+        args[index + 2] === PER_USER_CTX.homeDir
+    );
+    expect(physicalParent).toBeGreaterThanOrEqual(0);
+    expect(physicalParent).toBeGreaterThan(overlay);
+    for (const filename of ['.credentials.json', ...CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES]) {
+      expect(
+        hasTriple(args, '--ro-bind', '/dev/null', `${ownerHomeStore}/.claude/${filename}`)
+      ).toBe(true);
+    }
+  });
+
+  it('masks a hidden physical owner store when extra_allow_write re-exposes it', () => {
+    const args = resolveBwrapArgs(
+      { home_mode: 'per_user', extra_allow_write: [STORE] },
+      PER_USER_CTX
+    );
+    expect(hasTriple(args, '--bind', STORE, STORE)).toBe(true);
+    expect(hasTriple(args, '--bind', `${STORE}/.claude`, `${STORE}/.claude`)).toBe(true);
+    for (const filename of ['.credentials.json', ...CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES]) {
+      expect(hasTriple(args, '--ro-bind', '/dev/null', `${STORE}/.claude/${filename}`)).toBe(true);
+    }
+  });
+
+  it('masks an exact physical authority leaf re-exposed by extra_allow_write', () => {
+    const credentialPath = `${STORE}/.claude/.credentials.json`;
+    const args = resolveBwrapArgs(
+      { home_mode: 'per_user', extra_allow_write: [credentialPath] },
+      PER_USER_CTX
+    );
+    expect(hasTriple(args, '--bind', credentialPath, credentialPath)).toBe(true);
+    expect(hasTriple(args, '--ro-bind', '/dev/null', credentialPath)).toBe(true);
+  });
+
   it('emits only the outermost mask for nested data roots', () => {
     const dataHome = '/var/lib/agor';
     const tenantsBase = `${dataHome}/tenants`;
@@ -384,6 +474,15 @@ describe('resolveBwrapArgs — home_mode: per_user', () => {
     expect(hasTriple(args, '--ro-bind', '/dev/null', `${canonicalHomeDir}/.agor/config.yaml`)).toBe(
       true
     );
+    for (const home of ['/home/agor', canonicalHomeDir]) {
+      expect(hasTriple(args, '--bind', `${STORE}/.claude`, `${home}/.claude`)).toBe(true);
+      expect(hasTriple(args, '--ro-bind', '/dev/null', `${home}/.claude/.credentials.json`)).toBe(
+        true
+      );
+      for (const sidecar of CREDENTIAL_AUTHORITY_SIDECAR_FILENAMES) {
+        expect(hasTriple(args, '--ro-bind', '/dev/null', `${home}/.claude/${sidecar}`)).toBe(true);
+      }
+    }
     expect(hasPair(args, '--chdir', canonicalBranch)).toBe(true);
   });
 

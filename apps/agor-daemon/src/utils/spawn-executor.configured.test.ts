@@ -5,13 +5,15 @@ import path from 'node:path';
 import { Writable } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { containMock, sandboxWrapMock, spawnMock, trackMock, untrackMock } = vi.hoisted(() => ({
-  containMock: vi.fn(),
-  sandboxWrapMock: vi.fn(),
-  spawnMock: vi.fn(),
-  trackMock: vi.fn(),
-  untrackMock: vi.fn(),
-}));
+const { containMock, ensureAuthorityMock, sandboxWrapMock, spawnMock, trackMock, untrackMock } =
+  vi.hoisted(() => ({
+    containMock: vi.fn(),
+    ensureAuthorityMock: vi.fn(async () => {}),
+    sandboxWrapMock: vi.fn(),
+    spawnMock: vi.fn(),
+    trackMock: vi.fn(),
+    untrackMock: vi.fn(),
+  }));
 
 const OAUTH_DATA_HOME = '/private/synthetic-home';
 const LOCAL_RESPONSE_OPTIONS = { localResponseOriginUrl: 'http://localhost:3030' } as const;
@@ -31,6 +33,13 @@ vi.mock('../executor-tracking.js', () => ({
   trackExecutorProcess: trackMock,
   untrackExecutorProcess: untrackMock,
 }));
+
+vi.mock('@agor/core/codex/credential-file', async () => {
+  const actual = await vi.importActual<typeof import('@agor/core/codex/credential-file')>(
+    '@agor/core/codex/credential-file'
+  );
+  return { ...actual, ensureCredentialAuthorityLayout: ensureAuthorityMock };
+});
 
 vi.mock('@agor/core/unix', () => ({
   isValidExecutionHomeKey: (username: string) => /^[a-z_][a-z0-9_-]{0,31}$/.test(username),
@@ -164,6 +173,7 @@ describe('configured executor spawning', () => {
     sandboxWrapMock.mockReturnValue(null);
     containMock.mockReset();
     containMock.mockResolvedValue({ status: 'verified_absent' });
+    ensureAuthorityMock.mockClear();
     trackMock.mockReset();
     untrackMock.mockReset();
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -179,6 +189,51 @@ describe('configured executor spawning', () => {
       },
       LOCAL_RESPONSE_OPTIONS
     );
+  });
+
+  it('prepares the real Claude authority layout before a per-user sandbox spawn on Linux', async () => {
+    const installed = installMockExecutor('agor-executor-authority-layout-');
+    const root = mkdtempSync(path.join(tmpdir(), 'agor-sandbox-runtime-'));
+    const ownerStore = path.join(root, 'owner');
+    const branch = path.join(root, 'branch');
+    const { configureExecutor, spawnExecutor } = await import('./spawn-executor');
+    configureExecutor(
+      { sandbox: { enabled: true, home_mode: 'per_user' } },
+      {
+        ...LOCAL_RESPONSE_OPTIONS,
+        sandboxRuntimePaths: {
+          homeDir: path.join(root, 'home'),
+          dataHome: path.join(root, 'data'),
+          protectedDataRoots: [path.join(root, 'data')],
+          worktreesRoot: path.join(root, 'worktrees'),
+          agenticToolsPath: path.join(root, 'agentic-tools'),
+          agorConfigPath: path.join(root, 'config.yaml'),
+        },
+      }
+    );
+
+    spawnExecutor({
+      command: 'prompt',
+      params: { cwd: branch, sandboxHomeStore: ownerStore },
+    });
+
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledOnce());
+    if (process.platform === 'linux') {
+      expect(ensureAuthorityMock).toHaveBeenCalledWith(
+        path.join(ownerStore, '.claude', '.credentials.json')
+      );
+      expect(ensureAuthorityMock.mock.invocationCallOrder[0]).toBeLessThan(
+        sandboxWrapMock.mock.invocationCallOrder[0] as number
+      );
+    } else {
+      expect(ensureAuthorityMock).not.toHaveBeenCalled();
+    }
+    expect(sandboxWrapMock).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerHomeStore: ownerStore, branchPath: branch })
+    );
+
+    installed.restore();
+    rmSync(root, { recursive: true, force: true });
   });
 
   it('uses execution.executor_command_template configured at startup', async () => {

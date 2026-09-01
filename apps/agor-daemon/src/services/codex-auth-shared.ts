@@ -86,6 +86,8 @@ export type CodexCredentialRouteResolution =
        * user's `~/.codex`).
        */
       codexHome?: string;
+      /** Explicit Claude config directory for the same per-user home store. */
+      claudeConfigDir?: string;
     }
   | {
       ok: false;
@@ -180,11 +182,13 @@ export async function resolveCodexCredentialRoute(
       };
     }
     const codexHome = resolved.homeStore ? join(resolved.homeStore, '.codex') : undefined;
+    const claudeConfigDir = resolved.homeStore ? join(resolved.homeStore, '.claude') : undefined;
     return {
       ok: true,
       delegatedHomeKey: resolved.delegatedHomeKey,
       userId,
       ...(codexHome ? { codexHome } : {}),
+      ...(claudeConfigDir ? { claudeConfigDir } : {}),
     };
   } catch (err) {
     return {
