@@ -1,5 +1,4 @@
 import type {
-  AgenticToolName,
   AgorClient,
   Board,
   BoardComment,
@@ -107,6 +106,7 @@ import {
 import { getValidZoneParentId, sanitizeOrphanedNodeParents } from './canvas/utils/nodeParentUtils';
 import { ZoneTriggerModal } from './canvas/ZoneTriggerModal';
 import { DEFAULT_BOARD_OBJECT_Z_INDEX, selectedZIndex } from './canvas/zOrder';
+import { createZoneTriggerSession } from './canvas/zoneTriggerSessionCreation';
 
 interface SessionCanvasProps {
   board: Board | null;
@@ -577,36 +577,18 @@ const SessionCanvasInner = forwardRef<SessionCanvasRef, SessionCanvasProps>(
         try {
           let targetSessionId = sessionId;
 
-          // If creating new session, create it first
+          // Attach MCP in the create call so failures reject here, not silently dropped (#2629).
           if (sessionId === 'new') {
-            const newSession = await client.service('sessions').create({
-              branch_id: triggerModal.branchId,
-              agentic_tool: (agent || 'claude-code') as AgenticToolName,
-              agentic_tool_preset_id: agenticToolPresetId,
-              description: `Session from zone "${triggerModal.zoneName}"`,
-              status: 'idle',
-              model_config: modelConfig
-                ? {
-                    ...modelConfig,
-                    updated_at: new Date().toISOString(),
-                  }
-                : undefined,
-              permission_config: permissionMode
-                ? {
-                    mode: permissionMode,
-                  }
-                : undefined,
+            const newSession = await createZoneTriggerSession(client, {
+              branchId: triggerModal.branchId,
+              zoneName: triggerModal.zoneName,
+              agent,
+              agenticToolPresetId,
+              modelConfig,
+              permissionMode,
+              mcpServerIds,
             });
             targetSessionId = newSession.session_id;
-
-            // Attach MCP servers if provided
-            if (mcpServerIds && mcpServerIds.length > 0) {
-              for (const serverId of mcpServerIds) {
-                await client
-                  .service(`sessions/${targetSessionId}/mcp-servers`)
-                  .create({ mcpServerId: serverId });
-              }
-            }
           }
 
           // Execute action and capture the session the user should land on so
