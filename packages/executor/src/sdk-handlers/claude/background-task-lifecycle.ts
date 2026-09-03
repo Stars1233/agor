@@ -1,7 +1,24 @@
 import type { SDKMessage } from '@agor/core/sdk';
 
 type ResultDisposition = 'not-result' | 'await-background-tasks' | 'terminal';
-const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'stopped']);
+
+// Terminal background-task states across BOTH documented settlement signals.
+// `task_notification.status` reports `completed | failed | stopped`;
+// `task_updated.patch.status` reports `completed | failed | killed` (plus the
+// non-terminal `pending | running | paused`). The union covers either message —
+// each only ever emits its own subset — so a task that settles as `killed` and
+// is reported only via `task_updated` still drains instead of waiting out the
+// active-task timeout.
+const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'stopped', 'killed']);
+
+/**
+ * Stable identifier for the rare "the agent ended its turn with background work
+ * still running, and it never reported completion within the budget" event.
+ * Shared by the executor's structured operational log (`event=…`) and the
+ * `sdkSubtype` of the conversation notice it surfaces, so the greppable token
+ * and the queryable message subtype stay in lock-step.
+ */
+export const BACKGROUND_TASK_TIMEOUT_EVENT = 'background_task_timeout';
 
 export interface ClaudeQueryLifecycleTransition {
   resultDisposition: ResultDisposition;
