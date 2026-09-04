@@ -9,6 +9,7 @@ import { projectClaudeResultResponse, projectContextUsageSnapshot } from '@agor/
 import { shortId } from '@agor/core/db';
 import { isMCPAbortError, sanitizeMCPExternalError } from '@agor/core/mcp';
 import type { PermissionMode, SDKResultMessage } from '@agor/core/sdk';
+import type { PromptOrigin } from '@agor/core/types';
 import type {
   BranchRepository,
   MCPOAuthAuthHeadersRepository,
@@ -176,7 +177,8 @@ If you continue to see authentication errors, please contact your Agor administr
     permissionMode?: PermissionMode,
     _chunkCallback?: (messageId: string, chunk: string) => void,
     abortController?: AbortController,
-    onActivity?: SdkActivityCallback
+    onActivity?: SdkActivityCallback,
+    promptOrigin?: PromptOrigin
   ): AsyncGenerator<ProcessedEvent> {
     // Intercept slash commands that don't work via the Claude Agent SDK.
     // Commands like /compact and /cost are handled natively by the SDK and pass through.
@@ -260,6 +262,7 @@ If you continue to see authentication errors, please contact your Agor administr
         permissionMode,
         resume: true,
         abortController,
+        promptOrigin,
       }
     );
 
@@ -390,12 +393,12 @@ If you continue to see authentication errors, please contact your Agor administr
         ) {
           clearBackgroundTaskActivity();
         }
-        if (lifecycleTransition.taskTransition === 'started') {
+        for (let index = 0; index < (lifecycleTransition.tasksStarted ?? 0); index++) {
           // Keep the SDK watchdog paused for the documented lifetime of the
           // background task, not merely the Agent/Workflow launch tool call.
           onActivity?.('progress', 'background_task.start');
         }
-        if (lifecycleTransition.taskTransition === 'settled') {
+        for (let index = 0; index < (lifecycleTransition.tasksSettled ?? 0); index++) {
           onActivity?.('progress', 'background_task.complete');
         }
         // Process message through processor
