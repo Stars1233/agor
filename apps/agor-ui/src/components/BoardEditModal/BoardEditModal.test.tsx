@@ -2,7 +2,6 @@ import type { AgorClient, Board, BoardCapabilityPolicies } from '@agor-live/clie
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Form, Input } from 'antd';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { __setAuthConfigForTests } from '../../hooks/useAuthConfig';
 import { BoardEditModal } from './BoardEditModal';
 
 const showError = vi.hoisted(() => vi.fn());
@@ -16,29 +15,35 @@ vi.mock('../JSONEditor', () => ({
 vi.mock('../forms/BoardFormFields', () => ({
   BoardFormFields: ({
     capabilityPolicyEditor,
-    allGroups,
-    rbacEnabled,
     canEditGeneral,
   }: {
     capabilityPolicyEditor?: React.ReactNode;
-    allGroups?: Array<{ name: string }>;
-    rbacEnabled?: boolean;
     canEditGeneral?: boolean;
-  }) => (
-    <>
-      <Form.Item name="name" label="Name" rules={[{ required: true }]}>
-        <Input />
-      </Form.Item>
-      <div data-testid="board-modal-can-edit-general" data-value={String(canEditGeneral)} />
-      {capabilityPolicyEditor && (
-        <div
-          data-testid="board-modal-policy-editor"
-          data-group-names={allGroups?.map((group) => group.name).join(',')}
-          data-rbac-enabled={String(rbacEnabled)}
-        />
-      )}
-    </>
-  ),
+  }) => {
+    // The edit modal passes groups straight to the capability-policy editor
+    // element; assert propagation by inspecting that element's props.
+    const editorGroups =
+      capabilityPolicyEditor &&
+      typeof capabilityPolicyEditor === 'object' &&
+      'props' in capabilityPolicyEditor
+        ? ((capabilityPolicyEditor as { props?: { groups?: Array<{ name: string }> } }).props
+            ?.groups ?? [])
+        : [];
+    return (
+      <>
+        <Form.Item name="name" label="Name" rules={[{ required: true }]}>
+          <Input />
+        </Form.Item>
+        <div data-testid="board-modal-can-edit-general" data-value={String(canEditGeneral)} />
+        {capabilityPolicyEditor && (
+          <div
+            data-testid="board-modal-policy-editor"
+            data-group-names={editorGroups.map((group) => group.name).join(',')}
+          />
+        )}
+      </>
+    );
+  },
   extractBoardFormValues: (form: { getFieldValue: (name: string) => unknown }) => ({
     name: form.getFieldValue('name'),
   }),
@@ -120,47 +125,6 @@ function makeClient(metadataError: { code?: number; message?: string } = { code:
 describe('BoardEditModal', () => {
   beforeEach(() => {
     showError.mockReset();
-    __setAuthConfigForTests({ requireAuth: true }, { branchRbac: true });
-  });
-
-  it('keeps the normalized editor and policy request hidden when RBAC is disabled', async () => {
-    __setAuthConfigForTests({ requireAuth: true }, { branchRbac: false });
-    const { client, permissionsFind } = makeClient();
-
-    render(
-      <BoardEditModal
-        board={listedBoard}
-        client={client}
-        open
-        onClose={vi.fn()}
-        onUpdate={vi.fn()}
-      />
-    );
-
-    expect(await screen.findByDisplayValue('Fresh name')).toBeInTheDocument();
-    expect(screen.queryByTestId('board-modal-policy-editor')).not.toBeInTheDocument();
-    expect(permissionsFind).not.toHaveBeenCalled();
-  });
-
-  it('defaults canEditGeneral to true when RBAC is disabled, without fetching effective-access', async () => {
-    __setAuthConfigForTests({ requireAuth: true }, { branchRbac: false });
-    const { client } = makeClient();
-
-    render(
-      <BoardEditModal
-        board={listedBoard}
-        client={client}
-        open
-        onClose={vi.fn()}
-        onUpdate={vi.fn()}
-      />
-    );
-
-    await screen.findByDisplayValue('Fresh name');
-    expect(screen.getByTestId('board-modal-can-edit-general')).toHaveAttribute(
-      'data-value',
-      'true'
-    );
   });
 
   it('passes canEditGeneral=false through to BoardFormFields when the caller lacks board.edit', async () => {
