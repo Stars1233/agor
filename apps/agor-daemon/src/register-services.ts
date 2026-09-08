@@ -313,6 +313,7 @@ import {
   isSessionMcpServerLinkVisibleToCaller,
   loadMcpServerForCaller,
   registerMcpCapabilityRoleFloor,
+  resolveMcpCaller,
 } from './utils/mcp-server-authorization.js';
 import { resolveOwnerHomeStore, resolveSandboxStoragePaths } from './utils/sandbox-context.js';
 import {
@@ -5180,13 +5181,19 @@ export async function registerMCPServices(
     server: MCPServer,
     params?: AuthenticatedParams
   ): { success: false; error: string } | null => {
-    if (!params?.provider || !params.user) return null;
-    if (hasMinimumRole(params.user.role?.toLowerCase(), ROLES.ADMIN)) return null;
-    if (server.owner_user_id && server.owner_user_id === params.user.user_id) return null;
-    return {
-      success: false,
+    const caller = resolveMcpCaller(params);
+    if (caller.kind === 'internal') return null;
+    const denial = {
+      success: false as const,
       error: 'Access denied: only an admin or the server owner can discover this MCP server',
     };
+    // Read visibility is not discovery authority: service accounts carry no
+    // membership or ownership and must not exercise a saved credential here.
+    if (caller.kind === 'anonymous' || caller.kind === 'service-account') return denial;
+    const user = caller.user;
+    if (hasMinimumRole(user.role?.toLowerCase(), ROLES.ADMIN)) return null;
+    if (server.owner_user_id && server.owner_user_id === user.user_id) return null;
+    return denial;
   };
 
   // Discover endpoint
