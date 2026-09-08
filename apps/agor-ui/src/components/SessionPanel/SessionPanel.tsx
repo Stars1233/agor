@@ -89,6 +89,7 @@ import { getUrlDisplayLabel } from '../Pill/url-helpers';
 import { ToolIcon } from '../ToolIcon';
 import {
   buildPromptWithAttachments,
+  getComposerAttachmentFailureMessage,
   getComposerUploadAccept,
   getLatestComposerPromptText,
   isBlockingComposerAttachment,
@@ -1234,7 +1235,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
       const blockingAttachment = attachmentsAtSendStart.find(isBlockingComposerAttachment);
       if (blockingAttachment) {
         showError(
-          `${blockingAttachment.file.name} failed or cannot be uploaded. Remove failed files before sending.`
+          `${getComposerAttachmentFailureMessage(blockingAttachment)}. Remove failed files before sending.`
         );
         return;
       }
