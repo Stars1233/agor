@@ -94,7 +94,10 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<{
  * exercise Zod validation/coercion (the fake server below bypasses the SDK's
  * automatic schema parsing). */
 type CapturedTool = {
-  cfg: { inputSchema?: z.ZodType };
+  cfg: {
+    description?: string;
+    inputSchema?: z.ZodType;
+  };
   cb: ToolHandler;
 };
 
@@ -192,6 +195,23 @@ describe('sessionless MCP context', () => {
 });
 
 describe('agor_sessions_get_current_context', () => {
+  it.each(['agor_sessions_get_current', 'agor_sessions_get_current_context'])(
+    '%s metadata recommends omission-first self callbacks and fresh explicit identity',
+    async (toolName) => {
+      const tools = await registerAndCaptureTools(
+        { app: makeFakeApp({}), userId: 'user-1', sessionId: 'sess-current' },
+        [toolName]
+      );
+      const { description } = tools[toolName].cfg;
+
+      expect(description).toMatch(/enableCallback:\s*true/);
+      expect(description).toMatch(/omit\s+`?callbackSessionId`?/i);
+      expect(description).toMatch(/actual calling session.*cross-branch/i);
+      expect(description).toMatch(/fresh call.*session_id.*inherited/i);
+      expect(description).toMatch(/only.*intentional authorized alternate destination/i);
+    }
+  );
+
   it('returns coherent latest-task Git boundary snapshots', async () => {
     const app = makeFakeApp({
       sessions: {
