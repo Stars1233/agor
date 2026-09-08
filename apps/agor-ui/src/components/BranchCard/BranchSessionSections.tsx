@@ -29,12 +29,11 @@ import {
   Space,
   Spin,
   Tooltip,
-  Tree,
   Typography,
   theme,
 } from 'antd';
 import type React from 'react';
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
 import { useLocalStorage } from '../../hooks/useLocalStorage';
 import { useSessionActions } from '../../hooks/useSessionActions';
@@ -69,7 +68,7 @@ import {
   SessionSortButton,
 } from '../SessionSearchControls';
 import { ToolIcon } from '../ToolIcon';
-import { BRANCH_SESSION_VIEWPORT_HEIGHT } from './branchCardLayout';
+import { BranchSessionTree } from './BranchSessionTree';
 import {
   buildSessionTree,
   collectSessionSubtreeIds,
@@ -120,6 +119,8 @@ export interface BranchSessionSectionsProps {
   peekedSessionIds?: Set<string>;
   onTogglePeekSession?: (sessionId: string) => void;
   mode?: BranchSessionSectionsMode;
+  /** The caller supplies a bounded flex-column container (not an auto-sized card). */
+  fillAvailableHeight?: boolean;
   client: AgorClient | null;
 }
 
@@ -270,6 +271,19 @@ const SessionItemWithActions: React.FC<{
   );
 };
 
+/** Cap a section at its actual content plus measured chrome, freeing space for siblings. */
+function useTreeSectionHeight() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [maxHeight, setMaxHeight] = useState<number>();
+  const onContentSizeChange = useCallback((contentHeight: number, viewportHeight: number) => {
+    const sectionHeight = ref.current?.clientHeight;
+    if (!sectionHeight) return;
+    // Header/padding remain owned by Collapse/theme; do not duplicate their sizes.
+    setMaxHeight(sectionHeight - viewportHeight + contentHeight);
+  }, []);
+  return { ref, maxHeight, onContentSizeChange };
+}
+
 export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   branch,
   sessions,
@@ -284,6 +298,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   peekedSessionIds,
   onTogglePeekSession,
   mode = 'card',
+  fillAvailableHeight = false,
   client,
 }) => {
   const { token } = theme.useToken();
@@ -306,6 +321,9 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   const [sort, setSort] = useLocalStorage<SessionSort>(SESSION_SORT_STORAGE_KEY, 'recent');
 
   const isPanel = mode === 'panel';
+  const fillPanel = isPanel && fillAvailableHeight;
+  const manualTreeSection = useTreeSectionHeight();
+  const gatewayTreeSection = useTreeSectionHeight();
   // Every collapsible node (sections + parent sessions in the tree) defaults
   // to expanded; only user-collapsed exceptions are kept. Board cards persist
   // them per branch in the shared collapsedBranchNodes store; the teammate
@@ -979,12 +997,13 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   const renderSessionTree = (
     treeData: SessionTreeNode[],
     expandedKeys: React.Key[],
-    expandableKeys: React.Key[]
+    expandableKeys: React.Key[],
+    onContentSizeChange: (contentHeight: number, viewportHeight: number) => void
   ) => (
-    <Tree
+    <BranchSessionTree
       className="agor-flat-tree nodrag nowheel"
-      height={BRANCH_SESSION_VIEWPORT_HEIGHT}
-      virtual
+      fillAvailableHeight={fillPanel}
+      onContentSizeChange={onContentSizeChange}
       treeData={treeData}
       expandedKeys={expandedKeys}
       onExpand={(keys) => handleSessionTreeExpand(keys as React.Key[], expandableKeys)}
@@ -997,8 +1016,31 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     />
   );
 
+  const panelFlexStyle: React.CSSProperties | undefined = fillPanel
+    ? { display: 'flex', flexDirection: 'column', flexGrow: 1, flexBasis: 0, minHeight: 0 }
+    : undefined;
+  const treeBodyStyles = {
+    header: { flexShrink: 0 },
+    body: {
+      ...panelFlexStyle,
+      background: 'transparent',
+      paddingInline: isPanel ? 0 : undefined,
+    },
+  };
+  // Leave a few rows reachable when headers/other sections exceed a short
+  // panel. The outer teammate viewport then scrolls instead of clipping them.
+  const expandedPanelStyle = (maxHeight?: number): React.CSSProperties | undefined =>
+    fillPanel
+      ? { ...panelFlexStyle, minHeight: Math.min(140, maxHeight ?? 140), maxHeight }
+      : undefined;
+
   const sessionListContent = isManualSessionsOpen
-    ? renderSessionTree(sessionTreeData, expandedManualKeys, manualExpandableKeys)
+    ? renderSessionTree(
+        sessionTreeData,
+        expandedManualKeys,
+        manualExpandableKeys,
+        manualTreeSection.onContentSizeChange
+      )
     : null;
 
   const sessionListHeader = (
@@ -1117,12 +1159,17 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   );
 
   const gatewaySessionsContent = isGatewaySessionsOpen
-    ? renderSessionTree(gatewaySessionTreeData, expandedGatewayKeys, gatewayExpandableKeys)
+    ? renderSessionTree(
+        gatewaySessionTreeData,
+        expandedGatewayKeys,
+        gatewayExpandableKeys,
+        gatewayTreeSection.onContentSizeChange
+      )
     : null;
 
   const sessionSearchBar =
     isPanel && activeSessions.length > 0 ? (
-      <div style={{ paddingBottom: 12, paddingTop: 4 }}>
+      <div style={{ paddingBottom: 12, paddingTop: 4, flexShrink: 0 }}>
         <SessionSearchToolbar
           value={searchQuery}
           onChange={setSearchQuery}
@@ -1248,6 +1295,10 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         <>
           {manualSessions.length > 0 ? (
             <Collapse
+              ref={manualTreeSection.ref}
+              className={
+                fillPanel && isManualSessionsOpen ? 'agor-panel-session-tree-section' : undefined
+              }
               activeKey={openSectionKeys}
               onChange={handleManualSessionsChange}
               items={[
@@ -1255,13 +1306,18 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                   key: 'sessions',
                   label: sessionListHeader,
                   children: sessionListContent,
-                  styles: {
-                    body: { background: 'transparent', paddingInline: isPanel ? 0 : undefined },
-                  },
+                  style: panelFlexStyle,
+                  styles: treeBodyStyles,
                 },
               ]}
               ghost
-              style={{ marginTop: 8 }}
+              style={{
+                marginTop: 8,
+                flexShrink: 0,
+                ...(isManualSessionsOpen
+                  ? expandedPanelStyle(manualTreeSection.maxHeight)
+                  : undefined),
+              }}
             />
           ) : onCreateSession ? (
             <div style={{ marginTop: 8 }}>{sessionListHeader}</div>
@@ -1282,12 +1338,16 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                 },
               ]}
               ghost
-              style={{ marginTop: manualSessions.length > 0 ? 0 : 8 }}
+              style={{ marginTop: manualSessions.length > 0 ? 0 : 8, flexShrink: 0 }}
             />
           )}
 
           {gatewayRootSessions.length > 0 && (
             <Collapse
+              ref={gatewayTreeSection.ref}
+              className={
+                fillPanel && isGatewaySessionsOpen ? 'agor-panel-session-tree-section' : undefined
+              }
               activeKey={openSectionKeys}
               onChange={handleGatewaySessionsChange}
               items={[
@@ -1295,14 +1355,17 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                   key: 'gateway-sessions',
                   label: gatewaySessionsHeader,
                   children: gatewaySessionsContent,
-                  styles: {
-                    body: { background: 'transparent', paddingInline: isPanel ? 0 : undefined },
-                  },
+                  style: panelFlexStyle,
+                  styles: treeBodyStyles,
                 },
               ]}
               ghost
               style={{
                 marginTop: manualSessions.length > 0 || scheduledSessions.length > 0 ? 0 : 8,
+                flexShrink: 0,
+                ...(isGatewaySessionsOpen
+                  ? expandedPanelStyle(gatewayTreeSection.maxHeight)
+                  : undefined),
               }}
             />
           )}
