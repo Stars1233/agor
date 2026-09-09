@@ -10,6 +10,7 @@ const IV_LENGTH = 12;
 /** Purpose domains admitted by the durable bound-secret envelope. */
 export type BoundSecretPurpose =
   | 'pending-exchange'
+  | 'slack-mcp-recovery'
   | 'dcr-client'
   | 'codex-device-attempt'
   | 'claude-signin-attempt'

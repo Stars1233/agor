@@ -1,7 +1,12 @@
 import { matchPath } from 'react-router-dom';
 import { surfaceTitle } from '../branding/brand';
 
-export type RouteSurfaceId = 'workspace' | 'knowledge' | 'artifact-fullscreen' | 'demo';
+export type RouteSurfaceId =
+  | 'workspace'
+  | 'knowledge'
+  | 'mcp-recovery'
+  | 'artifact-fullscreen'
+  | 'demo';
 
 export interface RouteSurfaceDefinition {
   id: RouteSurfaceId;
@@ -67,6 +72,18 @@ export const KNOWLEDGE_SURFACE = defineSurface({
 
 export const ARTIFACT_FULLSCREEN_ROUTE_PATHS = ['/a/:artifactShortId/fullscreen'] as const;
 
+export const MCP_RECOVERY_ROUTE_PATHS = ['/recover/mcp'] as const;
+
+export const MCP_RECOVERY_SURFACE = defineSurface({
+  id: 'mcp-recovery',
+  label: 'MCP recovery',
+  routePaths: MCP_RECOVERY_ROUTE_PATHS,
+  startsWorkspaceRuntime: false,
+  usesDeviceRouter: false,
+  usesSharedUserSettings: true,
+  branding: surfaceTitle('MCP recovery'),
+});
+
 export const ARTIFACT_FULLSCREEN_SURFACE = defineSurface({
   id: 'artifact-fullscreen',
   label: 'Artifact fullscreen',
@@ -117,6 +134,7 @@ export const WORKSPACE_SURFACE = defineSurface({
 
 export const SURFACE_REGISTRY = [
   KNOWLEDGE_SURFACE,
+  MCP_RECOVERY_SURFACE,
   ARTIFACT_FULLSCREEN_SURFACE,
   DEMO_SURFACE,
   WORKSPACE_SURFACE,

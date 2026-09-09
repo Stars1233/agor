@@ -186,6 +186,6 @@ export function emitHaNativeSocketEvent<Event extends keyof HaNativeSocketPayloa
   target: NativeSocketTarget,
   event: Event,
   payload: HaNativeSocketPayloads[Event]
-): void {
-  target.emit(event, payload);
+): unknown {
+  return target.emit(event, payload);
 }

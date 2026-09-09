@@ -238,11 +238,14 @@ describe('register-services OAuth callback URL regression', () => {
     );
 
     const persistIndex = successBody.indexOf('persistOAuthTokenForPendingFlow');
+    const hintIndex = successBody.indexOf("code: 'runtime_authority_hint'");
     const notifyIndex = successBody.indexOf('emitOAuthCompletion(pendingFlow, true)');
     const resolveIndex = successBody.indexOf('pendingFlow.tokenResolve?.(tokenResponse)');
-    const renderIndex = successBody.indexOf('sendOAuthResultPage(res, true');
+    const renderIndex = successBody.indexOf('sendOAuthResultPage(');
 
     expect(persistIndex).toBeGreaterThanOrEqual(0);
+    expect(hintIndex).toBeGreaterThan(persistIndex);
+    expect(successBody).toContain("'oauth_browser_authority_changed'");
     expect(notifyIndex).toBeGreaterThan(persistIndex);
     expect(resolveIndex).toBeGreaterThan(notifyIndex);
     expect(renderIndex).toBeGreaterThan(resolveIndex);
@@ -276,7 +279,10 @@ describe('register-services OAuth callback URL regression', () => {
     );
 
     expect(frontChannelErrorBranch).toMatch(
-      /durableOAuthFlows\.failPendingCallback\s*\(\s*state\s*,\s*['"]authorization_denied['"]/
+      /durableOAuthFlows\.claimForCallback\s*\(\s*state\s*\)/
+    );
+    expect(frontChannelErrorBranch).toMatch(
+      /durableOAuthFlows\.finish\s*\(\s*claimed\.flow\s*,\s*['"]failed['"]\s*,\s*['"]authorization_denied['"]/
     );
     expect(frontChannelErrorBranch).not.toMatch(/invalidateTokenEndpointRejectedClient/);
     expect(frontChannelErrorBranch).not.toMatch(/client_registration_invalidated/);
