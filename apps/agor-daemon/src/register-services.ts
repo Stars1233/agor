@@ -179,6 +179,7 @@ import {
   ARTIFACTS_SERVICE_TRANSPORT_METHODS,
   createArtifactsService,
 } from './services/artifacts.js';
+import { createBoardBranchMover } from './services/board-branch-move.js';
 import { createBoardCommentsService } from './services/board-comments.js';
 import { createBoardObjectsService } from './services/board-objects.js';
 import { createBoardsService } from './services/boards.js';
@@ -622,9 +623,11 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     },
     // biome-ignore lint/suspicious/noExplicitAny: feathers-swagger docs option not typed in FeathersJS
   } as any);
+  const branchesService = createBranchesService(db, app);
   app.use(
     '/boards',
     createBoardsService(db, {
+      moveBranch: createBoardBranchMover(app, branchesService),
       emitBoardObjectPatched: (boardObject, params) => {
         emitServiceEvent(app, {
           path: 'board-objects',
@@ -689,7 +692,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Branches, repos
   // ============================================================================
 
-  app.use('/branches', createBranchesService(db, app), {
+  app.use('/branches', branchesService, {
     methods: [
       'find',
       'get',
