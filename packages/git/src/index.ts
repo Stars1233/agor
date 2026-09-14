@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { constants, existsSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, open, readdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { simpleGit } from 'simple-git';
 import { resolveGitBinary } from './git-binary';
 import {
@@ -2249,37 +2249,87 @@ export async function deleteBranchDirectory(
   branchPath: string,
   allowedBranchesDir: string
 ): Promise<void> {
-  const { rm } = await import('node:fs/promises');
-  const { realpathSync, existsSync } = await import('node:fs');
-  const { resolve, relative } = await import('node:path');
+  const { rm, lstat } = await import('node:fs/promises');
+  const target = await resolveManagedBranchDeletionPath(branchPath, allowedBranchesDir);
+  await rm(target, { recursive: true, force: true });
+  try {
+    await lstat(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error('Branch directory still exists after removal');
+}
 
-  // Safety check: ensure we're only deleting from configured branches directory
-  const branchesDir = allowedBranchesDir;
-
-  // Use realpathSync to follow symlinks and canonicalize paths.
-  // If the branch directory was already removed (e.g. by `git worktree remove`),
-  // fall back to resolve() — the safety check still works since the base dir exists.
-  const resolvedBranchesDir = realpathSync(branchesDir);
-  const resolvedBranchPath = existsSync(branchPath)
-    ? realpathSync(branchPath)
-    : resolve(realpathSync(resolve(branchPath, '..')), resolve(branchPath).split('/').pop()!);
-
-  // Get relative path from branchesDir to branchPath
-  const relativePath = relative(resolvedBranchesDir, resolvedBranchPath);
-
-  // Check if relative path goes outside (starts with '..' or is absolute)
-  if (relativePath.startsWith('..') || resolve(relativePath) === relativePath) {
+/** Validate before invoking Git, as well as before recursively removing residual files. */
+export async function resolveManagedBranchDeletionPath(
+  branchPath: string,
+  allowedBranchesDir: string
+): Promise<string> {
+  const { lstat, realpath, stat } = await import('node:fs/promises');
+  const { resolve, relative, isAbsolute, sep, join } = await import('node:path');
+  const relativePath = relative(resolve(allowedBranchesDir), resolve(branchPath));
+  if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
     throw new Error(
-      `Safety check failed: Branch path must be inside ${branchesDir}. Got: ${branchPath}`
+      `Safety check failed: Branch path must be inside ${allowedBranchesDir}. Got: ${branchPath}`
     );
   }
-
-  // Additional safety: don't allow deleting the branches directory itself
-  if (resolvedBranchPath === resolvedBranchesDir || relativePath === '') {
+  if (relativePath === '') {
     throw new Error('Cannot delete the branches directory itself');
   }
+  // The managed root must exist even on a retry. A missing root is not evidence
+  // that a branch on an unavailable storage mount was successfully removed.
+  const root = await realpath(allowedBranchesDir);
+  if (!(await stat(root)).isDirectory()) throw new Error('Managed branch root is not a directory');
+  let target = root;
+  for (const segment of relativePath.split(sep)) {
+    target = join(target, segment);
+    let info: Awaited<ReturnType<typeof lstat>>;
+    try {
+      info = await lstat(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return join(root, relativePath);
+      throw error;
+    }
+    // Even an in-root symlink may target a DIFFERENT branch. Root containment
+    // alone is not ownership; never canonicalize the victim into its neighbor.
+    if (info.isSymbolicLink())
+      throw new Error('Safety check failed: Branch deletion path contains a symlink');
+    if (!info.isDirectory())
+      throw new Error('Safety check failed: Branch deletion path is not a directory');
+  }
+  return target;
+}
 
-  await rm(resolvedBranchPath, { recursive: true, force: true });
+/**
+ * Remove only a branch workspace, retaining SDK homes and database metadata.
+ * Both archive and permanent deletion use this verified storage primitive.
+ * Paths/mode must come from authoritative records, never the checkout's .git.
+ * Does not delete Git refs or own admission/executor settlement.
+ */
+export async function removeBranchWorkspace(options: {
+  branchPath: string;
+  branchesRoot: string;
+  repoPath: string;
+  storageMode: 'clone' | 'worktree';
+}): Promise<void> {
+  const { branchPath, branchesRoot, repoPath, storageMode } = options;
+  const target = await resolveManagedBranchDeletionPath(branchPath, branchesRoot);
+  const { realpath } = await import('node:fs/promises');
+  // Require the authoritative repo to be available; canonicalize its root, not
+  // the victim (whose symlink descendants are rejected by the validator).
+  const repository = await realpath(repoPath);
+  if (repository === target || repository.startsWith(`${target}${sep}`))
+    throw new Error('Cannot delete the shared base repository');
+  if (storageMode === 'worktree') {
+    const registrations = await listGitWorktrees(repository);
+    if (registrations.some((item) => resolve(item.path) === target)) {
+      await removeGitWorktree(repository, target);
+    }
+    if ((await listGitWorktrees(repository)).some((item) => resolve(item.path) === target))
+      throw new Error('Worktree registration remains');
+  }
+  await deleteBranchDirectory(branchPath, branchesRoot);
 }
 
 /**

@@ -206,6 +206,8 @@ describe.skipIf(!postgresUrl || !usesPostgresSchema)(
           '0103_oauth_authority_watermark_reconciliation',
           '0104_mcp_slack_recovery_due',
           '0105_mcp_oauth_grant_attribution',
+          '0107_branch_permanent_deletion',
+          '0108_branch_deletion_recovery',
         ],
         dbAheadOfBinary: false,
       });
@@ -326,6 +328,10 @@ describe.skipIf(!postgresUrl || !usesPostgresSchema)(
       // rewinding the ledger: the old head did not have these future columns.
       await executeRaw(db, sql`ALTER TABLE tasks DROP COLUMN mcp_slack_recovery_due_at`);
       await executeRaw(db, sql`ALTER TABLE user_mcp_oauth_tokens DROP COLUMN granted_by_user_id`);
+      await executeRaw(db, sql`DROP POLICY IF EXISTS branch_maintenance_discovery ON branches`);
+      await executeRaw(db, sql`ALTER TABLE branches DROP COLUMN deletion_status`);
+      await executeRaw(db, sql`ALTER TABLE branches DROP COLUMN deletion_error`);
+      await executeRaw(db, sql`ALTER TABLE branches DROP COLUMN deletion_updated_at`);
 
       // Reproduce the previous reviewed head's timestamp-only final watermark.
       // Its authority schema is identical; the rebased bootstrap must not try
@@ -346,6 +352,8 @@ describe.skipIf(!postgresUrl || !usesPostgresSchema)(
           '0103_oauth_authority_watermark_reconciliation',
           '0104_mcp_slack_recovery_due',
           '0105_mcp_oauth_grant_attribution',
+          '0107_branch_permanent_deletion',
+          '0108_branch_deletion_recovery',
         ],
         dbAheadOfBinary: false,
       });

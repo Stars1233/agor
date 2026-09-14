@@ -27,11 +27,34 @@ Repository: `packages/core/src/db/repositories/branches.ts`.
 Service: `apps/agor-daemon/src/services/branches.ts`.
 Type: `packages/core/src/types/branch.ts`.
 
+### Permanent-deletion persistence boundary
+
+Permanent deletion stores `deletion_status`, a bounded safe `deletion_error`, and
+`deletion_updated_at` on the branch. Both `deleting` and `deletion_failed` are
+sticky admission fences; failure never authorizes resuming ordinary work.
+
+`db/repositories/branch-maintenance.ts` holds the shared private operation and
+invocation identity on that same row. It does not authorize callers or supervise
+executors. Its short claimed transactions must not contain filesystem/network
+work. Invocation uncertainty retains ownership; elapsed time is not settlement.
+`db/branch-admission.ts` supplies the Branch-first lock for producer admission.
+Do not expose maintenance methods or internal claim JSON as generic CRUD.
+
+`db/branch-deletion-manifest.ts` declares ownership-review dispositions for inbound
+FKs plus known plain-ID, JSON and external relations. Its dual-schema test detects
+new inbound FKs; it is not an executable cascade plan or proof of exhaustive runtime
+inventory. In particular, Knowledge namespaces require ownership classification,
+and published artifacts belong to boards rather than their provenance branch.
+
+Keep original storage locator rows until required removal has been verified.
+Do not replace those rows with an unbounded manifest on the branch or treat an
+empty descendant query as proof of filesystem/process containment.
+
 ## Things that bite
 
 - **Never use subprocess for git.** Always `simple-git` via `packages/core/src/git/index.ts`.
 - **Port allocation** uses `branch.unique_id` (monotonic per repo). Templates like `{{add 9000 branch.unique_id}}` resolve in environment configs.
-- **Deleting a branch** must cascade through: stop environment, kill terminals, delete normalized policy rows and sessions (including tasks/messages), then remove the git workspace. The service owns the canonical sequence.
+- **Permanent deletion is executor-owned**: `commands/branch-deletion.ts` drives authenticated `branch-deletion-steps` requests; `BranchDeletionRepository` drains owned data before branch-row-last finalization. The shared maintenance claim fences managed producers. Known activity and best-effort terminal closure are not proof that detached processes stopped. Unknown invocations remain fenced; never retry on heartbeat age alone.
 - **Moving a branch** requires branch Manager authority and Editor/Manager access on both boards. Inherited permissions follow the destination defaults; explicit overrides and primary ownership remain unchanged.
 - **Deleting a board** first materializes every inheriting branch as an override, including the shared-session prompt switch.
 - **Sessions reference branches**, not the other way around. Cascading from branch → sessions, not sessions → branch.

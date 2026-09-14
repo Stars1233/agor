@@ -1,3 +1,4 @@
+import { resolveExecutorBranch } from './branch-filesystem.js';
 /**
  * Git Command Handlers for Executor
  *
@@ -39,7 +40,7 @@ import {
   isRemoteRefVisibleForClone,
   isValidGitRepo,
   redactGitUrlCredentials,
-  removeGitWorktree,
+  removeBranchWorkspace,
   restoreBranchFilesystem,
   scanGitConfigRemoteCredentials,
   scrubGitConfigRemoteCredentials,
@@ -282,7 +283,7 @@ export async function handleBranchFilesList(
     const daemonUrl = payload.daemonUrl || 'http://localhost:3030';
     client = await createExecutorClient(daemonUrl, payload.sessionToken);
 
-    const branch = await client.service('branches').get(branchId);
+    const branch = await resolveExecutorBranch(client, branchId);
     if (!branch?.path) {
       return { success: true, data: { results: [] } };
     }
@@ -828,6 +829,7 @@ export async function handleGitBranchAdd(
   }
 
   let client: AgorClient | null = null;
+  let materializationWritesSettled = false;
 
   try {
     // Connect to daemon
@@ -838,7 +840,9 @@ export async function handleGitBranchAdd(
     // Resolve filesystem-bearing repository metadata through the initiating
     // user's delegated Feathers authority in this same executor.
     const repo = await client.service('repos').get(payload.params.repoId);
-    const branchRecord = await client.service('branches').get(branchId);
+    const branchRecord = await resolveExecutorBranch(client, branchId);
+    if (branchRecord.filesystem_status !== 'creating')
+      throw new Error('Branch materialization is not admitted');
     if (branchRecord.repo_id !== payload.params.repoId) {
       throw new Error(`Branch ${branchId} does not belong to repository ${payload.params.repoId}`);
     }
@@ -979,10 +983,6 @@ export async function handleGitBranchAdd(
     // rendering belongs to the daemon's existing authorization/validation
     // boundary and is derived there from trusted repo configuration.
     if (branchId) {
-      console.log(`[git.branch.add] Marking branch ${shortId(branchId)} as ready`);
-      await client.service('branches').patch(branchId, { filesystem_status: 'ready' });
-      console.log(`[git.branch.add] Branch marked as ready`);
-
       if (repo.environment) {
         try {
           const renderer = client.service(`branches/${branchId}/render-environment`) as unknown as {
@@ -1000,6 +1000,11 @@ export async function handleGitBranchAdd(
         }
       }
     }
+
+    // No filesystem work (including fallback recovery) may follow publication
+    // of readiness: deletion may acquire the Branch fence immediately afterward.
+    materializationWritesSettled = true;
+    await client.service('branches').patch(branchId, { filesystem_status: 'ready' });
 
     return {
       success: true,
@@ -1020,7 +1025,7 @@ export async function handleGitBranchAdd(
     // when git worktree add fails. No host permission repair is attempted.
     const fallbackPath = resolvedBranchPath;
     let fallbackCreated = false;
-    if (fallbackPath) {
+    if (fallbackPath && !materializationWritesSettled) {
       // Step 1: Ensure directory exists
       if (!existsSync(fallbackPath)) {
         try {
@@ -1047,7 +1052,7 @@ export async function handleGitBranchAdd(
     }
 
     // Try to mark branch as failed with error details (if we have a branchId and client)
-    if (branchId && client) {
+    if (branchId && client && !materializationWritesSettled && resolvedBranchPath) {
       try {
         await client.service('branches').patch(branchId, {
           filesystem_status: 'failed',
@@ -1091,8 +1096,8 @@ export async function handleGitBranchAdd(
 /**
  * Handle git.branch.remove command
  *
- * Removes a branch from the filesystem and deletes the database record.
- * This is a complete transaction - filesystem + DB in one atomic operation.
+ * Removes filesystem state only. Database finalization belongs to the deletion
+ * workflow; no filesystem operation is atomic with a database transaction.
  */
 export async function handleGitBranchRemove(
   payload: GitBranchRemovePayload,
@@ -1123,116 +1128,20 @@ export async function handleGitBranchRemove(
       `[git.branch.remove] Removing branch at ${branchPath} (storageMode=${storageMode})...`
     );
 
-    // Find the repo path from the branch's .git file
-    const { readFile, stat } = await import('node:fs/promises');
-    const { existsSync } = await import('node:fs');
-    const { join, dirname, basename } = await import('node:path');
-
-    const gitPath = join(branchPath, '.git');
-    let filesystemRemoved = false;
-
-    // Clone-mode short-circuit: there's no parent base repo to deregister
-    // from, no `gitdir:` pointer file, and `git worktree remove --force`
-    // would fail (or worse, mis-target). Just blow away the directory.
-    if (storageMode === 'clone') {
-      if (existsSync(branchPath)) {
-        console.log(
-          `[git.branch.remove] Clone mode — removing self-standing directory ${branchPath}`
-        );
-        await deleteBranchDirectory(branchPath, branchesRoot);
-        filesystemRemoved = true;
-      } else {
-        console.log(
-          '[git.branch.remove] Clone mode — directory already absent, skipping filesystem removal'
-        );
+    await removeBranchWorkspace({
+      branchPath,
+      branchesRoot,
+      repoPath: payload.params.repoPath,
+      storageMode,
+    });
+    // Preserve the legacy caller's explicit ref policy outside workspace removal.
+    // Permanent deletion retains shared Git refs and does not request this step.
+    if (storageMode === 'worktree' && payload.params.deleteBranch && payload.params.branch) {
+      try {
+        await deleteBranch(payload.params.repoPath, payload.params.branch);
+      } catch {
+        console.warn('[git.branch.remove] event=ref_removal_failed');
       }
-    } else if (existsSync(gitPath)) {
-      // Worktree mode: .git is a file (`gitdir: …`) pointing back at the
-      // base repo's `.git/worktrees/<name>`. Read it to find the base repo
-      // and deregister cleanly.
-      //
-      // Defensive: if .git is somehow a directory here despite storage_mode
-      // being 'worktree' (mislabeled DB row from a manual conversion), fall
-      // back to the clone-mode removal path rather than misreading a dir as
-      // a `gitdir:` file. See design doc §2 operational caveats.
-      const gitStat = await stat(gitPath);
-      if (gitStat.isDirectory()) {
-        console.warn(
-          `[git.branch.remove] DB says storage_mode='worktree' but ${gitPath} is a directory — treating as clone-mode removal`
-        );
-        await deleteBranchDirectory(branchPath, branchesRoot);
-        filesystemRemoved = true;
-      } else {
-        // Read .git file to find the main repo
-        // Format: gitdir: /path/to/repo/.git/worktrees/<name>
-        const gitContent = await readFile(gitPath, 'utf-8');
-        const match = gitContent.match(/gitdir:\s*(.+)/);
-
-        if (!match) {
-          throw new Error(`Invalid .git file in branch: ${gitPath}`);
-        }
-
-        // Extract repo path from gitdir path
-        // gitdir points to: <repo>/.git/worktrees/<name>
-        // We need: <repo>
-        const gitdirPath = match[1].trim();
-        const gitBranchesDir = dirname(gitdirPath); // <repo>/.git/worktrees
-        const dotGitDir = dirname(gitBranchesDir); // <repo>/.git
-        const repoPath = dirname(dotGitDir); // <repo>
-
-        const branchName = basename(branchPath);
-
-        console.log(`[git.branch.remove] Repo path: ${repoPath}, Branch name: ${branchName}`);
-
-        // Deregister the git worktree (removes the `.git/worktrees/<name>/`
-        // entry from the base repo). Wraps `git worktree remove --force`.
-        await removeGitWorktree(repoPath, branchName);
-        console.log(`[git.branch.remove] Git worktree deregistered`);
-
-        // git worktree remove --force may leave residual files on disk.
-        // Fully delete the directory to reclaim all disk space.
-        if (existsSync(branchPath)) {
-          console.log(`[git.branch.remove] Directory still exists, removing residual files...`);
-          await deleteBranchDirectory(branchPath, branchesRoot);
-          console.log(`[git.branch.remove] Directory fully removed`);
-        }
-
-        filesystemRemoved = true;
-        console.log(`[git.branch.remove] Branch removed from filesystem`);
-
-        // Delete the associated branch if requested
-        if (payload.params.deleteBranch && payload.params.branch) {
-          const branchToDelete = payload.params.branch;
-          try {
-            console.log(`[git.branch.remove] Deleting branch '${branchToDelete}'...`);
-            const deleted = await deleteBranch(repoPath, branchToDelete);
-            if (deleted) {
-              console.log(`[git.branch.remove] Branch '${branchToDelete}' deleted`);
-            } else {
-              console.log(
-                `[git.branch.remove] Branch '${branchToDelete}' not found (already deleted)`
-              );
-            }
-          } catch (branchError) {
-            // Log but don't fail the overall operation
-            console.warn(
-              `[git.branch.remove] Failed to delete branch '${branchToDelete}':`,
-              branchError instanceof Error ? branchError.message : String(branchError)
-            );
-          }
-        }
-      }
-    } else if (existsSync(branchPath)) {
-      // No .git file but directory exists — orphaned directory from a previous partial removal.
-      // Clean it up completely.
-      console.log(
-        '[git.branch.remove] No .git file but directory exists (orphaned), removing directory...'
-      );
-      await deleteBranchDirectory(branchPath, branchesRoot);
-      filesystemRemoved = true;
-      console.log('[git.branch.remove] Orphaned directory removed');
-    } else {
-      console.log('[git.branch.remove] Branch does not exist on filesystem, skipping git removal');
     }
 
     return {
@@ -1240,12 +1149,12 @@ export async function handleGitBranchRemove(
       data: {
         branchId,
         branchPath,
-        filesystemRemoved,
+        filesystemRemoved: true,
       },
     };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error('[git.branch.remove] Failed:', errorMessage);
+  } catch {
+    const errorMessage = 'Workspace removal could not be verified';
+    console.error('[git.branch.remove] event=workspace_removal_failed');
 
     return {
       success: false,

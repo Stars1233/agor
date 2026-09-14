@@ -764,6 +764,11 @@ export const branches = sqliteTable(
     archived: t.bool('archived').notNull().default(false),
     archived_at: t.timestamp('archived_at'),
     archived_by: text('archived_by', { length: 36 }),
+    // Permanent deletion retains this row and its authority through partial failure.
+    deletion_status: text('deletion_status', { enum: ['deleting', 'deletion_failed'] }),
+    deletion_error: text('deletion_error'),
+    deletion_updated_at: t.timestamp('deletion_updated_at'),
+
     filesystem_status: text('filesystem_status', {
       enum: ['creating', 'ready', 'failed', 'preserved', 'cleaned', 'deleted'],
     }),
@@ -819,6 +824,9 @@ export const branches = sqliteTable(
       .json<unknown>('data')
       .$type<{
         // File system
+        // Daemon-private shared maintenance authority. Never accept through generic patches.
+        maintenance?: import('../types/branch-deletion').BranchMaintenanceClaim;
+        maintenance_generation?: number;
         path: string; // Absolute path to branch directory
 
         // Git state (current)
@@ -851,6 +859,9 @@ export const branches = sqliteTable(
       .notNull(),
   },
   (table) => ({
+    deletionDiscoveryIdx: index('branches_deletion_discovery_idx')
+      .on(table.branch_id)
+      .where(sql`${table.deletion_status} = 'deleting'`),
     repoIdx: index('branches_repo_idx').on(table.repo_id),
     nameIdx: index('branches_name_idx').on(table.name),
     refIdx: index('branches_ref_idx').on(table.ref),

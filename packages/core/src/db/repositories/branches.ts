@@ -25,9 +25,9 @@ import {
 } from '../../types/branch';
 import { hasActiveEnvironmentCommand } from '../../types/environment-command';
 import { getBranchUrl } from '../../utils/url';
+import { admitTeammateKnowledgeReferences } from '../branch-reference-admission';
 import type { Database } from '../client';
 import {
-  deleteFrom,
   insert,
   isPostgresDatabase,
   jsonExtract,
@@ -126,6 +126,11 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
    * resolve the branch but have nowhere to switch the canvas to.
    */
   private rowToBranch(row: BranchRow, baseUrl?: string): Branch {
+    const {
+      maintenance: _maintenance,
+      maintenance_generation: _maintenanceGeneration,
+      ...publicData
+    } = row.data;
     const branchId = row.branch_id as BranchID;
     const url = baseUrl && row.board_id ? getBranchUrl(branchId, baseUrl) : null;
     return attachHiddenTenant(
@@ -165,7 +170,11 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
         clone_depth: row.clone_depth ?? undefined,
         // Per-branch SDK home intent (design §9.2)
         sdk_home: row.sdk_home ?? undefined,
-        ...row.data,
+        ...publicData,
+        // Authoritative columns cannot be overridden by historical JSON.
+        deletion_status: row.deletion_status ?? undefined,
+        deletion_error: row.deletion_error ?? undefined,
+        deletion_updated_at: row.deletion_updated_at?.toISOString(),
         url,
       },
       row
@@ -257,6 +266,7 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
       const row = await runDatabaseTransaction(
         this.db,
         async (tx) => {
+          await admitTeammateKnowledgeReferences(tx, branch.custom_context);
           const owner = await select(tx, { user_id: users.user_id })
             .from(users)
             .where(eq(users.user_id, insertData.primary_owner_user_id))
@@ -640,6 +650,7 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
 
     // Use transaction to make read-merge-write atomic
     return await this.db.transaction(async (tx) => {
+      await admitTeammateKnowledgeReferences(txAsDb(tx), updates.custom_context);
       // Acquire row-level lock on PostgreSQL to prevent lost updates
       await lockRowForUpdate(
         txAsDb(tx),
@@ -656,6 +667,14 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
 
       if (!currentRow) {
         throw new EntityNotFoundError('Branch', id);
+      }
+      if (currentRow.deletion_status) {
+        throw new RepositoryError(
+          'Branch deletion is irreversible; normal edits and unarchive are disabled'
+        );
+      }
+      if (currentRow.data.maintenance) {
+        throw new RepositoryError('Branch maintenance is in progress; normal edits are disabled');
       }
 
       if (
@@ -734,6 +753,8 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
       }
 
       const insertData = this.branchToInsert(merged);
+      insertData.data.maintenance = currentRow.data.maintenance;
+      insertData.data.maintenance_generation = currentRow.data.maintenance_generation;
       if (options?.preserveUpdatedAt) {
         insertData.updated_at = new Date(current.updated_at);
       }
@@ -824,7 +845,9 @@ export class BranchRepository implements BaseRepository<Branch, Partial<Branch>>
             'Wait for the active environment command before deleting its branch'
           );
         }
-        await deleteFrom(tx, branches).where(eq(branches.branch_id, existing.branch_id)).run();
+        throw new RepositoryError(
+          'Metadata-only branch deletion is prohibited; use the permanent deletion lifecycle'
+        );
       },
       { sqliteImmediate: true }
     );
