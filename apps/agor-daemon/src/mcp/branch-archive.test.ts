@@ -257,6 +257,14 @@ dbTest(
               params(payload)
             )
           ).resolves.toMatchObject({ filesystem_status });
+          const staleOutcome = filesystem_status === 'ready' ? 'failed' : 'ready';
+          await expect(
+            fixture.service.patch(
+              branch.branch_id,
+              { filesystem_status: staleOutcome, provisioning_attempt_id: attemptId },
+              params(payload)
+            )
+          ).resolves.toMatchObject({ filesystem_status });
         }
       });
     } finally {
