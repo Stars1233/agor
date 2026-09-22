@@ -8,7 +8,7 @@
 import { Ajv } from '@feathersjs/schema';
 import type { TObject, TProperties } from '@feathersjs/typebox';
 import { getValidator, Type } from '@feathersjs/typebox';
-import { PAGINATION } from '../config/constants';
+import { MESSAGE_PAGINATION, PAGINATION } from '../config/constants';
 import { AGENTIC_TOOL_NAMES, PERSISTED_AGENTIC_TOOL_NAMES } from '../types/agentic-tool';
 import { MAX_PRESENCE_BOARD_SUBSCRIPTIONS } from '../types/presence';
 
@@ -258,7 +258,15 @@ export const messageQuerySchema = Type.Object(
         ),
       ])
     ),
-    task_id: Type.Optional(CommonSchemas.uuid),
+    task_id: Type.Optional(
+      Type.Union([
+        CommonSchemas.uuid,
+        Type.Object(
+          { $in: Type.Array(CommonSchemas.uuid, { maxItems: MESSAGE_PAGINATION.MAX_TASK_IDS }) },
+          { additionalProperties: false }
+        ),
+      ])
+    ),
     type: Type.Optional(messageTypeSchema),
     role: Type.Optional(messageRoleSchema),
     $limit: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),

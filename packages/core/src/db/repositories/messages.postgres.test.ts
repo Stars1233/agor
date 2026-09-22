@@ -285,6 +285,15 @@ describePostgres('MessagesRepository PostgreSQL Unicode persistence', () => {
         tool_uses: [call],
       });
       countedMessageId = countedMessage.message_id;
+      const batch = await messages.findPage({
+        sessionId: visibleSession.session_id,
+        taskIds: [countedTaskId],
+        lean: true,
+        visibleToUserId: viewerId,
+      });
+      expect(batch.data.map((item) => item.message_id)).toEqual([countedMessageId]);
+      expect(JSON.stringify(batch)).not.toContain('PRIVATE_RESULT_CANARY');
+
       expect(
         (await taskRepo.update(countedTaskId, { status: TaskStatus.COMPLETED })).recorded_tool_count
       ).toBe(1);
@@ -302,6 +311,7 @@ describePostgres('MessagesRepository PostgreSQL Unicode persistence', () => {
       const page = await new MessagesRepository(scoped).findPage({
         lean: true,
         sessionId: visibleSessionId!,
+        taskIds: [countedTaskId!],
         limit: 10,
         skip: 0,
       });

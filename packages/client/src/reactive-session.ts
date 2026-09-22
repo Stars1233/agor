@@ -1,17 +1,10 @@
 import type { AgorClient, Message, Session, SessionPromptOptions, Task } from '@agor/core/client';
-import {
-  EXECUTING_TASK_STATUSES,
-  isTaskExecuting,
-  MESSAGE_PAGINATION,
-  PAGINATION,
-  TaskStatus,
-} from '@agor/core/client';
+import { isTaskExecuting, MESSAGE_PAGINATION, PAGINATION, TaskStatus } from '@agor/core/client';
 
 export type TaskHydrationMode = 'none' | 'lazy' | 'eager' | 'lean';
 
 /** POC task page, not a byte limit: an individual turn may still be large. */
 export const LEAN_TRANSCRIPT_TASK_PAGE_SIZE = 10;
-const LEAN_ACTIVE_STATUSES = EXECUTING_TASK_STATUSES;
 const isLeanActive = isTaskExecuting;
 
 export interface ReactiveSessionOptions {
@@ -791,13 +784,21 @@ export class ReactiveSessionHandle {
     return operation;
   }
 
-  private async fetchLeanTaskMessages(taskId: string): Promise<Message[]> {
-    return this.fetchMessagesAtHighWater({
-      session_id: this.sessionId,
-      task_id: taskId,
-      transcript: 'lean',
-      $sort: { index: 1 },
-    });
+  private async fetchLeanTaskMessages(taskIds: string[], stale: () => boolean): Promise<Message[]> {
+    const messages: Message[] = [];
+    // Bound reconnect hydration as well as the initial ten-turn page.
+    for (let offset = 0; offset < taskIds.length; offset += MESSAGE_PAGINATION.MAX_TASK_IDS) {
+      if (stale()) break;
+      messages.push(
+        ...(await this.fetchMessagesAtHighWater({
+          session_id: this.sessionId,
+          task_id: { $in: taskIds.slice(offset, offset + MESSAGE_PAGINATION.MAX_TASK_IDS) },
+          transcript: 'lean',
+          $sort: { index: 1 },
+        }))
+      );
+    }
+    return messages;
   }
 
   private async doSyncLeanHistory(older: boolean): Promise<void> {
@@ -808,30 +809,34 @@ export class ReactiveSessionHandle {
     const messageToken = this.beginMessageFetch();
     const sessionSequence = this.sessionMutationSequence;
     try {
-      const session = await this.client.service('sessions').get(this.sessionId);
-      if (stale()) return;
-      this.canonicalSessionId = session.session_id;
       const pageSize = this.options.cacheScope === 'preview' ? 1 : LEAN_TRANSCRIPT_TASK_PAGE_SIZE;
       const cursor = older ? this.leanOldestTaskId : undefined;
-      const result = await this.client.service('tasks').find({
-        query: {
-          session_id: this.sessionId,
-          $sort: { task_id: -1 },
-          $limit: pageSize + 1,
-          status: { $ne: TaskStatus.QUEUED },
-          ...(cursor ? { task_id: { $lte: cursor } } : {}),
-        },
-      });
+      const [session, result, queue] = await Promise.all([
+        older && this.stateSnapshot.session
+          ? Promise.resolve(this.stateSnapshot.session)
+          : this.client.service('sessions').get(this.sessionId),
+        this.client.service('tasks').find({
+          query: {
+            session_id: this.sessionId,
+            $sort: { task_id: -1 },
+            $limit: pageSize + 1,
+            status: { $ne: TaskStatus.QUEUED },
+            ...(cursor ? { task_id: { $lte: cursor } } : {}),
+          },
+        }),
+        older
+          ? Promise.resolve({ data: this.stateSnapshot.queuedTasks } as QueueFindResult)
+          : (this.client
+              .service(`/sessions/${this.sessionId}/tasks/queue`)
+              .find() as Promise<QueueFindResult>),
+      ]);
       if (stale()) return;
+      this.canonicalSessionId = session.session_id;
       const rows = Array.isArray(result) ? result : result.data;
       const candidates = rows.filter((task) => task.task_id !== cursor);
       const page = candidates.slice(0, pageSize);
       const hasOlder = cursor ? candidates.length >= pageSize : candidates.length > pageSize;
       const byId = new Map(this.stateSnapshot.tasks.map((task) => [task.task_id, task]));
-      const queue = (await this.client
-        .service(`/sessions/${this.sessionId}/tasks/queue`)
-        .find()) as QueueFindResult;
-      if (stale()) return;
       for (const task of queue.data ?? []) byId.set(task.task_id, task);
       if (!older) {
         // A reconnect can span more than ten newly completed turns. Fill the
@@ -858,21 +863,6 @@ export class ReactiveSessionHandle {
           if (next <= after) throw new Error('History cursor did not advance');
           after = next;
         }
-        // Active work must remain reachable even behind more than a page of
-        // queued prompts. Existing status-filtered queries, no new auth route.
-        for (const status of LEAN_ACTIVE_STATUSES) {
-          if (stale()) return;
-          const active = await this.client.service('tasks').find({
-            query: {
-              session_id: this.sessionId,
-              status,
-              $limit: 1,
-              $sort: { task_id: -1 },
-            },
-          });
-          for (const task of Array.isArray(active) ? active : active.data)
-            byId.set(task.task_id, task);
-        }
         // Refresh previously reached history without widening its membership.
         for (const task of this.stateSnapshot.tasks) {
           if (stale()) return;
@@ -890,19 +880,31 @@ export class ReactiveSessionHandle {
       const fullIds = new Set(this.stateSnapshot.loadedTaskIds);
       const snapshots = new Map<string, Message[]>();
       const sequences = new Map<string, number>();
-      for (const task of tasks) {
-        if (stale()) return;
-        if (older && !page.some((item) => item.task_id === task.task_id)) continue;
-        if (task.status === TaskStatus.QUEUED) continue;
+      // The executing turn belongs to the latest nonqueued page; hydrate it fully
+      // without a separate active-task lookup. Queued prompts do not consume page slots.
+      const hydrateTasks = tasks.filter(
+        (task) =>
+          task.status !== TaskStatus.QUEUED &&
+          (!older || page.some((item) => item.task_id === task.task_id))
+      );
+      for (const task of hydrateTasks) {
         if (isLeanActive(task)) this.leanLiveTaskIds.add(task.task_id);
         if (this.leanLiveTaskIds.has(task.task_id)) fullIds.add(task.task_id);
         sequences.set(task.task_id, this.messageCacheMutationsByTask.get(task.task_id) ?? 0);
-        snapshots.set(
-          task.task_id,
-          fullIds.has(task.task_id)
-            ? await this.fetchTaskMessagesAtHighWater(task.task_id)
-            : await this.fetchLeanTaskMessages(task.task_id)
-        );
+        snapshots.set(task.task_id, []);
+      }
+      const leanIds = hydrateTasks
+        .filter((task) => !fullIds.has(task.task_id))
+        .map((task) => task.task_id);
+      const leanMessages = await this.fetchLeanTaskMessages(leanIds, stale);
+      if (stale()) return;
+      for (const message of leanMessages) {
+        if (message.task_id) snapshots.get(message.task_id)?.push(message);
+      }
+      for (const task of hydrateTasks) {
+        if (stale()) return;
+        if (fullIds.has(task.task_id))
+          snapshots.set(task.task_id, await this.fetchTaskMessagesAtHighWater(task.task_id));
       }
       if (
         this.disposed ||
