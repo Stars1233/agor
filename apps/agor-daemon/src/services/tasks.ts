@@ -286,6 +286,11 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
     ) {
       pageOptions.sessionIds = sessionId.$in as SessionID[];
     }
+    if (query.status && typeof query.status === 'object' && '$ne' in query.status) {
+      if (query.status.$ne !== TaskStatus.QUEUED)
+        throw new BadRequest('Only queued status exclusion is supported');
+      pageOptions.excludeQueued = true;
+    }
     if (typeof query.status === 'string') pageOptions.status = query.status as Task['status'];
     if (typeof query.created_at === 'number' && Number.isFinite(query.created_at)) {
       pageOptions.createdAt = new Date(query.created_at);
@@ -393,7 +398,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
       status: task.status,
       model: task.model ?? task.normalized_sdk_response?.primaryModel ?? null,
       queue_position: task.queue_position ?? null,
-      tool_use_count: task.tool_use_count ?? 0,
+      recorded_tool_count: task.recorded_tool_count ?? null,
       is_callback: task.metadata?.is_agor_callback === true,
       source: task.metadata?.source ?? null,
     };
@@ -1324,7 +1329,7 @@ export class TasksService extends DrizzleService<Task, Partial<Task>, TaskParams
           task.message_range?.start_index !== undefined
             ? task.message_range.end_index - task.message_range.start_index + 1
             : 0,
-        toolUseCount: task.tool_use_count || 0,
+        recordedToolCount: task.recorded_tool_count,
         lastAssistantMessage,
       };
 

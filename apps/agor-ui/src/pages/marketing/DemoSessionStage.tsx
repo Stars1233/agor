@@ -169,7 +169,6 @@ const buildPriorTask = (variant: StageVariantConfig): Task =>
       start_timestamp: demoNow,
       end_timestamp: demoNow,
     },
-    tool_use_count: 4,
     git_state: { ref_at_start: STAGE_BRANCH.ref, sha_at_start: 'unknown' },
     duration_ms: 94_000,
     created_at: demoNow,
@@ -270,7 +269,6 @@ export const DemoSessionStage = ({ scene, t, variant = 'coding' }: DemoSessionSt
       // Empty timestamps + no created_at keep TimerPill off the wall clock:
       // it renders nothing while running and the fixed duration once done.
       message_range: { start_index: 7, end_index: 7, start_timestamp: '' },
-      tool_use_count: phase >= 4 ? 2 : phase >= 3 ? 1 : 0,
       git_state: { ref_at_start: STAGE_BRANCH.ref, sha_at_start: 'unknown' },
       ...(phase >= 5 ? { duration_ms: 3_400 } : {}),
     } as unknown as Task;
@@ -482,13 +480,10 @@ export const DemoSessionStage = ({ scene, t, variant = 'coding' }: DemoSessionSt
             sessionModel={STAGE_MODEL}
             userById={USER_BY_ID}
             currentUserId={CURRENT_USER_ID}
-            isExpanded
-            onExpandChange={NOOP}
             sessionId={STAGE_SESSION_ID}
             taskMessages={priorMessages}
             taskMessagesLoaded
             onLoadTaskMessages={NOOP}
-            onUnloadTaskMessages={NOOP}
             branchName={STAGE_BRANCH.name}
           />
           {liveTask && (
@@ -498,13 +493,10 @@ export const DemoSessionStage = ({ scene, t, variant = 'coding' }: DemoSessionSt
               sessionModel={STAGE_MODEL}
               userById={USER_BY_ID}
               currentUserId={CURRENT_USER_ID}
-              isExpanded
-              onExpandChange={NOOP}
               sessionId={STAGE_SESSION_ID}
               taskMessages={liveMessages}
               taskMessagesLoaded
               onLoadTaskMessages={NOOP}
-              onUnloadTaskMessages={NOOP}
               branchName={STAGE_BRANCH.name}
               isLatestTask
             />

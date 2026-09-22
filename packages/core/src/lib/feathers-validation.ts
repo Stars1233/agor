@@ -109,6 +109,7 @@ export function createQuerySchema<T extends TProperties>(properties: TObject<T>)
  */
 export const sessionQuerySchema = createQuerySchema(
   Type.Object({
+    include_usage: Type.Optional(CommonSchemas.boolean),
     session_id: Type.Optional(CommonSchemas.uuid),
     status: Type.Optional(CommonSchemas.sessionStatus),
     agentic_tool: Type.Optional(CommonSchemas.persistedAgenticTool),
@@ -151,6 +152,7 @@ export const taskQuerySchema = Type.Intersect(
       session_id: Type.Optional(CommonSchemas.uuid),
       status: Type.Optional(
         Type.Union([
+          Type.Object({ $ne: Type.Literal('queued') }, { additionalProperties: false }),
           Type.Literal('queued'),
           Type.Literal('created'),
           Type.Literal('dispatching'),
@@ -234,6 +236,7 @@ const messageSelectableFieldSchema = Type.Union(
  */
 export const messageQuerySchema = Type.Object(
   {
+    transcript: Type.Optional(Type.Literal('lean')),
     message_id: Type.Optional(
       Type.Union([
         CommonSchemas.uuid,

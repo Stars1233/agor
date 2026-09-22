@@ -9,6 +9,7 @@ import type { Message, MessageCreate, MessageID, SessionID, TaskID, UUID } from 
 import { and, asc, desc, eq, gt, gte, inArray, lte, type SQL, sql } from 'drizzle-orm';
 import { generateId } from '../../lib/ids';
 import { isCanonicalFullUuid } from '../../types/id';
+import { LEAN_TRANSCRIPT_METADATA_FIELDS } from '../../types/message';
 import { JsonSanitizationError, sanitizeJsonValue } from '../../utils/sanitize-json';
 import { lockSessionBranchForAdmission } from '../branch-admission';
 import type { Database } from '../client';
@@ -23,6 +24,7 @@ import {
 } from '../database-wrapper';
 import { type MessageInsert, type MessageRow, messages, sessions, tasks } from '../schema';
 import { visibleSessionReferenceAccessExists } from './branch-access';
+import { invalidateRecordedToolCount } from './recorded-tool-count';
 
 export const MESSAGE_CONTENT_OMITTED =
   '[Message content omitted: payload could not be safely persisted]';
@@ -41,6 +43,8 @@ export type MessageFindPageOptions = {
   select?: readonly (keyof Message)[];
   limit?: number;
   skip?: number;
+  /** POC: SQL projection, not a promise to avoid reading the stored JSON blob. */
+  lean?: boolean;
 };
 
 /** Optional hook executed after a Message insert and before its transaction commits. */
@@ -108,6 +112,9 @@ export class MessagesRepository {
       timestamp: new Date(row.timestamp).toISOString(),
       content_preview: row.content_preview || '',
       content: (row.data as { content: Message['content'] }).content,
+      ...((row.data as { has_deferred_reasoning?: boolean }).has_deferred_reasoning
+        ? { has_deferred_reasoning: true }
+        : {}),
       tool_uses: (row.data as { tool_uses?: Message['tool_uses'] }).tool_uses,
       parent_tool_use_id: row.parent_tool_use_id || undefined,
       metadata: (row.data as { metadata?: Message['metadata'] }).metadata,
@@ -270,6 +277,7 @@ export class MessagesRepository {
           await this.assertSessionBelongsToTenant(tx, message.session_id);
           if (message.task_id) {
             await this.assertTaskBelongsToSession(tx, message.task_id, message.session_id);
+            await invalidateRecordedToolCount(tx, message.task_id);
           }
           const inserted = await insert(tx, messages).values(row).returning().one();
           const created = this.rowToMessage(inserted);
@@ -309,6 +317,12 @@ export class MessagesRepository {
       runDatabaseTransaction(
         this.db,
         async (txDb) => {
+          const parent = await select(txDb, { task_id: messages.task_id })
+            .from(messages)
+            .where(eq(messages.message_id, messageId))
+            .one();
+          if (parent?.task_id)
+            await lockRowForUpdate(txDb, this.db, tasks, eq(tasks.task_id, parent.task_id));
           await lockRowForUpdate(txDb, this.db, messages, eq(messages.message_id, messageId));
           const row = await select(txDb)
             .from(messages)
@@ -335,6 +349,7 @@ export class MessagesRepository {
             );
             sanitizedData = omittedMessageData(error.category);
           }
+          if (parent?.task_id) await invalidateRecordedToolCount(txDb, parent.task_id);
           const updatedRow = await update(txDb, messages)
             .set({ data: sanitizedData })
             .where(eq(messages.message_id, messageId))
@@ -377,6 +392,58 @@ export class MessagesRepository {
     if (conditions.length > 0) query = query.where(and(...conditions));
     const rows = await query.orderBy(messages.index).all();
     return rows.map((r: MessageRow) => this.rowToMessage(r));
+  }
+
+  /**
+   * POC read model. Never select the original data/preview alongside this.
+   * JSON extraction still reads the source blob in the database. It avoids
+   * transferring/deserializing tool payloads in the daemon and browser only.
+   * Pending permission requests retain their inputs: never ask for approval
+   * of hidden arguments, even if a historical task status is inconsistent.
+   * Full task hydration uses the unchanged authorized messages.find boundary.
+   */
+  private leanDataProjection(): SQL {
+    const metadataKeys = sql.join(
+      LEAN_TRANSCRIPT_METADATA_FIELDS.map((key) => sql`${key}`),
+      sql`, `
+    );
+    // Qualify the widget discriminator as table + identifier: Drizzle strips
+    // Column qualifiers in single-table SELECTs, but json_each also has a type column.
+    if (isSQLiteDatabase(this.db)) {
+      return sql`json_object(
+        'has_deferred_reasoning', EXISTS(SELECT 1 FROM json_each(CASE WHEN json_type(${messages.data}, '$.content') = 'array' THEN json_extract(${messages.data}, '$.content') ELSE '[]' END) WHERE json_extract(value, '$.type') = 'thinking'),
+        'content', json(CASE json_type(${messages.data}, '$.content')
+          WHEN 'array' THEN (SELECT json_group_array(json(value))
+            FROM json_each(${messages.data}, '$.content')
+            WHERE json_extract(value, '$.type') NOT IN ('tool_use', 'tool_result', 'thinking'))
+          WHEN 'object' THEN CASE WHEN ${messages.type} = 'permission_request'
+            THEN json_set(json_extract(${messages.data}, '$.content'), '$.tool_input', json(
+              CASE WHEN json_extract(${messages.data}, '$.content.status') = 'pending'
+                THEN COALESCE(json_extract(${messages.data}, '$.content.tool_input'), '{}') ELSE '{}' END))
+            ELSE json_extract(${messages.data}, '$.content') END
+          ELSE json_quote(json_extract(${messages.data}, '$.content')) END),
+        'metadata', json((SELECT json_group_object(key, json(json_extract(${messages.data}, '$.metadata') -> key))
+          FROM json_each(${messages.data}, '$.metadata')
+          WHERE key IN (${metadataKeys}) AND (key != 'widget' OR ${messages}.${sql.identifier('type')} = 'widget_request')))
+      )`.mapWith(messages.data);
+    }
+    return sql`jsonb_build_object(
+      'has_deferred_reasoning', EXISTS(SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(${messages.data}::jsonb -> 'content') = 'array' THEN ${messages.data}::jsonb -> 'content' ELSE '[]'::jsonb END) AS b(block) WHERE block ->> 'type' = 'thinking'),
+      'content', CASE jsonb_typeof(${messages.data}::jsonb -> 'content')
+        WHEN 'array' THEN COALESCE((SELECT jsonb_agg(block ORDER BY ordinal)
+          FROM jsonb_array_elements(${messages.data}::jsonb -> 'content') WITH ORDINALITY AS b(block, ordinal)
+          WHERE block ->> 'type' NOT IN ('tool_use', 'tool_result', 'thinking')), '[]'::jsonb)
+        WHEN 'object' THEN CASE WHEN ${messages.type} = 'permission_request'
+          THEN jsonb_set(${messages.data}::jsonb -> 'content', '{tool_input}',
+            CASE WHEN ${messages.data}::jsonb -> 'content' ->> 'status' = 'pending'
+              THEN COALESCE(${messages.data}::jsonb -> 'content' -> 'tool_input', '{}'::jsonb)
+              ELSE '{}'::jsonb END)
+          ELSE ${messages.data}::jsonb -> 'content' END
+        ELSE ${messages.data}::jsonb -> 'content' END,
+      'metadata', COALESCE((SELECT jsonb_object_agg(key, value)
+        FROM jsonb_each(COALESCE(NULLIF(${messages.data}::jsonb -> 'metadata', 'null'::jsonb), '{}'::jsonb))
+        WHERE key IN (${metadataKeys}) AND (key != 'widget' OR ${messages}.${sql.identifier('type')} = 'widget_request')), '{}'::jsonb)
+    )`.mapWith(messages.data);
   }
 
   /**
@@ -432,7 +499,12 @@ export class MessagesRepository {
       if (projection && column) projection[field] = column;
     }
 
-    let dataQuery = select(this.db, projection).from(messages);
+    // Identity-only membership probes select no JSON at all.
+    const leanProjection =
+      opts.lean && !selectedFields
+        ? { ...physicalColumns, content_preview: sql<string>`''`, data: this.leanDataProjection() }
+        : undefined;
+    let dataQuery = select(this.db, leanProjection ?? projection).from(messages);
     if (whereClause) dataQuery = dataQuery.where(whereClause);
 
     const sortColumns = {
@@ -538,6 +610,15 @@ export class MessagesRepository {
       runDatabaseTransaction(
         this.db,
         async (tx) => {
+          // Task before Message matches create/terminalization lock ordering.
+          const parent = await select(tx, { task_id: messages.task_id })
+            .from(messages)
+            .where(eq(messages.message_id, messageId))
+            .one();
+          if (parent?.task_id) {
+            await lockRowForUpdate(tx, this.db, tasks, eq(tasks.task_id, parent.task_id));
+            await invalidateRecordedToolCount(tx, parent.task_id);
+          }
           // PATCH reconstructs the JSON data column from the current logical
           // Message. Lock before reading it so concurrent patches to distinct
           // mutable fields cannot overwrite one another with stale data.
@@ -582,13 +663,42 @@ export class MessagesRepository {
    * Delete all messages for a session (cascades automatically via FK)
    */
   async deleteBySessionId(sessionId: SessionID): Promise<void> {
-    await deleteFrom(this.db, messages).where(eq(messages.session_id, sessionId)).run();
+    await runDatabaseTransaction(
+      this.db,
+      async (tx) => {
+        const parents = await select(tx, { task_id: tasks.task_id })
+          .from(tasks)
+          .where(eq(tasks.session_id, sessionId))
+          .orderBy(asc(tasks.task_id))
+          .all();
+        for (const parent of parents) {
+          await lockRowForUpdate(tx, this.db, tasks, eq(tasks.task_id, parent.task_id));
+          await invalidateRecordedToolCount(tx, parent.task_id);
+        }
+        await deleteFrom(tx, messages).where(eq(messages.session_id, sessionId)).run();
+      },
+      { sqliteImmediate: true }
+    );
   }
 
   /**
    * Delete a single message
    */
   async delete(messageId: MessageID): Promise<void> {
-    await deleteFrom(this.db, messages).where(eq(messages.message_id, messageId)).run();
+    await runDatabaseTransaction(
+      this.db,
+      async (tx) => {
+        const parent = await select(tx, { task_id: messages.task_id })
+          .from(messages)
+          .where(eq(messages.message_id, messageId))
+          .one();
+        if (parent?.task_id) {
+          await lockRowForUpdate(tx, this.db, tasks, eq(tasks.task_id, parent.task_id));
+          await invalidateRecordedToolCount(tx, parent.task_id);
+        }
+        await deleteFrom(tx, messages).where(eq(messages.message_id, messageId)).run();
+      },
+      { sqliteImmediate: true }
+    );
   }
 }
