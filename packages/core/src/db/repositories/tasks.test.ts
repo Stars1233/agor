@@ -3269,6 +3269,46 @@ describe('TaskRepository.createPending', () => {
     }
   });
 
+  dbTest(
+    'queue mutations preserve direct dispatch and subsequent admission order',
+    async ({ db }) => {
+      const repo = new TaskRepository(db);
+      const sessionId = await createSessionWithDeps(db);
+      const input = {
+        ...createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED }),
+        dispatchIfIdle: dispatchFields(),
+      };
+      const active = await repo.createPending(input);
+      expect(active.status).toBe(TaskStatus.DISPATCHING);
+      const session = await new SessionRepository(db).findById(sessionId);
+      const first = await repo.createPending(input);
+      const second = await repo.createPending(input);
+      const ids = [first.task_id, second.task_id];
+
+      // A batch containing directly dispatched work must not cancel its queued sibling.
+      expect(
+        await repo.mutateQueued(sessionId, { cancel: [first.task_id, active.task_id] })
+      ).toMatchObject({ outcome: 'conflict', removed: [], wake: false });
+      expect((await repo.findQueued(sessionId)).map((task) => task.task_id)).toEqual(ids);
+      expect(
+        await repo.mutateQueued(sessionId, { order: [...ids].reverse(), expected: ids })
+      ).toMatchObject({ outcome: 'changed', wake: false });
+      expect(await repo.mutateQueued(sessionId, { cancel: [first.task_id] })).toMatchObject({
+        outcome: 'changed',
+        removed: [{ task_id: first.task_id }],
+        wake: false,
+      });
+      const next = await repo.createPending(input);
+      expect(next).toMatchObject({ status: TaskStatus.QUEUED, queue_position: 2 });
+      expect((await repo.findQueued(sessionId)).map((task) => task.task_id)).toEqual([
+        second.task_id,
+        next.task_id,
+      ]);
+      expect(await repo.findById(active.task_id)).toEqual(active);
+      expect(await new SessionRepository(db).findById(sessionId)).toEqual(session);
+    }
+  );
+
   dbTest('does not directly dispatch a stopping Session or a missing creator', async ({ db }) => {
     const repo = new TaskRepository(db);
     const sessionId = await createSessionWithDeps(db);

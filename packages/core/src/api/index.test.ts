@@ -790,7 +790,9 @@ describe('createClient', () => {
         'connectExecutor',
         'reportTerminationComplete',
         'reportRuntimeTelemetry',
-        'reportSdkHealthFailure'
+        'reportSdkHealthFailure',
+        'cancelQueued',
+        'reorderQueued'
       );
     });
 

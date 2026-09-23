@@ -25,6 +25,7 @@ import type {
   Branch,
   BranchCapabilityPolicy,
   BranchEnvironmentUpdate,
+  CancelQueuedTasksInput,
   CapabilityPolicyWorkspacePreferences,
   CardType,
   CardWithType,
@@ -71,6 +72,7 @@ import type {
   OwnershipTransferResult,
   PatchAgenticToolPreset,
   PermissionMode,
+  ReorderQueuedTasksInput,
   Repo,
   RuntimeTelemetryInput,
   Schedule,
@@ -81,6 +83,7 @@ import type {
   SessionID,
   SessionUpdate,
   Task,
+  TaskQueueMutationResult,
   TeammateWelcomeNoteRequest,
   TemplateRenderRequest,
   TemplateRenderResponse,
@@ -548,6 +551,8 @@ export interface TasksService extends AgorService<Task> {
   reportRuntimeTelemetry(data: RuntimeTelemetryInput, params?: Params): Promise<Task>;
   /** Report a daemon-authorized SDK watchdog decision. */
   reportSdkHealthFailure(data: SdkHealthFailureInput, params?: Params): Promise<Task>;
+  cancelQueued(data: CancelQueuedTasksInput, params?: Params): Promise<TaskQueueMutationResult>;
+  reorderQueued(data: ReorderQueuedTasksInput, params?: Params): Promise<TaskQueueMutationResult>;
   /**
    * Mark a task as completed
    */
@@ -1385,7 +1390,9 @@ function extendTasksService(client: AgorClient): void {
       'connectExecutor',
       'reportTerminationComplete',
       'reportRuntimeTelemetry',
-      'reportSdkHealthFailure'
+      'reportSdkHealthFailure',
+      'cancelQueued',
+      'reorderQueued'
     );
   }
   tasksService[TASKS_SERVICE_EXTENDED] = true;
