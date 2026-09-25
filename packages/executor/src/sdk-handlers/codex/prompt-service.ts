@@ -207,26 +207,6 @@ function isKnownCodexBoundaryError(
   }
 }
 
-function logCodexRuntimeFailure(
-  event: 'stream_error_observed' | 'turn_completed_without_response' | 'turn_failed',
-  error: unknown,
-  sessionId: SessionID,
-  taskId?: TaskID,
-  category?: 'configuration_required'
-): void {
-  const safe = sanitizeMCPExternalError(error, {
-    stage: 'runtime',
-    ...(category ? { category } : {}),
-  });
-  const code = safe.diagnostic.code;
-  const message = `[codex.runtime] event=${event} session_id=${sessionId}${taskId ? ` task_id=${taskId}` : ''} category=${safe.category} type=${safe.diagnostic.type}${code ? ` code=${code}` : ''}`;
-  if (event === 'stream_error_observed') {
-    console.warn(`${message} outcome=awaiting_terminal_event`);
-  } else {
-    console.error(message);
-  }
-}
-
 function codexDebug(...args: unknown[]): void {
   if (process.env.AGOR_DEBUG_CODEX === '1' || process.env.DEBUG?.includes('codex')) {
     console.debug(...args);
@@ -1392,7 +1372,8 @@ export class CodexPromptService {
       }
     };
 
-    let runtimePhase: 'starting' | 'streaming' = 'starting';
+    let streamReturned = false;
+    let firstEventObserved = false;
     try {
       codexDebug(
         `▶️  [Codex] Running prompt: "${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}"`
@@ -1419,7 +1400,7 @@ export class CodexPromptService {
       // Keep the persisted user prompt and cached client configuration unchanged.
       const providerPrompt = `${prompt}\n\n${renderAgorSessionIdentity(sessionId)}`;
       const { events } = await thread.runStreamed(providerPrompt, turnOptions);
-      runtimePhase = 'streaming';
+      streamReturned = true;
       codexDebug(`✅ [Codex] runStreamed() returned, starting event iteration`);
 
       const currentMessage: Array<{
@@ -1444,6 +1425,9 @@ export class CodexPromptService {
       let didStop = false;
 
       for await (const event of events) {
+        // runStreamed returns a lazy iterator; even process spawn can fail on
+        // the first next(). Only an observed event establishes streaming here.
+        firstEventObserved = true;
         eventCount++;
         codexDebug(`📨 [Codex] Event ${eventCount}: ${event.type}`);
 
@@ -1528,12 +1512,7 @@ export class CodexPromptService {
             }
 
             if (observedStreamError && !receivedAssistantMessage) {
-              logCodexRuntimeFailure(
-                'turn_completed_without_response',
-                observedStreamError,
-                sessionId,
-                taskId
-              );
+              diagnostics.recordFailure('turn_completed_without_response', observedStreamError);
               throw new CodexLifecycleError('completed_without_response');
             }
 
@@ -1718,12 +1697,7 @@ export class CodexPromptService {
             // Turn complete, emit final message
             receivedTerminalEvent = true;
             if (observedStreamError && !receivedAssistantMessage) {
-              logCodexRuntimeFailure(
-                'turn_completed_without_response',
-                observedStreamError,
-                sessionId,
-                taskId
-              );
+              diagnostics.recordFailure('turn_completed_without_response', observedStreamError);
               throw new CodexLifecycleError('completed_without_response');
             }
             threadId = thread.id || '';
@@ -1751,11 +1725,9 @@ export class CodexPromptService {
           case 'turn.failed': {
             receivedTerminalEvent = true;
             const missingAuthentication = !this.apiKey && !this.useNativeAuth;
-            logCodexRuntimeFailure(
+            diagnostics.recordFailure(
               'turn_failed',
               event.error,
-              sessionId,
-              taskId,
               missingAuthentication ? 'configuration_required' : undefined
             );
             throw new CodexLifecycleError(
@@ -1771,7 +1743,7 @@ export class CodexPromptService {
             // not parse provider prose or terminate early: remember the error
             // and wait for the authoritative turn.completed / turn.failed / EOF.
             observedStreamError = event;
-            logCodexRuntimeFailure('stream_error_observed', event, sessionId, taskId);
+            diagnostics.recordFailure('stream_error_observed', event);
             break;
           }
 
@@ -1786,6 +1758,7 @@ export class CodexPromptService {
       // exited without emitting a terminal event (turn.completed / task_complete / turn_complete),
       // which is the bug described in issue #1749.
       if (!didStop) {
+        diagnostics.recordFailure('stream_ended_without_completion', undefined);
         throw new CodexLifecycleError('stream_ended_without_completion');
       }
     } catch (error) {
@@ -1806,12 +1779,16 @@ export class CodexPromptService {
 
       if (isKnownCodexBoundaryError(error)) throw error;
 
+      diagnostics.recordFailure(
+        firstEventObserved ? 'stream_interrupted' : 'stream_start_failed',
+        error
+      );
+
       // Convert opaque SDK lifecycle failures to local, fixed control-flow
       // errors. Codex runtime failures emitted as typed events above have already
       // been converted to Codex-specific fixed lifecycle errors.
-      throw new CodexLifecycleError(
-        runtimePhase === 'starting' ? 'stream_start_failed' : 'stream_interrupted'
-      );
+      // Preserve the existing UI distinction independently of diagnostic phase.
+      throw new CodexLifecycleError(streamReturned ? 'stream_interrupted' : 'stream_start_failed');
     } finally {
       diagnostics.finish();
     }
