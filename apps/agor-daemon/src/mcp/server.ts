@@ -18,6 +18,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AgorConfig } from '@agor/core/config';
 import {
+  isMissingTenantContextError,
   resolveMultiTenancyConfig,
   resolveTenantContext,
   TenantResolutionError,
@@ -30,13 +31,20 @@ import {
   UserApiKeysRepository,
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import type { Session, SessionID, TenantContext, UserID } from '@agor/core/types';
-import { MCP_CLIENT_HINT_HEADER } from '@agor/core/types';
+import {
+  MCP_CLIENT_HINT_HEADER,
+  PERSONAL_API_KEY_PREFIX,
+  type Session,
+  type SessionID,
+  type TenantContext,
+  type UserID,
+} from '@agor/core/types';
 import { isNotFoundError } from '@agor/core/utils/errors';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { createMcpHandler, type ListToolsResult, McpServer } from '@modelcontextprotocol/server';
 import type { Request, Response } from 'express';
 import { toJSONSchema } from 'zod/v4-mini';
+import { createApiKeyHostTenantResolver } from '../auth/api-key-host-tenant.js';
 import type { AuthenticatedParams, AuthenticatedUser } from '../declarations.js';
 import { createMcpAuthRejectionLogger } from './auth-rejection-log.js';
 import { ToolDispatcher, toolDispatcherProxy } from './register-tool-proxy.js';
@@ -416,7 +424,9 @@ export function setupMCPRoutes(
   app: Application,
   db: TenantScopeAwareDatabase,
   toolSearchEnabled = true,
-  config: Pick<AgorConfig, 'multi_tenancy' | 'metrics'> = { multi_tenancy: undefined },
+  config: Pick<AgorConfig, 'multi_tenancy' | 'metrics' | 'external_launch'> = {
+    multi_tenancy: undefined,
+  },
   options: { serverVersion?: string } = {}
 ): void {
   const serverVersion = options.serverVersion ?? '0.0.0';
@@ -430,6 +440,7 @@ export function setupMCPRoutes(
   const logAuthRejection = createMcpAuthRejectionLogger();
   const personalApiKeys = new UserApiKeysRepository(db);
   const multiTenancy = resolveMultiTenancyConfig(config);
+  const resolveApiKeyHostTenant = createApiKeyHostTenantResolver({ db, config });
   const requestContext = new AsyncLocalStorage<McpContext>();
 
   const protocolHandler = createMcpHandler(
@@ -608,17 +619,23 @@ export function setupMCPRoutes(
       let userId: UserID;
       let sessionId: SessionID | undefined;
       let tenant: TenantContext;
-      const isPersonalApiKey = credential.startsWith('agor_sk_');
+      const isPersonalApiKey = credential.startsWith(PERSONAL_API_KEY_PREFIX);
 
       if (isPersonalApiKey) {
         try {
           // Opaque personal keys do not contain a signed tenant claim. Resolve
           // static mode or the configured trusted edge header before touching
-          // the tenant-owned key table. Auth-claim-only hosted deployments must
-          // use an internal tenant-bound MCP token instead.
-          tenant = resolveTenantContext(multiTenancy, {
-            headers: getTenantResolutionHeaders(req),
-          });
+          // the tenant-owned key table. Hosted claim-only deployments route the
+          // key by the trusted workspace Host instead (see api-key-host-tenant).
+          const tenantHeaders = getTenantResolutionHeaders(req);
+          try {
+            tenant = resolveTenantContext(multiTenancy, { headers: tenantHeaders });
+          } catch (error) {
+            // Only a missing identity may fall back to Host routing; malformed
+            // or conflicting trusted tenant headers stay terminal.
+            if (!isMissingTenantContextError(error) || !resolveApiKeyHostTenant) throw error;
+            tenant = await resolveApiKeyHostTenant(tenantHeaders);
+          }
         } catch (error) {
           if (error instanceof TenantResolutionError) {
             return res.status(401).json({
