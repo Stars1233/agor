@@ -301,8 +301,8 @@ Discord transport state is stateless from Agor's durable perspective. Gateway
 sequence/session checkpoints, repair/redrive controls, provider history, and
 provider actions are not operator configuration or MCP resources. Only routing
 facts, admitted cursors, mappings/aliases, and the narrow final-response
-delivery path are durable. Responses remain text-only and expose no agent
-tools (`agent_tools:[]`). Inbound images are opt-in (`files:true`) and are
+delivery path are durable. Responses remain text-only. Agent tools are off
+unless enabled per row (see Agent channel history below). Inbound images are opt-in (`files:true`) and are
 materialized through the normal executor boundary; they are not conversation
 history. Text is split into Discord-sized chunks;
 reply aliases resolve to the same Agor session. This is not a promise of live
@@ -314,6 +314,31 @@ target only `channel:<allowlisted-parent-snowflake>`. The send is recorded as a
 durable seed; the first eligible human reply consumes that seed and starts the
 mapped session without creating a summon thread. Replies to later response
 chunks continue through the compatibility aliases.
+
+### Agent channel history
+
+To let session agents read recent Discord messages, enable **Let session agents
+read channel history** in Settings → Gateway Channels, or set `channelHistory`
+in `agor_gateway_discord_setup`. The capability is off by default
+(`agent_tools: { channel_history: true }` enables it).
+
+Agents use `agor_gateway_discord_channel_history_get`:
+
+- Reads are limited to allowlisted public parent channels and public threads
+  under them. The bot needs View Channel and Read Message History permissions.
+- In a session created by this gateway channel, the default target is the parent
+  channel of the session's thread. Other sessions on its target branch pass
+  `gatewayChannelId` and `discordChannelId`. Callers without session context
+  need admin role or `all` branch permission.
+- Results are chronological, with 50 messages by default and at most 200. Page
+  with either a `before` or an `after` message-ID cursor. Bot and system messages
+  are omitted unless `includeBotMessages` is true. Reads are bounded by the
+  gateway channel's catch-up limits; use `next_cursor` when `has_more` is true.
+
+Enabling this gives eligible sessions access through the bot, regardless of the
+Agor user's own Discord access. The bot token stays private, and message text
+is labeled untrusted. Returned messages become part of the calling session's
+transcript; Agor keeps no separate copy of Discord history.
 
 ### Setting up Discord
 
@@ -329,7 +354,7 @@ creates a Discord application or calls Discord. Before enabling a row:
 3. Configure the explicit channel and user/role allowlists, thread mode,
    auto-archive setting, bounded catch-up values, identity mode, `files:false`
    (or opt in to bounded PNG/JPEG inbound images with `files:true`),
-   `agent_tools:[]`, and optional proactive target. Enter the bot token through
+   agent tools (off by default), and optional proactive target. Enter the bot token through
    the secure credential form; do not paste it into chat or MCP arguments.
 4. Keep the row disabled while translating an old implicit configuration. Run
    the connection test if useful, then enable only after the explicit contract
